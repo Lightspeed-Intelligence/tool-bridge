@@ -6,8 +6,8 @@
   "main": "src/index.ts",
   "compatibility_date": "2025-06-01",
   "compatibility_flags": ["nodejs_compat"],
-  // DJJ 账户(与 gateway 同;wrangler OAuth 多账户须显式指定)。
-  "account_id": "0cb9b897010bc426cd8bf33d8c052d11",
+  // Lightspeed 账户(与 gateway/plugin-feishu 同;wrangler OAuth 多账户须显式指定)。
+  "account_id": "041d4868e5611b45f9959f4f58c1e4c7",
   "observability": {
     "enabled": true
   }
