@@ -154,3 +154,38 @@ export async function queryUser(cfg: MeegoApiConfig, args: QueryUserArgs): Promi
   const resp = await request(cfg, 'POST', '/open_api/user/query', body)
   return { users: resp.data }
 }
+
+// ---------- 工作项查询 ----------
+
+export interface FilterWorkItemsArgs {
+  pageNum?: number
+  pageSize?: number
+  projectKey: string
+  /** 按人筛:open_api filter 的 user_keys 内建"该用户全角色并集"(经办人/研发/负责人等),无需手写 OR。 */
+  userKeys?: string[]
+  workItemName?: string
+  workItemTypeKeys?: string[]
+}
+
+/**
+ * POST /open_api/:project_key/work_item/filter → 工作项列表(含 work_item_status)。
+ * 替代旧 meego 的 search_by_mql "按人查名下工作项":user_keys 由 open_api 内建全角色并集,
+ * 比手写 `__经办人 OR __研发 OR 当前负责人` 更准(不同工作项类型角色不同,后端已算好)。
+ * 查询按字段筛,与调用方身份无关;X-USER-KEY 仅用于鉴权。
+ */
+export async function filterWorkItems(
+  cfg: MeegoApiConfig,
+  args: FilterWorkItemsArgs,
+): Promise<unknown> {
+  const body: Record<string, unknown> = {}
+  if (args.workItemName !== undefined) body.work_item_name = args.workItemName
+  if (args.userKeys !== undefined && args.userKeys.length > 0) body.user_keys = args.userKeys
+  if (args.workItemTypeKeys !== undefined && args.workItemTypeKeys.length > 0) {
+    body.work_item_type_keys = args.workItemTypeKeys
+  }
+  if (args.pageNum !== undefined) body.page_num = args.pageNum
+  if (args.pageSize !== undefined) body.page_size = args.pageSize
+  const path = `/open_api/${encodeURIComponent(args.projectKey)}/work_item/filter`
+  const resp = await request(cfg, 'POST', path, body)
+  return { work_items: resp.data, pagination: resp.pagination }
+}

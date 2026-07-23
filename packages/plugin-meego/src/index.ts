@@ -44,6 +44,7 @@ import {
 } from '@tool-bridge/core'
 import {
   addComment,
+  filterWorkItems,
   isMeegoAuthError,
   listComments,
   type MeegoApiConfig,
@@ -130,13 +131,13 @@ const TOOLS: ToolSpec[] = [
   {
     name: 'add_comment',
     description:
-      '给工作项添加评论(markdown/富文本)。评论以**调用方绑定的 user_key 身份**落地——谁调用显示谁,不再固定为挂载者。',
+      '给工作项添加评论(纯文本)。评论以**调用方绑定的 user_key 身份**落地——谁调用显示谁,不再固定为挂载者。',
     effect: 'destructive',
     inputSchema: {
       type: 'object',
       properties: {
         ...WORK_ITEM_SCHEMA_PROPS,
-        content: { type: 'string', description: '评论内容' },
+        content: { type: 'string', description: '评论内容(纯文本)' },
       },
       required: ['project_key', 'work_item_type_key', 'work_item_id', 'content'],
     },
@@ -173,6 +174,35 @@ const TOOLS: ToolSpec[] = [
     description: '返回当前调用方绑定的 Meego 操作人(user_key + 用户详情);验证"评论会显示为谁"。',
     effect: 'read',
     inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'filter_work_items',
+    description:
+      '按条件查工作项(需求/缺陷等)。user_keys 传某人 user_key = 查其名下工作项——open_api 内建全角色并集(经办人/研发/负责人),无需手写 MQL 三路 OR。返回含 work_item_status(状态)。',
+    effect: 'read',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project_key: {
+          type: 'string',
+          description: '空间 projectKey(如 tipsy chat = 6a4226868b7eed94090347eb)',
+        },
+        work_item_type_keys: {
+          type: 'array',
+          items: { type: 'string' },
+          description: '工作项类型 key(缺陷=issue,需求=story;可多选)',
+        },
+        user_keys: {
+          type: 'array',
+          items: { type: 'string' },
+          description: '按人筛(该用户名下全角色);查"我名下"传自己 user_key(见 whoami)',
+        },
+        work_item_name: { type: 'string', description: '按名称模糊筛' },
+        page_num: { type: 'number', description: '页码(1 起)' },
+        page_size: { type: 'number', description: '每页条数(默认 50)' },
+      },
+      required: ['project_key'],
+    },
   },
 ]
 
@@ -289,6 +319,25 @@ async function callTool(
       const detail = await withPatRetry(env, cred, userKey, cfg =>
         queryUser(cfg, { userKeys: [userKey] }))
       return { key_id: ctx.keyId, user_key: userKey, ...(detail as object) }
+    }
+    case 'filter_work_items': {
+      const userKey = resolveUserKey(ctx)
+      const userKeys = strArray(args, 'user_keys')
+      const workItemTypeKeys = strArray(args, 'work_item_type_keys')
+      const pageNum = optNum(args, 'page_num')
+      const pageSize = optNum(args, 'page_size')
+      const workItemName = args.work_item_name
+      return withPatRetry(env, cred, userKey, cfg =>
+        filterWorkItems(cfg, {
+          projectKey: str(args, 'project_key'),
+          ...(userKeys !== undefined ? { userKeys } : {}),
+          ...(workItemTypeKeys !== undefined ? { workItemTypeKeys } : {}),
+          ...(typeof workItemName === 'string' && workItemName !== ''
+            ? { workItemName }
+            : {}),
+          ...(pageNum !== undefined ? { pageNum } : {}),
+          ...(pageSize !== undefined ? { pageSize } : {}),
+        }))
     }
     default:
       throw TBError.notFound(`未知工具:'${name}'`)

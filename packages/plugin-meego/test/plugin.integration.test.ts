@@ -45,6 +45,10 @@ function meegoMock() {
   let tokenSeq = 0
   let authCalls = 0
   const commentCalls: Array<{ path: string, userKey: string | null }> = []
+  const filterCalls: Array<{
+    body: { user_keys?: string[], work_item_type_keys?: string[] }
+    userKey: string | null
+  }> = []
 
   const ok = (data: unknown, extra: Record<string, unknown> = {}) =>
     new Response(JSON.stringify({ err_code: 0, err_msg: '', data, ...extra }), {
@@ -102,6 +106,21 @@ function meegoMock() {
       const keys = body.user_keys ?? (body.emails ?? []).map(e => `key-of-${e}`)
       return ok(keys.map(k => ({ user_key: k, name_cn: `用户${k}`, email: `${k}@x.com` })))
     }
+    if (url.pathname.endsWith('/work_item/filter')) {
+      const body = JSON.parse(String(init?.body)) as {
+        user_keys?: string[]
+        work_item_type_keys?: string[]
+      }
+      filterCalls.push({ body, userKey: headers.get('X-USER-KEY') })
+      // 回两条,一条 OPEN 一条 RESOLVED,供状态筛选断言
+      return ok(
+        [
+          { id: 111, name: '缺陷A', work_item_status: { state_key: 'OPEN' } },
+          { id: 222, name: '缺陷B', work_item_status: { state_key: 'RESOLVED' } },
+        ],
+        { pagination: { page_num: 1, page_size: 50, total: 2 } },
+      )
+    }
     return new Response('no such mock path', { status: 404 })
   })
 
@@ -109,6 +128,7 @@ function meegoMock() {
     fetchMock,
     authCalls: () => authCalls,
     commentCalls,
+    filterCalls,
     revokeAllTokens: () => validTokens.clear(),
   }
 }
@@ -197,18 +217,20 @@ describe('envelope 鉴权与上下文', () => {
 })
 
 describe('List / Get', () => {
-  it('List 返回四工具;add_comment 标 destructive、list_comments 标 read', async () => {
+  it('List 返回五工具;add_comment 标 destructive、filter_work_items 标 read', async () => {
     const res = await envelope('List', {})
     expect(res.status).toBe(200)
     const tools = (await res.json()) as Array<{ effect?: string, name: string }>
     expect(tools.map(t => t.name).sort()).toEqual([
       'add_comment',
+      'filter_work_items',
       'list_comments',
       'query_user',
       'whoami',
     ])
     expect(tools.find(t => t.name === 'add_comment')?.effect).toBe('destructive')
     expect(tools.find(t => t.name === 'list_comments')?.effect).toBe('read')
+    expect(tools.find(t => t.name === 'filter_work_items')?.effect).toBe('read')
   })
 
   it('Get 未知工具 → 404', async () => {
@@ -352,6 +374,58 @@ describe('query_user / list_comments', () => {
     }
     expect(body.content.comments[0]?.operator).toBe('uk_alice_001')
     expect(body.content.pagination.total).toBe(1)
+  })
+})
+
+describe('filter_work_items(按人查工作项)', () => {
+  it('透传 user_keys/type,返回工作项含状态', async () => {
+    const upstream = meegoMock()
+    vi.stubGlobal('fetch', upstream.fetchMock)
+
+    const res = await envelope('Call', {
+      name: 'filter_work_items',
+      args: {
+        project_key: PROJECT_KEY,
+        work_item_type_keys: ['issue'],
+        user_keys: ['uk_target_person'],
+        page_size: 50,
+      },
+    })
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as {
+      content: {
+        pagination: { total: number }
+        work_items: Array<{ id: number, work_item_status: { state_key: string } }>
+      }
+    }
+    // 透传给 open_api 的筛选条件正确
+    expect(upstream.filterCalls).toHaveLength(1)
+    expect(upstream.filterCalls[0]?.body.user_keys).toEqual(['uk_target_person'])
+    expect(upstream.filterCalls[0]?.body.work_item_type_keys).toEqual(['issue'])
+    // 返回工作项带状态,供未处理筛选
+    expect(body.content.work_items.map(w => w.work_item_status.state_key)).toEqual([
+      'OPEN',
+      'RESOLVED',
+    ])
+    expect(body.content.pagination.total).toBe(2)
+  })
+
+  it('缺 project_key → 400', async () => {
+    const upstream = meegoMock()
+    vi.stubGlobal('fetch', upstream.fetchMock)
+    const res = await envelope('Call', { name: 'filter_work_items', args: {} })
+    expect(res.status).toBe(400)
+  })
+
+  it('未绑定 key → 403,不打上游', async () => {
+    const upstream = meegoMock()
+    vi.stubGlobal('fetch', upstream.fetchMock)
+    const res = await envelope('Call', {
+      name: 'filter_work_items',
+      args: { project_key: PROJECT_KEY },
+    }, { headers: { [HEADER_TB_CONTEXT]: tbContext('key-stranger', USER_KEYS) } })
+    expect(res.status).toBe(403)
+    expect(upstream.filterCalls).toHaveLength(0)
   })
 })
 
