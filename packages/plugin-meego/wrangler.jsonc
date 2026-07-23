@@ -1,0 +1,14 @@
+{
+  // Meego tool-provider plugin Worker。secrets:PLUGIN_TOKEN(注册后 wrangler secret put);
+  // Meego 凭证(plugin_id/plugin_secret)不在此配——存平台 SecretStore,经 X-TB-Upstream-Auth 每次传入。
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "tb-plugin-meego",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-06-01",
+  "compatibility_flags": ["nodejs_compat"],
+  // DJJ 账户(与 gateway 同;wrangler OAuth 多账户须显式指定)。
+  "account_id": "0cb9b897010bc426cd8bf33d8c052d11",
+  "observability": {
+    "enabled": true
+  }
+}
