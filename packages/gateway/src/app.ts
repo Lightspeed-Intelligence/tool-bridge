@@ -36,8 +36,12 @@ export interface Env {
   TB_KV: KVNamespace
   /** X-TB-Via 跳数上限(默认 4)。 */
   TB_MAX_HOPS?: string
-  /** meego 自动绑定用的空间 projectKey(缺省 → 跳过 meego 绑定)。 */
-  TB_MEEGO_PROJECT_KEY?: string
+  /** meego 自动绑定:承载 userKeys 映射的 tool 节点路径(如 "plugins/meego")。与 SECRET_REF 都配才启用。 */
+  TB_MEEGO_BIND_NODE?: string
+  /** meego 自动绑定:转 union_id 用的登录 app 凭证引用(缺省复用 TB_FEISHU_LOGIN_SECRET_REF)。 */
+  TB_MEEGO_LOGIN_SECRET_REF?: string
+  /** meego 自动绑定:meego 插件凭证 {plugin_id,plugin_secret} 的 SecretStore 引用(如 "meego-app")。 */
+  TB_MEEGO_SECRET_REF?: string
   TB_R2: R2Bucket
   /** r2 presign 凭证链的 env 段(SecretStore 'r2-presign' 优先)。 */
   TB_R2_ACCESS_KEY_ID?: string
@@ -169,8 +173,18 @@ function depsFromEnv(env: Env): TbAppDeps {
   }
   const loginTtl = positiveIntEnv(env.TB_FEISHU_LOGIN_KEY_TTL_SEC)
   if (loginTtl !== undefined) deps.feishuLoginKeyTtlSec = loginTtl
-  if (env.TB_MEEGO_PROJECT_KEY !== undefined && env.TB_MEEGO_PROJECT_KEY !== '') {
-    deps.meegoProjectKey = env.TB_MEEGO_PROJECT_KEY
+  // meego 自动绑定:节点路径 + meego 凭证引用都配了才启用(open_id → union_id → user_key)。
+  if (
+    env.TB_MEEGO_BIND_NODE !== undefined && env.TB_MEEGO_BIND_NODE !== ''
+    && env.TB_MEEGO_SECRET_REF !== undefined && env.TB_MEEGO_SECRET_REF !== ''
+  ) {
+    deps.meegoBind = {
+      nodePath: env.TB_MEEGO_BIND_NODE,
+      secretRef: env.TB_MEEGO_SECRET_REF,
+      ...(env.TB_MEEGO_LOGIN_SECRET_REF !== undefined && env.TB_MEEGO_LOGIN_SECRET_REF !== ''
+        ? { loginSecretRef: env.TB_MEEGO_LOGIN_SECRET_REF }
+        : {}),
+    }
   }
   return deps
 }

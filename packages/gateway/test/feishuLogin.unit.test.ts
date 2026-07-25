@@ -109,20 +109,18 @@ describe('rotateLoginKey', () => {
   })
 })
 
-describe('bindMeegoIdentity(best-effort)', () => {
+describe('bindMeegoIdentity(open_id → union_id → user_key,best-effort)', () => {
   const base = (over: Partial<MeegoBindDeps>): MeegoBindDeps => ({
-    listMemberUserKeys: async () => ['uk1', 'uk2', 'uk3'],
-    queryOutId: async keys =>
-      Object.fromEntries(keys.map(k => [k, `out_${k}`])),
+    loginOpenIdToUnionId: async openId => (openId === 'ou_target' ? 'on_union_target' : null),
+    queryUserKeyByUnionId: async unionId => (unionId === 'on_union_target' ? 'uk2' : null),
     getMeegoUserKeys: async () => ({ existing: 'ukX' }),
     setMeegoUserKeys: async () => {},
     ...over,
   })
 
-  it('open_id 命中成员 out_id → 绑定并合并写回', async () => {
+  it('open_id → union_id → user_key 全通 → 绑定并合并写回', async () => {
     let written: Record<string, string> | undefined
     const deps = base({
-      queryOutId: async keys => Object.fromEntries(keys.map(k => [k, k === 'uk2' ? 'ou_target' : `out_${k}`])),
       setMeegoUserKeys: async (next) => {
         written = next
       },
@@ -132,21 +130,20 @@ describe('bindMeegoIdentity(best-effort)', () => {
     expect(written).toEqual({ existing: 'ukX', newKeyId: 'uk2' }) // 合并,不覆盖已有
   })
 
-  it('无成员候选 → 不绑定', async () => {
-    const r = await bindMeegoIdentity(base({ listMemberUserKeys: async () => [] }), 'k', 'ou_x')
+  it('open_id 转 union_id 失败 → 不绑定(登录 app 无通讯录权限场景)', async () => {
+    const r = await bindMeegoIdentity(base({ loginOpenIdToUnionId: async () => null }), 'k', 'ou_x')
     expect(r.bound).toBe(false)
   })
 
-  it('open_id 不匹配任何成员 → 不绑定(跨 app 不对齐场景)', async () => {
-    const r = await bindMeegoIdentity(base({}), 'k', 'ou_nobody')
+  it('union_id 查不到 meego 成员 → 不绑定(此人不在空间)', async () => {
+    const deps = base({ queryUserKeyByUnionId: async () => null })
+    const r = await bindMeegoIdentity(deps, 'k', 'ou_target')
     expect(r.bound).toBe(false)
   })
 
   it('任何环节抛错 → 吞掉返回 bound:false,不阻断', async () => {
     const deps = base({
-      listMemberUserKeys: async () => {
-        throw new Error('meego down')
-      },
+      loginOpenIdToUnionId: async () => { throw new Error('meego down') },
     })
     const r = await bindMeegoIdentity(deps, 'k', 'ou_x')
     expect(r).toEqual({ bound: false, reason: 'meego down' })

@@ -279,28 +279,132 @@ export async function rotateLoginKey(
   return { keyId: key.id, secret }
 }
 
-// ---------- meego 自动绑定(open_id → user_key,best-effort) ----------
+// ---------- meego 自动绑定(open_id → union_id → user_key) ----------
 //
-// ⚠️ 实证结论(2026-07-25,真机登录验证):open_id 按 app 隔离,登录 app
-// (cli_a9155139)与 meego app 给同一个人的 open_id **不同源**——
-//   登录 open_id = ou_fe43cd1b...(ou_ 前缀)
-//   meego out_id = on_9540d6b7...(on_ 前缀)
-// 故「用登录 open_id 匹配 meego out_id」这条路走不通(queryOutId 匹配恒失败)。
-// 跨 app 稳定标识只有 union_id,但 meego query_user 不返回 union_id(待验证 meego
-// open_api 是否支持按 union_id 查)。在此路打通前,meego 绑定只能由管理员手动
-// patch userKeys(手动绑定已验证可用:绑后登录 key 调 meego 即以本人身份落地)。
-// 下方注入面保留,便于未来 union_id 路打通后直接接入。
+// ✅ 打通路径(2026-07-25 真机全链路验证):
+//   登录 open_id(ou_xxx,登录 app 下)
+//     → 飞书通讯录 API 转 union_id(on_xxx,企业内跨 app 唯一)
+//     → meego user/query { out_ids:[union_id] } 直查 user_key(一步命中,无需遍历)
+// 关键订正:meego 的 out_id 前缀是 on_,它**本身就是 union_id**(on_=union_id、ou_=open_id)。
+// 此前"用登录 open_id 直接比 out_id"必然失败,根因是身份类型错配,而非跨 app 不可达。
+
+/** meego 插件凭证形状:{plugin_id, plugin_secret}(存 SecretStore,如 "meego-app")。 */
+export interface MeegoCredential {
+  plugin_id: string
+  plugin_secret: string
+}
+
+/** 解析 meego 凭证 JSON;形状不符 → unavailable。 */
+export function parseMeegoCredential(raw: string | undefined, refName: string): MeegoCredential {
+  if (raw !== undefined) {
+    try {
+      const v = JSON.parse(raw) as Partial<MeegoCredential>
+      if (typeof v.plugin_id === 'string' && v.plugin_id !== '' && typeof v.plugin_secret === 'string' && v.plugin_secret !== '') {
+        return { plugin_id: v.plugin_id, plugin_secret: v.plugin_secret }
+      }
+    } catch {
+      // fallthrough
+    }
+  }
+  throw new TBError('unavailable', `meego 凭证 '${refName}' 不是 {"plugin_id","plugin_secret"} 形状的 JSON`, { retryable: false })
+}
+
+/** meego open_api base(与 plugin-meego 默认一致;私有化可 override)。 */
+export const MEEGO_BASE = 'https://project.feishu.cn'
+
+/** 换登录 app 的 app_access_token(通讯录 API 用;失败 → unavailable)。 */
+export async function feishuAppAccessToken(cred: FeishuAppCredential): Promise<string> {
+  let resp: Response
+  try {
+    resp = await fetch(`${FEISHU_BASE}/open-apis/auth/v3/app_access_token/internal`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json; charset=utf-8' },
+      body: JSON.stringify({ app_id: cred.app_id, app_secret: cred.app_secret }),
+    })
+  } catch (err) {
+    throw new TBError('unavailable', `app_access_token 网络失败:${err instanceof Error ? err.message : String(err)}`, { retryable: true })
+  }
+  const body = (await resp.json().catch(() => null)) as { app_access_token?: string, code?: number, msg?: string } | null
+  const token = body?.app_access_token
+  if (!resp.ok || body === null || body.code !== 0 || typeof token !== 'string' || token === '') {
+    throw new TBError('unavailable', `app_access_token 失败:code=${body?.code ?? '?'} ${body?.msg ?? ''}`.trim(), { retryable: false })
+  }
+  return token
+}
+
+/** open_id → union_id(飞书通讯录 GET users/{open_id}?user_id_type=open_id)。查不到 → null。 */
+export async function openIdToUnionId(appToken: string, openId: string): Promise<string | null> {
+  let resp: Response
+  try {
+    resp = await fetch(
+      `${FEISHU_BASE}/open-apis/contact/v3/users/${encodeURIComponent(openId)}?user_id_type=open_id`,
+      { headers: { authorization: `Bearer ${appToken}` } },
+    )
+  } catch {
+    return null
+  }
+  const body = (await resp.json().catch(() => null)) as { code?: number, data?: { user?: { union_id?: string } } } | null
+  const unionId = body?.data?.user?.union_id
+  return typeof unionId === 'string' && unionId !== '' ? unionId : null
+}
+
+/** 换 meego plugin_token(type:0 正式);失败 → null(best-effort 不抛)。 */
+async function meegoPluginToken(cred: MeegoCredential): Promise<string | null> {
+  try {
+    const resp = await fetch(`${MEEGO_BASE}/open_api/authen/plugin_token`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json; charset=utf-8' },
+      body: JSON.stringify({ plugin_id: cred.plugin_id, plugin_secret: cred.plugin_secret, type: 0 }),
+    })
+    const body = (await resp.json().catch(() => null)) as { data?: { token?: string }, error?: { code?: number } } | null
+    const token = body?.data?.token
+    return body?.error?.code === 0 && typeof token === 'string' && token !== '' ? token : null
+  } catch {
+    return null
+  }
+}
 
 /**
- * meego 绑定所需的最小注入面(解耦 Hono/provider):
- * - listMemberUserKeys:拉 meego 空间成员的 user_key 候选集(分页已在实现内收敛)
- * - queryOutId:给定 user_key 批量取 out_id(=飞书 open_id);返回 { user_key: out_id }
- * - getMeegoUserKeys / setMeegoUserKeys:读/整体写回 plugins/meego 的 providerConfig.userKeys
+ * union_id → meego user_key。走 open_api `user/query { out_ids:[union_id] }`(meego out_id 即
+ * union_id)。X-USER-KEY 需合法操作人(operatorUserKey,空间内任意已知成员)。失败 → null。
+ */
+export async function queryMeegoUserKeyByUnionId(
+  cred: MeegoCredential,
+  operatorUserKey: string,
+  unionId: string,
+): Promise<string | null> {
+  const pat = await meegoPluginToken(cred)
+  if (pat === null) return null
+  let resp: Response
+  try {
+    resp = await fetch(`${MEEGO_BASE}/open_api/user/query`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json; charset=utf-8',
+        'X-PLUGIN-TOKEN': pat,
+        'X-USER-KEY': operatorUserKey,
+      },
+      body: JSON.stringify({ out_ids: [unionId] }),
+    })
+  } catch {
+    return null
+  }
+  const body = (await resp.json().catch(() => null)) as { data?: Array<{ user_key?: string }>, err_code?: number } | null
+  if (body?.err_code !== 0) return null
+  const uk = (body.data ?? [])[0]?.user_key
+  return typeof uk === 'string' && uk !== '' ? uk : null
+}
+
+/**
+ * meego 绑定的最小注入面(解耦 Hono/provider,便于单测):
+ * - loginOpenIdToUnionId:登录 open_id → union_id(内部用登录 app 通讯录 API;失败 null)
+ * - queryUserKeyByUnionId:union_id → meego user_key(内部走 meego user/query out_ids;失败 null)
+ * - getMeegoUserKeys / setMeegoUserKeys:读 / 整体写回 plugins/meego 的 providerConfig.userKeys
  */
 export interface MeegoBindDeps {
   getMeegoUserKeys: () => Promise<Record<string, string>>
-  listMemberUserKeys: () => Promise<string[]>
-  queryOutId: (userKeys: string[]) => Promise<Record<string, string>>
+  loginOpenIdToUnionId: (openId: string) => Promise<string | null>
+  queryUserKeyByUnionId: (unionId: string) => Promise<string | null>
   setMeegoUserKeys: (next: Record<string, string>) => Promise<void>
 }
 
@@ -309,9 +413,8 @@ export type MeegoBindResult
     | { bound: false, reason: string }
 
 /**
- * 把新签发的 keyId 绑定到 meego 操作人身份:按 open_id 反查 user_key,写入映射表。
- * best-effort:任何环节失败(反查不到 / meego 不可用 / open_id 跨 app 不对齐)都不抛,
- * 返回 { bound:false, reason },由调用方在回调页提示"meego 身份待管理员绑定"。
+ * 把新签发的 keyId 绑定到 meego 操作人身份:open_id → union_id → user_key,写入映射表。
+ * best-effort:任一环节失败都不抛,返回 { bound:false, reason },由调用方在回调页提示,不阻断发 key。
  */
 export async function bindMeegoIdentity(
   deps: MeegoBindDeps,
@@ -319,26 +422,17 @@ export async function bindMeegoIdentity(
   openId: string,
 ): Promise<MeegoBindResult> {
   try {
-    const candidates = await deps.listMemberUserKeys()
-    if (candidates.length === 0) return { bound: false, reason: 'meego 空间无成员候选' }
-    // 批量取 out_id,匹配 open_id。meego query_user 一次限 20,分批。
-    let matched: string | undefined
-    for (let i = 0; i < candidates.length && matched === undefined; i += 20) {
-      const batch = candidates.slice(i, i + 20)
-      const outIds = await deps.queryOutId(batch)
-      for (const [uk, outId] of Object.entries(outIds)) {
-        if (outId === openId) {
-          matched = uk
-          break
-        }
-      }
+    const unionId = await deps.loginOpenIdToUnionId(openId)
+    if (unionId === null) {
+      return { bound: false, reason: 'open_id 转 union_id 失败(登录 app 无通讯录权限?)' }
     }
-    if (matched === undefined) {
-      return { bound: false, reason: 'open_id 未匹配到 meego 成员(可能跨 app 不对齐)' }
+    const userKey = await deps.queryUserKeyByUnionId(unionId)
+    if (userKey === null) {
+      return { bound: false, reason: 'union_id 未匹配到 meego 成员(此人不在该空间?)' }
     }
     const current = await deps.getMeegoUserKeys()
-    await deps.setMeegoUserKeys({ ...current, [keyId]: matched })
-    return { bound: true, userKey: matched }
+    await deps.setMeegoUserKeys({ ...current, [keyId]: userKey })
+    return { bound: true, userKey }
   } catch (err) {
     return { bound: false, reason: err instanceof Error ? err.message : String(err) }
   }
