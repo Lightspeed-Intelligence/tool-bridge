@@ -34,6 +34,7 @@ import {
   negotiate,
   type NodeConfig,
   NodeRegistryStore,
+  normalizePath,
   type ObjectStore,
   optionalMethodsForCapabilities,
   parseNodeInput,
@@ -75,11 +76,15 @@ import {
   DEFAULT_KEY_TTL_SEC,
   exchangeUserToken,
   FEISHU_CALLBACK_PATH,
+  feishuAppAccessToken,
   fetchUserInfo,
   type MeegoBindDeps,
   newLoginState,
+  openIdToUnionId,
   openLoginState,
   parseFeishuCredential,
+  parseMeegoCredential,
+  queryMeegoUserKeyByUnionId,
   renderLoginFailedHtml,
   renderLoginSuccessHtml,
   rotateLoginKey,
@@ -160,8 +165,14 @@ export interface TbAppDeps {
   feishuLoginSecretRef?: string
   /** SDK 进程内 Provider 表(缺省无)。 */
   locals?: LocalProviderHooks
-  /** meego 自动绑定用的空间 projectKey(缺省 → 跳过 meego 绑定,SK 照发)。 */
-  meegoProjectKey?: string
+  /**
+   * 飞书登录后自动绑定 meego 操作人身份(缺省 → 跳过绑定,SK 照发)。
+   * - nodePath:承载 userKeys 映射的 tool 节点(如 "plugins/meego")。
+   * - secretRef:meego 插件凭证 {plugin_id,plugin_secret} 的 SecretStore 引用(如 "meego-app")。
+   * - loginSecretRef:转 union_id 用的登录 app 凭证引用(缺省复用 feishuLoginSecretRef;
+   *   该 app 须有通讯录读权限;open_id 归属登录 app,须同 app 转 union_id)。
+   */
+  meegoBind?: { loginSecretRef?: string, nodePath: string, secretRef: string }
   /** context 平台对象存储('r2' provider 的落点);缺省 → 该 provider unavailable。 */
   objects?: () => Promise<ObjectStore> | ObjectStore
   /** context Get 的 $ref 内联阈值(字节,缺省 1 MiB)。 */
@@ -1216,19 +1227,52 @@ function renderTreeDsl(tree: TreeJson): string {
   return `${lines.join('\n')}\n`
 }
 /**
- * meego 自动绑定的注入面装配(open_id → user_key)。
+ * meego 自动绑定注入面装配(open_id → union_id → user_key)。缺 meegoBind → null(不绑,SK 照发)。
  *
- * 现状(2026-07-25,真机验证后):暂返回 null(不自动绑定)。
- * open_id 按 app 隔离已被实测坐实——登录 app 的 open_id(ou_fe43cd1b...)与 meego
- * out_id(on_9540d6b7...)不同源,故基于 open_id 的 queryOutId 匹配恒失败(见 feishuLogin.ts
- * meego 段注释)。跨 app 稳定标识只有 union_id,待验证 meego open_api 是否支持按 union_id
- * 查 user_key;打通前 meego 绑定由管理员手动 patch userKeys(已验证可用)。
- * union_id 路打通后:在此按 deps.meegoProjectKey 装配注入面,bindMeegoIdentity 即自动生效。
+ * 链路(2026-07-25 真机全链路验证):登录 open_id → 登录 app 通讯录转 union_id →
+ * meego user/query{out_ids} 查 user_key → merge 写回 nodePath 的 providerConfig.userKeys。
+ * meego out_id 即 union_id(on_ 前缀),out_ids 直查一步命中。操作人 X-USER-KEY 取节点
+ * 现有 userKeys 任一已绑成员(仅作合法操作人头,不影响查询目标)。
  */
 function meegoBindDepsFor(deps: TbAppDeps): MeegoBindDeps | null {
-  if (deps.meegoProjectKey === undefined) return null
-  // open_id 跨 app 不对齐已实证;union_id 路未打通前不自动绑,避免签发误绑他人身份。
-  return null
+  const cfg = deps.meegoBind
+  if (cfg === undefined) return null
+  const registry = new NodeRegistryStore(deps.state)
+  const nodePath = normalizePath(cfg.nodePath)
+  const loginRef = cfg.loginSecretRef ?? deps.feishuLoginSecretRef
+
+  const readUserKeys = async (): Promise<Record<string, string>> => {
+    const node = await registry.get(nodePath).catch(() => null)
+    const pc = (node?.config as { providerConfig?: { userKeys?: unknown } } | undefined)?.providerConfig
+    const uk = pc?.userKeys
+    return typeof uk === 'object' && uk !== null ? { ...(uk as Record<string, string>) } : {}
+  }
+
+  return {
+    getMeegoUserKeys: readUserKeys,
+    setMeegoUserKeys: async (next) => {
+      const node = await registry.get(nodePath)
+      const config = { ...(node.config as Record<string, unknown>) }
+      const providerConfig = { ...((config.providerConfig as Record<string, unknown>) ?? {}), userKeys: next }
+      await registry.update(
+        nodePath,
+        { config: { ...config, providerConfig } as unknown as NodeConfig },
+        new Date().toISOString(),
+      )
+    },
+    loginOpenIdToUnionId: async (openId) => {
+      if (loginRef === undefined) return null
+      const cred = parseFeishuCredential(await deps.secrets.resolve(loginRef), loginRef)
+      const appToken = await feishuAppAccessToken(cred)
+      return await openIdToUnionId(appToken, openId)
+    },
+    queryUserKeyByUnionId: async (unionId) => {
+      const meegoCred = parseMeegoCredential(await deps.secrets.resolve(cfg.secretRef), cfg.secretRef)
+      const operator = Object.values(await readUserKeys())[0]
+      if (operator === undefined) return null
+      return await queryMeegoUserKeyByUnionId(meegoCred, operator, unionId)
+    },
+  }
 }
 
 export function createTbApp(deps: TbAppDeps): Hono<{ Variables: Vars }> {
