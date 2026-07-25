@@ -280,6 +280,16 @@ export async function rotateLoginKey(
 }
 
 // ---------- meego 自动绑定(open_id → user_key,best-effort) ----------
+//
+// ⚠️ 实证结论(2026-07-25,真机登录验证):open_id 按 app 隔离,登录 app
+// (cli_a9155139)与 meego app 给同一个人的 open_id **不同源**——
+//   登录 open_id = ou_fe43cd1b...(ou_ 前缀)
+//   meego out_id = on_9540d6b7...(on_ 前缀)
+// 故「用登录 open_id 匹配 meego out_id」这条路走不通(queryOutId 匹配恒失败)。
+// 跨 app 稳定标识只有 union_id,但 meego query_user 不返回 union_id(待验证 meego
+// open_api 是否支持按 union_id 查)。在此路打通前,meego 绑定只能由管理员手动
+// patch userKeys(手动绑定已验证可用:绑后登录 key 调 meego 即以本人身份落地)。
+// 下方注入面保留,便于未来 union_id 路打通后直接接入。
 
 /**
  * meego 绑定所需的最小注入面(解耦 Hono/provider):
