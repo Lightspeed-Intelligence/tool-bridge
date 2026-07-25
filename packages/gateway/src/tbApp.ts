@@ -1218,17 +1218,16 @@ function renderTreeDsl(tree: TreeJson): string {
 /**
  * meego 自动绑定的注入面装配(open_id → user_key)。
  *
- * 现状(2026-07):暂返回 null(不绑定)——两个前置未破:
- * (1) 登录 app 与 meego app 的 open_id 是否同源(跨 app 隔离,meego 不返回 union_id),
- *     需真机登录拿到 open_id 与 meego out_id 实测比对;
- * (2) meego 成员枚举链路不稳(mcp/meego 官方节点 project_key 传参未通)。
- * 破验证后:在此按 deps.meegoProjectKey 装配 listMemberUserKeys/queryOutId/
- * getMeegoUserKeys/setMeegoUserKeys(经 providerFor(mcp/meego) 枚举 + NodeRegistryStore
- * 读改写 plugins/meego 的 providerConfig.userKeys),bindMeegoIdentity 即自动生效。
+ * 现状(2026-07-25,真机验证后):暂返回 null(不自动绑定)。
+ * open_id 按 app 隔离已被实测坐实——登录 app 的 open_id(ou_fe43cd1b...)与 meego
+ * out_id(on_9540d6b7...)不同源,故基于 open_id 的 queryOutId 匹配恒失败(见 feishuLogin.ts
+ * meego 段注释)。跨 app 稳定标识只有 union_id,待验证 meego open_api 是否支持按 union_id
+ * 查 user_key;打通前 meego 绑定由管理员手动 patch userKeys(已验证可用)。
+ * union_id 路打通后:在此按 deps.meegoProjectKey 装配注入面,bindMeegoIdentity 即自动生效。
  */
 function meegoBindDepsFor(deps: TbAppDeps): MeegoBindDeps | null {
   if (deps.meegoProjectKey === undefined) return null
-  // TODO(open_id 跨 app 对齐验证后接入):当前即便配了 projectKey 也先不绑,避免赌未验证的假设。
+  // open_id 跨 app 不对齐已实证;union_id 路未打通前不自动绑,避免签发误绑他人身份。
   return null
 }
 
