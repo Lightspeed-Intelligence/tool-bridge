@@ -54,6 +54,7 @@ import {
   type SkillhubProvider,
   skillhubScopeForCmd,
   type SkillPublishFile,
+  SKRegistryStore,
   type StateStore,
   TBError,
   type TBErrorBody,
@@ -68,6 +69,21 @@ import {
 } from '@tool-bridge/core'
 import { type Context, Hono } from 'hono'
 import type { UpstreamProvider } from './providers/types'
+import {
+  bindMeegoIdentity,
+  buildAuthorizeUrl,
+  DEFAULT_KEY_TTL_SEC,
+  exchangeUserToken,
+  FEISHU_CALLBACK_PATH,
+  fetchUserInfo,
+  type MeegoBindDeps,
+  newLoginState,
+  openLoginState,
+  parseFeishuCredential,
+  renderLoginFailedHtml,
+  renderLoginSuccessHtml,
+  rotateLoginKey,
+} from './feishuLogin'
 import {
   finishMcpAuthorization,
   invalidateMcpOAuth,
@@ -135,8 +151,17 @@ export interface TbAppDeps {
   encryptionKey?: string
   /** 认证前的实例就绪钩子(引导/延迟注册 flush);每请求调用,幂等由宿主保证。 */
   ensureReady?: () => Promise<void>
+  /** 飞书登录签发 key 的有效期秒(缺省 90 天)。 */
+  feishuLoginKeyTtlSec?: number
+  /**
+   * 飞书登录:SecretStore 中 {app_id,app_secret} 的引用名(默认复用 feishu plugin 的 "feishu-app")。
+   * 缺省 → /login 与 /~feishu/callback 返回 unavailable(未启用登录)。
+   */
+  feishuLoginSecretRef?: string
   /** SDK 进程内 Provider 表(缺省无)。 */
   locals?: LocalProviderHooks
+  /** meego 自动绑定用的空间 projectKey(缺省 → 跳过 meego 绑定,SK 照发)。 */
+  meegoProjectKey?: string
   /** context 平台对象存储('r2' provider 的落点);缺省 → 该 provider unavailable。 */
   objects?: () => Promise<ObjectStore> | ObjectStore
   /** context Get 的 $ref 内联阈值(字节,缺省 1 MiB)。 */
@@ -1190,6 +1215,23 @@ function renderTreeDsl(tree: TreeJson): string {
   walk(tree, 0)
   return `${lines.join('\n')}\n`
 }
+/**
+ * meego 自动绑定的注入面装配(open_id → user_key)。
+ *
+ * 现状(2026-07):暂返回 null(不绑定)——两个前置未破:
+ * (1) 登录 app 与 meego app 的 open_id 是否同源(跨 app 隔离,meego 不返回 union_id),
+ *     需真机登录拿到 open_id 与 meego out_id 实测比对;
+ * (2) meego 成员枚举链路不稳(mcp/meego 官方节点 project_key 传参未通)。
+ * 破验证后:在此按 deps.meegoProjectKey 装配 listMemberUserKeys/queryOutId/
+ * getMeegoUserKeys/setMeegoUserKeys(经 providerFor(mcp/meego) 枚举 + NodeRegistryStore
+ * 读改写 plugins/meego 的 providerConfig.userKeys),bindMeegoIdentity 即自动生效。
+ */
+function meegoBindDepsFor(deps: TbAppDeps): MeegoBindDeps | null {
+  if (deps.meegoProjectKey === undefined) return null
+  // TODO(open_id 跨 app 对齐验证后接入):当前即便配了 projectKey 也先不绑,避免赌未验证的假设。
+  return null
+}
+
 export function createTbApp(deps: TbAppDeps): Hono<{ Variables: Vars }> {
   const app = new Hono<{ Variables: Vars }>()
   const builtinsOf = (store: StateStore): Map<string, BuiltinModule> =>
@@ -1328,6 +1370,81 @@ export function createTbApp(deps: TbAppDeps): Hono<{ Variables: Vars }> {
         return renderOAuthCallbackHtml(false, detail)
       }
       return renderOAuthCallbackHtml(true, `mcp mount '${payload.p}' is now authorized`)
+    }),
+  )
+
+  // 飞书登录换 key:redirect_uri 钉在 canonicalOrigin(或请求 origin)。
+  const loginRedirectUri = (c: AppContext): string =>
+    `${deps.canonicalOrigin ?? new URL(c.req.url).origin}${FEISHU_CALLBACK_PATH}`
+
+  // GET /login → 生成加密 state,302 跳飞书授权页。树外免认证(无 SK 时可访问)。
+  app.get('/login', c =>
+    runHandler(async () => {
+      const encKey = deps.encryptionKey
+      const secretRef = deps.feishuLoginSecretRef
+      if (encKey === undefined || secretRef === undefined) {
+        return renderLoginFailedHtml('飞书登录未启用(缺 encryptionKey 或 feishuLoginSecretRef)')
+      }
+      await deps.ensureReady?.()
+      const cred = parseFeishuCredential(await deps.secrets.resolve(secretRef), secretRef)
+      const state = await newLoginState(encKey, Date.now())
+      const url = buildAuthorizeUrl(cred.app_id, loginRedirectUri(c), state)
+      return c.redirect(url, 302)
+    }),
+  )
+
+  // GET /~feishu/callback → 校验 state → 换 token → 拿 open_id → rotate 签发 → meego 绑定 → 展示 SK。
+  app.get(FEISHU_CALLBACK_PATH, c =>
+    runHandler(async () => {
+      const encKey = deps.encryptionKey
+      const secretRef = deps.feishuLoginSecretRef
+      if (encKey === undefined || secretRef === undefined) {
+        return renderLoginFailedHtml('飞书登录未启用')
+      }
+      const q = c.req.query()
+      if (q.error !== undefined) return renderLoginFailedHtml(`飞书返回:${q.error}`)
+      const code = q.code
+      const state = q.state
+      if (code === undefined || state === undefined) {
+        return renderLoginFailedHtml('缺 code 或 state 参数')
+      }
+      const payload = await openLoginState(state, encKey)
+      if (payload === null || payload.exp * 1000 <= Date.now()) {
+        return renderLoginFailedHtml('state 非法或已过期,请重新登录')
+      }
+      await deps.ensureReady?.()
+      const cred = parseFeishuCredential(await deps.secrets.resolve(secretRef), secretRef)
+      let openId: string
+      let name: string | undefined
+      try {
+        const userToken = await exchangeUserToken(cred, code, loginRedirectUri(c))
+        const info = await fetchUserInfo(userToken)
+        openId = info.open_id
+        name = info.name
+      } catch (err) {
+        return renderLoginFailedHtml(isTBError(err) ? err.message : '飞书授权失败')
+      }
+      const now = new Date().toISOString()
+      const sk = new SKRegistryStore(deps.state)
+      const { keyId, secret } = await rotateLoginKey(sk, openId, now, {
+        ttlSec: deps.feishuLoginKeyTtlSec ?? DEFAULT_KEY_TTL_SEC,
+      })
+      // meego 自动绑定(best-effort;projectKey 未配则跳过)。
+      let meegoNote: string | undefined
+      const bindDeps = meegoBindDepsFor(deps)
+      if (bindDeps !== null) {
+        const r = await bindMeegoIdentity(bindDeps, keyId, openId)
+        meegoNote = r.bound
+          ? `已绑定 meego 操作人身份(user_key=${r.userKey}),评论/写操作将以你本人落地。`
+          : `meego 身份未自动绑定(${r.reason}),如需 meego 写操作请联系管理员绑定。`
+      }
+      const baseUrl = deps.canonicalOrigin ?? new URL(c.req.url).origin
+      return renderLoginSuccessHtml({
+        secret,
+        baseUrl,
+        ...(name !== undefined ? { name } : {}),
+        ...(meegoNote !== undefined ? { meegoNote } : {}),
+      })
     }),
   )
 
