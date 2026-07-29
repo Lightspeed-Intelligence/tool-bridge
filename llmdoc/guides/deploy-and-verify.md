@@ -6,9 +6,9 @@
 
 ### 1. 本地验证:`pnpm verify`
 
-typecheck + biome lint + 单测(core/cli/sdk)+ 集成测试(gateway 真实 workerd + server 纯 Node + plugin-feishu 真实 workerd)一把过。
+typecheck + eslint + 单测(core/cli/sdk)+ 集成测试(gateway 真实 workerd + server 纯 Node + plugin-feishu / plugin-meego / plugin-bytebase 真实 workerd)一把过。
 
-2026-07-10 快照:core `681 passed`、cli `162 passed`、sdk `12 passed | 1 skipped`、gateway `119 passed | 6 skipped`、server `23 passed`、plugin-feishu `8 passed`,合计 **1005 passed / 7 skipped**。数字随开发增长,以全 pass 和退出码 0 为准;任一段红即停,先修再继续。
+2026-07-29 快照:core `699 passed`、cli `233 passed`、sdk `12 passed | 1 skipped`、gateway `145 passed | 6 skipped`、server `24 passed`、plugin-feishu `8 passed`、plugin-meego `20 passed`、plugin-bytebase `14 passed`,合计 **1155 passed / 7 skipped**。数字随开发增长,以全 pass 和退出码 0 为准;任一段红即停,先修再继续。
 
 ### 2. 先确认部署状态,再决定是否手工部署
 
