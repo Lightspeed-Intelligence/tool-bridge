@@ -79,6 +79,22 @@ exports `.` / `./tbApp` / `./bootstrap` / `./deviceHello`(供 SDK 与 server 复
 | `test/plugin.integration.test.ts` | 8 例集成测试(vitest-pool-workers 真实 workerd;mock 换发接口与 MCP 上游,默认离线),含吊销 token 后 401 强制重换发自愈、凭证头缺失/坏形状、多租户不串号 |
 | env(`wrangler.jsonc`) | secrets:仅 `PLUGIN_TOKEN`(飞书凭证不落 plugin,由挂载 authRef 经 `X-TB-Upstream-Auth` 注入);vars:`FEISHU_ALLOWED_TOOLS`(默认白名单 8 工具;search-user/search-doc 仅 UAT 不列)、`FEISHU_MCP_URL` / `FEISHU_AUTH_URL`(测试 override) |
 
+## packages/plugin-bytebase — Bytebase tool-provider Plugin(private,CF Worker)
+
+Bytebase 自托管 MCP(`{baseUrl}/mcp`)的 tool-provider/v1 plugin,解决**托管 OAuth 须人工本机授权**问题:Bytebase `/mcp` 只认 OAuth bearer 且其 DCR 白名单只放行 loopback(直挂 `kind:mcp` 得走 `tb tool auth --local` 开浏览器,access token 1h 过期、refresh 轮换在多 isolate 并发下会互相作废)。本 plugin 改走**服务账号**:SA 的 `service_key` 换发访问令牌并缓存,401 强制重换发——零人工授权、永不过期。结构照抄 plugin-feishu(同一模式第三例)。
+
+| 文件 | 管什么 |
+|---|---|
+| `src/index.ts` | 契约面 GET `/healthz` / `/~describe` / `/~help` + POST `/` envelope(List/Get/Call);`PLUGIN_TOKEN` Bearer 鉴权;`RequestDedupe` 幂等;**上游凭证不自持**:从 `X-TB-Upstream-Auth` 读(base64url JSON `{"email","service_key"[,"base_url"]}`);实例地址 = 凭证 `base_url` > `BYTEBASE_BASE_URL`,皆缺 → unavailable;**上游 401 → 强制重换发令牌重试一次**(`withTokenRetry`);`EFFECT_BY_NAME` 按名兜底 effect(**Bytebase 3.19.0 的 tools/list 不带 annotations**,不兜底则 destructive 二次确认失效);白名单**双闸**(List 过滤 + Call 拒绝,知道名字也绕不过) |
+| `src/token.ts` | SA 访问令牌换发(`POST /v1/auth/login` body `{email,password:<service_key>,web:false}` → `{token}`)+ isolate 内存缓存(**按 `<baseUrl>\|<email>\|sha256(service_key)前16hex` 键控** —— key 摘要必须进键,2026-07-29 生产实测:漏了它则错 service_key 会命中同 email 的有效缓存并返回 200,既破坏"plugin 无凭证即空壳"也让 key 轮换延迟到旧令牌到期;多实例/多账号挂载不串号;刷新余量 5min)。响应**无 expires_in**,到期时刻从 JWT `exp` claim 解(`decodeExp`,只解不验签;读不到回落 30min 保守 TTL);实测 SA token audience `bb.user.access`、固定 1h。换发失败一律 `retryable:false`——Bytebase login 有按 email 的失败锁定,不重试放大 |
+| `src/bytebaseMcp.ts` | MCP SDK Streamable HTTP client:标准 `Authorization: Bearer`;isolate 内存会话复用(键与令牌缓存**同粒度**,含 key 摘要 —— 换了 key 即另一条身份链,会话不得复用;400/404 清会话重握手一次);401 原样抛出交给 index 重换发;`CfWorkerJsonSchemaValidator`(workerd 禁 eval,同 gateway 坑) |
+| `test/plugin.integration.test.ts` | 14 例集成测试(真实 workerd;mock login 与 MCP 上游,默认离线):令牌换发与缓存命中、401 强制重换发自愈、**会话 404 重握手不误触发换发**、凭证头缺失/坏形状/缺字段、错 service_key 只打一次 login、**错 key 不得蹭同 email 缓存令牌(生产实测回归)**、白名单双闸、多账号不串号、`base_url` 覆盖与归一、`decodeExp` |
+| env(`wrangler.jsonc`) | secrets:仅 `PLUGIN_TOKEN`;vars:`BYTEBASE_BASE_URL`、`BYTEBASE_ALLOWED_TOOLS`(留空 = 放行上游全部工具) |
+
+**权限/审计边界(与 plugin-feishu 不同的要点)**:SA 继承自己在 Bytebase 的 IAM 角色,审计日志记在该 SA 名下而非真实调用者——第一道闸是 Bytebase 侧授权(只读用途只给 `sqlEditorReadUser` 之类),`BYTEBASE_ALLOWED_TOOLS` 是 plugin 侧补充的第二道。若要做「谁调用记谁」需另走 plugin-meego 的 `mountConfig` 身份映射路子(Bytebase 侧要求每人一个 SA,当前未做)。
+
+**权限分级用「一份部署 + 多个挂载」表达**(2026-07-29 落地):令牌与会话缓存键含 service_key 摘要,故同一 Worker 可同时服务不同权限的 SA。生产实例上挂了两个节点:`bytebase`(只读 SA)与 `bytebase-rw`(test 可写 + 全环境提单 SA)。`bytebase-rw` 的"生产只提单不直写"由**项目级 CEL 条件** `resource.environment_id in ["test"]` 实现——注意 CEL 条件绑定只能下在项目级(工作区级不支持),新建项目须手动补;而提工单的三个权限(`bb.sheets.create`/`plans.create`/`issues.create`)是项目/工作区级、无法按环境区分,所以环境边界只能靠写权限那条条件。
+
 ## packages/server — Node/Docker 宿主胶水(npm 发布物,bin `tool-bridge-server`)
 
 改宿主行为前先读 [../guides/docker-host.md](../guides/docker-host.md)(env 面、差异表、验收命令)。

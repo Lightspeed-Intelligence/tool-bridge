@@ -25,7 +25,7 @@
 | Agent 反馈 | `~feedback` 保留段(per-path 一级协议能力,非 builtin):提交/投票/下钻,头部条目注入 ~help | core `feedback/` 存储 + gateway `tbApp.ts` 路由 | 权限判定落目标 path |
 | SDK | 内嵌 TB 实例 / 程序化注册 / 反向连接 | —(装配层) | `packages/sdk`:createToolBridge = core + gateway 的 createTbApp + 内存宿主缺省 |
 | CLI | 纯 API 客户端 `tb`,18 个子命令一一映射接口面,**无专用端点** | — | `packages/cli`(commander;npm 发布物) |
-| Plugin System | 自定义 Provider 注册与生命周期(探活/契约校验/信封传输) | `plugin/` | gateway `providers/pluginClient|pluginTool|pluginContext` + builtin `system/plugin`;首个 in-repo plugin 参考实现:`packages/plugin-feishu`(CF Worker,飞书 TAT 自动换发) |
+| Plugin System | 自定义 Provider 注册与生命周期(探活/契约校验/信封传输) | `plugin/` | gateway `providers/pluginClient|pluginTool|pluginContext` + builtin `system/plugin`;in-repo plugin 参考实现:`packages/plugin-feishu`(飞书 TAT 自动换发)、`packages/plugin-meego`(每调用者身份)、`packages/plugin-bytebase`(Bytebase SA 令牌自动换发,免 OAuth 人工授权),均为 CF Worker |
 | Dashboard | `~help` 通用渲染器 + 管理表单,**无专用后端** | — | `packages/dashboard`(React SPA)经 gateway Static Assets 挂 `/ui` |
 | 部署 | CF 与 Docker 两条路径产出同一棵树 | — | CF:`scripts/provision.mjs` + wrangler;Docker/Node:`packages/server`(SQLite/FS/ws DeviceHub)+ 根 Dockerfile,见 [../guides/docker-host.md](../guides/docker-host.md) |
 
