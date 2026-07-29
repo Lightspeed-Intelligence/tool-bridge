@@ -68,8 +68,13 @@ Bytebase 凭证;轮换 service key 只需 `tb secret set`,不必重新部署。
 - `tools/list` 宣告 6 个工具,且**不带 annotations** → plugin 按工具名兜底 `effect`
   (`propose_database_change` → destructive、`query_database`/`get_schema`/`search_api`/`get_skill` → read、
   `call_api` → write)。上游哪天补了 annotations,以 annotations 为准。
-- 失效信号分两层:坏/过期 token → **401**(强制重换发令牌);有效 token + 陈旧 sessionId → **404**
-  (清会话完整重握手)。两者不可混淆。
+- 失效信号分**三**层,各自的纠错动作不同,不可混淆:
+  - 坏/过期 token → **401** → 强制重换发令牌
+  - 有效 token + 陈旧 sessionId → **404** → 清会话完整重握手
+  - **会话内令牌过期** → **HTTP 200 + ToolResult 文本 `access token expired`** → 丢会话 **且** 重换发 + 重握手。
+    上游把 token 绑在 session 上(`withAccessToken`),`tools/call` 用的是建会话时那个 token 而非请求头,
+    所以复用活过 1h 的会话时自动续期会静默失效;只换令牌没用,新令牌进不了旧会话。
+    注意 `search_api` 等不打 Bytebase API 的工具此时仍正常,故障面容易误判。
 - 换发响应只有 `token`,**没有 expires_in** —— 到期时刻解 JWT `exp`(实测固定 1h)。
 - login 有按 email 的失败锁定:service key 配错时换发失败**不重试**,以免锁号。
 - 令牌与会话缓存键含 `sha256(service_key)` 前 16 hex。只按 `baseUrl|email` 键控时,错 key 会命中
@@ -107,5 +112,5 @@ test 环境 `CREATE TABLE`/`INSERT`/读回/`DROP TABLE` 全通;生产提工单�
 ## 测试
 
 ```sh
-pnpm --filter @tool-bridge/plugin-bytebase test   # 14 例,真实 workerd,上游全 mock,默认离线
+pnpm --filter @tool-bridge/plugin-bytebase test   # 15 例,真实 workerd,上游全 mock,默认离线
 ```

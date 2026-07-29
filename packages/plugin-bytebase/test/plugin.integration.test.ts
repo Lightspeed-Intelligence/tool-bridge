@@ -51,6 +51,8 @@ function fakeJwt(sub: string, expMs: number, seq: number): string {
 function bytebaseMock(tools: Array<{ description: string, name: string }>) {
   const validTokens = new Set<string>()
   const sessions = new Set<string>()
+  /** sessionId → 建会话时携带的 token(模拟上游把 token 绑进 session context)。 */
+  const sessionToken = new Map<string, string>()
   let tokenSeq = 0
   let sessionSeq = 0
   let loginCalls = 0
@@ -113,6 +115,9 @@ function bytebaseMock(tools: Array<{ description: string, name: string }>) {
         sessionSeq += 1
         const fresh = `sess-${sessionSeq}`
         sessions.add(fresh)
+        // 真实上游把建会话时的 token 绑进 session context,后续 tools/call 用的是它
+        // (不看本次请求头)。这里记下来以复现"会话内令牌过期"。
+        sessionToken.set(fresh, bearer)
         return rpc(
           {
             protocolVersion: body.params?.protocolVersion ?? '2025-06-18',
@@ -129,6 +134,15 @@ function bytebaseMock(tools: Array<{ description: string, name: string }>) {
         return rpc({ tools: tools.map(t => ({ ...t, inputSchema: { type: 'object' } })) })
       }
       if (body.method === 'tools/call') {
+        // 会话内令牌过期:用**建会话时**那个 token 判定,且以 HTTP 200 + ToolResult
+        // 文本(不是 401)返回业务错误 —— 与真实上游一致。
+        const bound = sid !== null ? sessionToken.get(sid) : undefined
+        if (bound !== undefined && !validTokens.has(bound)) {
+          return rpc({
+            content: [{ type: 'text', text: 'failed to list databases: HTTP 401: access token expired' }],
+            isError: true,
+          })
+        }
         return rpc({
           content: [
             {
@@ -149,6 +163,16 @@ function bytebaseMock(tools: Array<{ description: string, name: string }>) {
     loginCalls: () => loginCalls,
     revokeAllTokens: () => validTokens.clear(),
     expireSessions: () => sessions.clear(),
+    /**
+     * 让**已绑进会话**的 token 在上游侧失效(其它 token 不动)。
+     *
+     * 复现「会话内令牌过期」的要点是让"请求头上的 token"与"会话里绑的 token"分离:
+     * 直接吊销全部会导致头也失效、退化成已有用例覆盖的 401 路径。配合推进系统时钟
+     * (plugin 越过刷新余量后会自行换发新令牌进请求头)即得真实生产序列。
+     */
+    expireSessionBoundTokens: () => {
+      for (const bound of sessionToken.values()) validTokens.delete(bound)
+    },
   }
 }
 
@@ -349,6 +373,34 @@ describe('List / Get / Call(访问令牌自动换发)', () => {
     const specs = (await after.json()) as Array<{ name: string }>
     expect(specs.map(s => s.name)).toContain('query_database')
     expect(upstream.loginCalls()).toBe(2)
+  })
+
+  it('会话内令牌过期(HTTP 200 + 文本 access token expired)→ 丢会话 + 重换发 + 重握手自愈(2026-07-29 生产实测回归)', async () => {
+    const upstream = bytebaseMock(TOOLS)
+    vi.stubGlobal('fetch', upstream.fetchMock)
+
+    // 建会话并成功调一次(会话绑住当前 token)。
+    const first = await envelope('Call', { name: 'query_database', args: { q: 1 } })
+    expect(first.status).toBe(200)
+    expect(upstream.loginCalls()).toBe(1)
+
+    // 生产序列:①会话里绑的 token 到期失效;②时钟越过刷新余量,plugin 自行换发新令牌
+    // 进请求头。于是"头有效 + 会话绑的已失效" —— 上游不回 401(头是好的),而是
+    // 200 + "access token expired"。只换令牌没用,新令牌进不了旧会话,必须连会话一起丢。
+    upstream.expireSessionBoundTokens()
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    vi.setSystemTime(Date.now() + 58 * 60_000) // 越过 5min 刷新余量(令牌 1h)
+    try {
+      const healed = await envelope('Call', { name: 'query_database', args: { q: 2 } })
+      expect(healed.status).toBe(200)
+      const result = (await healed.json()) as { content: Array<{ text: string }> }
+      // 自愈后拿到真实结果,而不是过期错误。
+      expect(result.content[0]?.text).toContain('bytebase:query_database')
+      expect(result.content[0]?.text).not.toContain('access token expired')
+      expect(upstream.loginCalls()).toBeGreaterThanOrEqual(2) // 确实重换发了
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('会话过期(有效令牌 + 陈旧 sessionId → 404)→ 清会话完整重握手,不重换发令牌', async () => {

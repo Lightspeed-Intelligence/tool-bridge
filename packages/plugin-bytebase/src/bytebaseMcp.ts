@@ -47,6 +47,11 @@ export function clearSessionCache(): void {
   sessions.clear()
 }
 
+/** 丢弃某条会话(令牌层纠错时用:旧会话绑着旧 token,必须换新会话)。 */
+export function dropSession(sessionKey: string): void {
+  sessions.delete(sessionKey)
+}
+
 export interface BytebaseMcpConfig {
   /** 会话缓存键(`<baseUrl>|<email>`,由 index.ts 拼)。 */
   sessionKey: string
@@ -70,6 +75,29 @@ function isSessionInvalid(err: unknown): boolean {
 /** 上游 401:访问令牌过期/无效,调用方应强制重换发后重试。 */
 export function isUnauthorized(err: unknown): boolean {
   return err instanceof StreamableHTTPError && err.code === 401
+}
+
+/**
+ * **会话内令牌过期**:Bytebase 在 initialize 时把当时的 access token 存进 MCP session
+ * 的 context(backend/api/mcp: `withAccessToken`),后续 tools/call 用的是**存在 session
+ * 里的那个 token**,而不是本次请求头上的新 token。于是复用一个活过 1h 的会话时,即使
+ * plugin 已经换发了新令牌,上游仍拿旧的去打内部 API 并回 `access token expired`。
+ *
+ * 该信号是 **HTTP 200 + ToolResult 文本里的业务错误**(不是 401),所以 isUnauthorized
+ * 那条自愈路径抓不到 —— 2026-07-29 生产实测踩到:会话跨过 1h 后所有需要访问 Bytebase
+ * API 的工具(query_database/get_schema/call_api)全部失败,而 search_api(纯本地索引,
+ * 不打 API)照常可用,故障面看起来很怪。
+ *
+ * 修法:把它也当失效信号 —— 清会话 + 强制重换发令牌 + 完整重握手重试一次(见
+ * index.ts 的 withTokenRetry)。会话缓存不设 TTL 也能自愈,因为纠错路径不回读缓存。
+ */
+export function isSessionTokenExpired(result: BytebaseToolResult): boolean {
+  const content = result.content
+  if (!Array.isArray(content)) return false
+  return content.some((part) => {
+    const text = (part as { text?: unknown }).text
+    return typeof text === 'string' && text.includes('access token expired')
+  })
 }
 
 async function withSession<T>(

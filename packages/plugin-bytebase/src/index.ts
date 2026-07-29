@@ -48,6 +48,8 @@ import {
   type BytebaseMcpConfig,
   type BytebaseTool,
   callTool,
+  dropSession,
+  isSessionTokenExpired,
   isUnauthorized,
   listTools,
   MCP_PATH,
@@ -187,21 +189,46 @@ async function mcpConfig(
   return { url: `${baseUrl}${MCP_PATH}`, sessionKey: await sessionKey(tokenCfg), token }
 }
 
+/** withTokenRetry 的返回值可能是 ToolSpec[](List)或 ToolResult(Call),只对后者验签。 */
+function isToolResultLike(v: unknown): v is { content?: unknown } {
+  return typeof v === 'object' && v !== null && !Array.isArray(v)
+}
+
 /**
- * 执行 `fn`,上游 401 时强制重换发访问令牌后重试一次。缓存的 token 在余量内也可能已
- * 失效(如 service_key 轮换、SA 被停用),401 是唯一失效信号;重试必须绕过缓存(force)。
+ * 执行 `fn`,令牌失效时强制重换发后重试一次。缓存的 token 在余量内也可能已失效
+ * (service_key 轮换、SA 被停用),重试必须绕过缓存(force)。
+ *
+ * 失效有**两种**信号,都要接:
+ * 1. 上游 **401**(StreamableHTTPError)—— token 本身被拒。
+ * 2. **HTTP 200 + ToolResult 文本含 `access token expired`** —— 会话内令牌过期:
+ *    Bytebase 把 token 绑在 MCP session 上,复用活过 1h 的会话时它用的是建会话时那个
+ *    旧 token,与本次请求头无关(详见 bytebaseMcp.ts `isSessionTokenExpired` 注释)。
+ *    此时**必须连会话一起丢**,只换令牌没用 —— 新令牌进不了旧会话。
  */
 async function withTokenRetry<T>(
   env: Env,
   cred: BytebaseCredential,
   fn: (cfg: BytebaseMcpConfig) => Promise<T>,
 ): Promise<T> {
-  try {
-    return await fn(await mcpConfig(env, cred))
-  } catch (err) {
-    if (!isUnauthorized(err)) throw err
+  const retry = async (): Promise<T> => {
+    // 先丢会话再强制重换发:旧会话绑着旧 token,留着它新令牌也生效不了。
+    dropSession(await sessionKey({
+      baseUrl: resolveBaseUrl(env, cred),
+      email: cred.email,
+      serviceKey: cred.service_key,
+    }))
     return await fn(await mcpConfig(env, cred, true))
   }
+  let out: T
+  try {
+    out = await fn(await mcpConfig(env, cred))
+  } catch (err) {
+    if (!isUnauthorized(err)) throw err
+    return await retry()
+  }
+  // 200 但内容是"会话内令牌过期" → 同样走纠错路径。
+  if (isToolResultLike(out) && isSessionTokenExpired(out)) return await retry()
+  return out
 }
 
 async function visibleTools(env: Env, cred: BytebaseCredential): Promise<BytebaseTool[]> {
