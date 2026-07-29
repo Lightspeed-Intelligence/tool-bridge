@@ -93,7 +93,7 @@ Bytebase 自托管 MCP(`{baseUrl}/mcp`)的 tool-provider/v1 plugin,解决**托�
 
 **权限/审计边界(与 plugin-feishu 不同的要点)**:SA 继承自己在 Bytebase 的 IAM 角色,审计日志记在该 SA 名下而非真实调用者——第一道闸是 Bytebase 侧授权(只读用途只给 `sqlEditorReadUser` 之类),`BYTEBASE_ALLOWED_TOOLS` 是 plugin 侧补充的第二道。若要做「谁调用记谁」需另走 plugin-meego 的 `mountConfig` 身份映射路子(Bytebase 侧要求每人一个 SA,当前未做)。
 
-**权限分级用「一份部署 + 多个挂载」表达**(2026-07-29 落地):令牌与会话缓存键含 service_key 摘要,故同一 Worker 可同时服务不同权限的 SA。生产实例上挂了两个节点:`bytebase`(只读 SA)与 `bytebase-rw`(test 可写 + 全环境提单 SA)。`bytebase-rw` 的"生产只提单不直写"由**项目级 CEL 条件** `resource.environment_id in ["test"]` 实现——注意 CEL 条件绑定只能下在项目级(工作区级不支持),新建项目须手动补;而提工单的三个权限(`bb.sheets.create`/`plans.create`/`issues.create`)是项目/工作区级、无法按环境区分,所以环境边界只能靠写权限那条条件。
+**权限分级用「一份部署 + 多个挂载」表达**(2026-07-29 落地):令牌与会话缓存键含 service_key 摘要,故同一 Worker 可同时服务不同权限的 SA。生产实例上挂了两个节点(与其他 plugin 同级于 `plugins/` 下):`plugins/bytebase`(只读 SA)与 `plugins/bytebase-rw`(test 可写 + 全环境提单 SA)。`plugins/bytebase-rw` 的"生产只提单不直写"由**项目级 CEL 条件** `resource.environment_id in ["test"]` 实现——注意 CEL 条件绑定只能下在项目级(工作区级不支持),新建项目须手动补;而提工单的三个权限(`bb.sheets.create`/`plans.create`/`issues.create`)是项目/工作区级、无法按环境区分,所以环境边界只能靠写权限那条条件。
 
 ## packages/server — Node/Docker 宿主胶水(npm 发布物,bin `tool-bridge-server`)
 

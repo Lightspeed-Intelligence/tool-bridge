@@ -31,22 +31,25 @@ curl -sX POST "$BB_URL/v1/workspaces/{ws}/serviceAccounts?serviceAccountId=tool-
 
 ```sh
 # 1. 改 wrangler.jsonc:account_id、BYTEBASE_BASE_URL(也可留给凭证里的 base_url)
-pnpm --filter @tool-bridge/plugin-bytebase deploy
+pnpm --filter @tool-bridge/plugin-bytebase run deploy
 
 # 2. 平台注册(拿到 pluginToken),再把它配进 Worker secret
-tb plugin register --id bytebase --endpoint https://tb-plugin-bytebase.<subdomain>.workers.dev --auth platform-token
+tb plugin register --file manifest.json   # {"id":"bytebase","kind":"tool-provider","interfaceVersion":"tool-provider/v1",
+                                          #  "endpoint":"https://tb-plugin-bytebase.<subdomain>.workers.dev",
+                                          #  "auth":{"kind":"platform-token"},"healthPath":"/healthz","enabled":true}
 pnpm --filter @tool-bridge/plugin-bytebase exec wrangler secret put PLUGIN_TOKEN
 
 # 3. 凭证存平台(不落 plugin),再挂载并引用它
-tb secret set --name bytebase-sa   # 值:{"email":"...@service.bytebase.com","service_key":"bbs_...","base_url":"https://bytebase.example.com"}
-tb tool mount bytebase --plugin bytebase --auth-ref bytebase-sa
+tb secret set --name bytebase-sa   # 值经 stdin:{"email":"...@service.bytebase.com","service_key":"bbs_...","base_url":"https://bytebase.example.com"}
+tb tool mount plugins/bytebase --kind tool --provider bytebase --auth-ref bytebase-sa
 
 # 4. 验证
-tb help bytebase
+tb help plugins/bytebase
+tb call plugins/bytebase/query_database '{"database":"...","instance":"...","statement":"SELECT 1"}'
 ```
 
 `base_url` 在凭证 JSON 里给时优先于 `BYTEBASE_BASE_URL`,同一份部署可以服务多个实例/多个账号的
-挂载(令牌与 MCP 会话缓存按 `<baseUrl>|<email>` 键控,互不串号)。
+挂载(令牌与 MCP 会话缓存按 `<baseUrl>|<email>|sha256(service_key)前16hex` 键控,互不串号)。
 
 ## env
 
@@ -79,19 +82,21 @@ Worker `tb-plugin-bytebase` @ https://tb-plugin-bytebase.heco.workers.dev(Lights
 
 **一份部署,两个挂载做权限分级**(令牌缓存按 key 摘要隔离,互不串号):
 
+两个节点都挂在 `plugins/` 下,与 `plugins/feishu`、`plugins/meego` 同级:
+
 | 挂载路径 | authRef / SA | 能做什么 |
 |---|---|---|
-| `bytebase` | `bytebase-sa` / `tool-bridge@` | 纯只读(`roles/sqlEditorReadUser`)。日常查询与看 schema 用这个 |
-| `bytebase-rw` | `bytebase-rw` / `tool-bridge-rw@` | **test 环境直接写** + **全环境提工单**;生产库只能提单不能直写 |
+| `plugins/bytebase` | `bytebase-sa` / `tool-bridge@` | 纯只读(`roles/sqlEditorReadUser`)。日常查询与看 schema 用这个 |
+| `plugins/bytebase-rw` | `bytebase-rw` / `tool-bridge-rw@` | **test 环境直接写** + **全环境提工单**;生产库只能提单不能直写 |
 
-`bytebase-rw` 的授权三段:
+`plugins/bytebase-rw` 的授权三段:
 
 - 工作区级 `sqlEditorReadUser` — 全环境可读(写迁移 SQL 前得能看生产 schema)
 - 工作区级 `projectDeveloper` — `bb.sheets.create`/`plans.create`/`issues.create`,即提工单
 - **每个项目**级 `sqlEditorUser` + CEL 条件 `resource.environment_id in ["test"]` — test 环境直接跑 DDL/DML
 
 ⚠️ **CEL 条件绑定只能下在项目级**(工作区级 IAM policy 不支持 condition)。**新建 Bytebase 项目后须手动补这条绑定**,
-否则该项目的 test 库对 `bytebase-rw` 不可写。当前已授:default / new-api-tdis / tipsy-backend-131q / tipsy-memory / tipsystudio。
+否则该项目的 test 库对 `plugins/bytebase-rw` 不可写。当前已授:default / new-api-tdis / tipsy-backend-131q / tipsy-memory / tipsystudio。
 
 ⚠️ 提工单的三个权限是项目/工作区级、**无法按环境区分**。"生产只提单不直写"这条边界靠的是**写权限的 CEL 条件**,
 不是工单权限本身——所以别把 `sqlEditorUser` 无条件授到工作区级,那会让生产库也能直写。
