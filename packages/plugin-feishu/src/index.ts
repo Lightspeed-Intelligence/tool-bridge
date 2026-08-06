@@ -195,6 +195,11 @@ const HELP: HelpModel = {
     kind: 'tool',
     description: 'Feishu official remote MCP (auto-refreshed tenant_access_token)',
   },
+  hint:
+    '本节点以应用(tenant)身份调用,只能访问已显式授权给该应用的数据;'
+    + '知识库建节点/写文档等常因应用缺少目标库的成员权限而失败(errorCode=131006 tenant needs edit permission)。'
+    + '需以用户本人身份操作(用户对自己的知识库/文档天然有编辑权)时,请改用本地飞书 CLI:'
+    + 'https://open.feishu.cn/document/no_class/mcp-archive/feishu-cli-installation-guide.md',
   cmds: [
     {
       name: 'List',
