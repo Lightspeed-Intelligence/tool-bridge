@@ -6,7 +6,8 @@
  *   302 跳飞书 `/authen/v1/authorize`。
  * - 回调(`GET /~feishu/callback`,树外免认证):解密校验 state → code 换
  *   user_access_token → `/authen/v1/user_info` 拿 open_id → **rotate 签发** SK
- *   (同 owner 旧 key 先删再签,因明文只返回一次)→ 回调页一次性展示。
+ *   (同 owner 旧 key 先删再签,因明文只返回一次)→ CLI 流回调页一次性展示;
+ *   Dashboard 流把 SK 装进短时 AES-GCM + HttpOnly Cookie,由同源 UI POST 消费。
  *
  * 准入:能走完企业飞书 OAuth = 本企业成员,不校验邮箱域(方案 A)。
  * app 凭证:复用 feishu plugin 的 SecretStore 引用(默认 "feishu-app",{app_id,app_secret})。
@@ -29,8 +30,23 @@ export const FEISHU_BASE = 'https://open.feishu.cn'
 /** 登录回调路径(树外免认证;飞书后台需登记 `<origin>/~feishu/callback`)。 */
 export const FEISHU_CALLBACK_PATH = '/~feishu/callback'
 
+/** Dashboard 消费短时登录交接的同源端点(树外免认证,凭加密 HttpOnly Cookie)。 */
+export const FEISHU_HANDOFF_PATH = '/~feishu/handoff'
+
+/** Dashboard 探测当前网关是否启用飞书登录的公开端点。 */
+export const FEISHU_LOGIN_STATUS_PATH = '/~feishu/login-status'
+
+/** Dashboard 发起登录时唯一允许的回跳目标;不接受任意 return URL,避免开放重定向。 */
+export const FEISHU_DASHBOARD_PATH = '/ui/'
+
+/** Dashboard 登录交接 Cookie;值经 AES-GCM 加密,且由 tbApp 限定 HttpOnly/SameSite/Path。 */
+export const FEISHU_HANDOFF_COOKIE = 'tb_feishu_handoff'
+
 /** state TTL:发起 → 回调时限;过期一律拒,防 code 重放窗口拉长。 */
 const STATE_TTL_SEC = 600
+
+/** OAuth 回调 → Dashboard 消费 SK 的最长时间;短时降低 Cookie 被窃后的重放窗口。 */
+export const HANDOFF_TTL_SEC = 120
 
 /** 默认签发的 key 有效期(秒):90 天,过期重新登录自动 rotate。 */
 export const DEFAULT_KEY_TTL_SEC = 90 * 24 * 3600
@@ -53,8 +69,9 @@ export function defaultLoginScopes(): Scope[] {
 
 // ---------- state(AES-256-GCM,零存储;域前缀区隔 mcp-oauth 的 state 密钥)----------
 
-/** state 载荷:n = CSRF nonce,exp = 过期时刻(epoch 秒)。 */
+/** state 载荷:n = CSRF nonce,exp = 过期时刻;d=true 表示回调交给 Dashboard。 */
 export interface LoginStatePayload {
+  d?: true
   exp: number
   n: string
 }
@@ -97,19 +114,113 @@ export async function openLoginState(
       ciphertext as Uint8Array<ArrayBuffer>,
     )
     const payload = JSON.parse(new TextDecoder().decode(plain)) as LoginStatePayload
-    if (typeof payload.n !== 'string' || typeof payload.exp !== 'number') return null
+    if (
+      typeof payload.n !== 'string'
+      || typeof payload.exp !== 'number'
+      || (payload.d !== undefined && payload.d !== true)
+    ) return null
     return payload
   } catch {
     return null
   }
 }
 
-/** 生成一段新 state(nonce 随机 + exp=now+TTL);返回加密串。 */
-export async function newLoginState(secret: string, nowMs: number): Promise<string> {
+/** 生成一段新 state(nonce 随机 + exp=now+TTL);dashboard 只写入布尔标记,不携带 URL。 */
+export async function newLoginState(
+  secret: string,
+  nowMs: number,
+  opts?: { dashboard?: boolean },
+): Promise<string> {
   const nonce = base64urlEncode(crypto.getRandomValues(new Uint8Array(16)))
   return await sealLoginState(
-    { n: nonce, exp: Math.floor(nowMs / 1000) + STATE_TTL_SEC },
+    {
+      n: nonce,
+      exp: Math.floor(nowMs / 1000) + STATE_TTL_SEC,
+      ...(opts?.dashboard === true ? { d: true as const } : {}),
+    },
     secret,
+  )
+}
+
+// ---------- Dashboard 登录交接(AES-256-GCM,短时 HttpOnly Cookie)----------
+
+/** 交接载荷:b = BaseURL,s = SK,u = 飞书展示名,exp = 过期时刻(epoch 秒)。 */
+export interface LoginHandoffPayload {
+  b: string
+  exp: number
+  s: string
+  u?: string
+}
+
+/** 与 OAuth state 再做一次域分离,避免同一主密钥跨用途复用。 */
+async function handoffCryptoKey(secret: string): Promise<CryptoKey> {
+  const digest = await crypto.subtle.digest(
+    'SHA-256',
+    new TextEncoder().encode(`tb-feishu-login-handoff:${secret}`),
+  )
+  return crypto.subtle.importKey('raw', digest, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt'])
+}
+
+/** 加密 Dashboard 登录交接;密文可进 Cookie,不把 SK 放入 URL/HTML/日志。 */
+export async function sealLoginHandoff(
+  payload: LoginHandoffPayload,
+  secret: string,
+): Promise<string> {
+  const key = await handoffCryptoKey(secret)
+  const iv = crypto.getRandomValues(new Uint8Array(12))
+  const ciphertext = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv },
+    key,
+    new TextEncoder().encode(JSON.stringify(payload)),
+  )
+  return `${base64urlEncode(iv)}.${base64urlEncode(new Uint8Array(ciphertext))}`
+}
+
+/** 解密并校验交接形状;篡改、错 key、非法字段一律 null,过期由调用方按请求时钟判断。 */
+export async function openLoginHandoff(
+  value: string,
+  secret: string,
+): Promise<LoginHandoffPayload | null> {
+  const dot = value.indexOf('.')
+  if (dot <= 0) return null
+  try {
+    const key = await handoffCryptoKey(secret)
+    const iv = base64urlDecode(value.slice(0, dot))
+    const ciphertext = base64urlDecode(value.slice(dot + 1))
+    const plain = await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: iv as Uint8Array<ArrayBuffer> },
+      key,
+      ciphertext as Uint8Array<ArrayBuffer>,
+    )
+    const payload = JSON.parse(new TextDecoder().decode(plain)) as LoginHandoffPayload
+    if (
+      typeof payload.b !== 'string'
+      || payload.b === ''
+      || typeof payload.s !== 'string'
+      || !payload.s.startsWith('tbk_')
+      || typeof payload.exp !== 'number'
+      || (payload.u !== undefined && typeof payload.u !== 'string')
+    ) return null
+    return payload
+  } catch {
+    return null
+  }
+}
+
+/** 生成短时 Dashboard 交接;SK 只出现在加密 Cookie 明文内部。 */
+export async function newLoginHandoff(
+  input: { baseUrl: string, name?: string, secret: string },
+  encryptionKey: string,
+  nowMs: number,
+): Promise<string> {
+  return await sealLoginHandoff(
+    {
+      b: input.baseUrl,
+      s: input.secret,
+      exp: Math.floor(nowMs / 1000) + HANDOFF_TTL_SEC,
+      ...(input.name !== undefined ? { u: input.name } : {}),
+    },
+    encryptionKey,
   )
 }
 
@@ -121,7 +232,13 @@ export interface FeishuAppCredential {
   app_secret: string
 }
 
-/** 解析 SecretStore resolve 出的凭证 JSON;形状不符 → unavailable。 */
+/**
+ * 飞书自建应用 ID 的公开格式为 `cli_` + 16 位小写十六进制字符。
+ * 严格校验可避免本地视觉测试的占位值被误判成“登录已启用”，直到用户点击后才由飞书报 20028。
+ */
+const FEISHU_APP_ID_PATTERN = /^cli_[0-9a-f]{16}$/
+
+/** 解析 SecretStore resolve 出的凭证 JSON;形状或 app_id 格式不符 → unavailable。 */
 export function parseFeishuCredential(raw: string | undefined, refName: string): FeishuAppCredential {
   if (raw === undefined) {
     throw new TBError('unavailable', `飞书登录凭证 '${refName}' 无法解析(SecretStore 未配置?)`, {
@@ -130,13 +247,18 @@ export function parseFeishuCredential(raw: string | undefined, refName: string):
   }
   try {
     const v = JSON.parse(raw) as Partial<FeishuAppCredential>
-    if (typeof v.app_id === 'string' && v.app_id !== '' && typeof v.app_secret === 'string' && v.app_secret !== '') {
+    if (
+      typeof v.app_id === 'string'
+      && FEISHU_APP_ID_PATTERN.test(v.app_id)
+      && typeof v.app_secret === 'string'
+      && v.app_secret !== ''
+    ) {
       return { app_id: v.app_id, app_secret: v.app_secret }
     }
   } catch {
     // fallthrough
   }
-  throw new TBError('unavailable', `凭证 '${refName}' 不是 {"app_id","app_secret"} 形状的 JSON`, {
+  throw new TBError('unavailable', `凭证 '${refName}' 不是有效的飞书应用凭证 JSON`, {
     retryable: false,
   })
 }

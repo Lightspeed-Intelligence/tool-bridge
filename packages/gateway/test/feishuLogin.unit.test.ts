@@ -3,11 +3,16 @@ import { describe, expect, it } from 'vitest'
 import {
   bindMeegoIdentity,
   defaultLoginScopes,
+  HANDOFF_TTL_SEC,
   LOGIN_KEY_TAG,
   type MeegoBindDeps,
+  newLoginHandoff,
   newLoginState,
+  openLoginHandoff,
   openLoginState,
+  parseFeishuCredential,
   rotateLoginKey,
+  sealLoginHandoff,
   sealLoginState,
 } from '../src/feishuLogin'
 
@@ -44,6 +49,60 @@ describe('login state 封解', () => {
     expect(p!.exp).toBe(Math.floor(now / 1000) + 600)
     expect(typeof p!.n).toBe('string')
     expect(p!.n.length).toBeGreaterThan(0)
+  })
+
+  it('Dashboard 发起时只在 state 内携带受控布尔标记', async () => {
+    const state = await newLoginState(SECRET, 1_000_000_000_000, { dashboard: true })
+    const payload = await openLoginState(state, SECRET)
+    expect(payload?.d).toBe(true)
+  })
+})
+
+describe('飞书应用凭证', () => {
+  it('只接受真实飞书 app_id 格式，拒绝本地视觉占位值', () => {
+    expect(parseFeishuCredential(
+      '{"app_id":"cli_0123456789abcdef","app_secret":"secret_test"}',
+      'feishu-app',
+    )).toEqual({ app_id: 'cli_0123456789abcdef', app_secret: 'secret_test' })
+
+    expect(() => parseFeishuCredential(
+      '{"app_id":"cli_local_visual_check","app_secret":"secret_test"}',
+      'feishu-app',
+    )).toThrow('不是有效的飞书应用凭证')
+  })
+})
+
+describe('Dashboard 登录交接封解', () => {
+  it('roundtrip:SK/BaseURL/展示名完整还原,有效期为 120 秒', async () => {
+    const now = 1_000_000_000_000
+    const value = await newLoginHandoff(
+      { baseUrl: 'https://tb.example.com', secret: 'tbk_handoff_secret', name: '测试用户' },
+      SECRET,
+      now,
+    )
+    expect(value).not.toContain('tbk_handoff_secret')
+    expect(await openLoginHandoff(value, SECRET)).toEqual({
+      b: 'https://tb.example.com',
+      s: 'tbk_handoff_secret',
+      u: '测试用户',
+      exp: Math.floor(now / 1000) + HANDOFF_TTL_SEC,
+    })
+  })
+
+  it('篡改、错密钥和非法 SK 形状一律拒绝', async () => {
+    const value = await newLoginHandoff(
+      { baseUrl: 'https://tb.example.com', secret: 'tbk_handoff_secret' },
+      SECRET,
+      Date.now(),
+    )
+    expect(await openLoginHandoff(`${value.slice(0, -2)}xx`, SECRET)).toBeNull()
+    expect(await openLoginHandoff(value, 'wrong-key')).toBeNull()
+
+    const invalid = await sealLoginHandoff(
+      { b: 'https://tb.example.com', s: 'not-a-tool-bridge-key', exp: 9999999999 },
+      SECRET,
+    )
+    expect(await openLoginHandoff(invalid, SECRET)).toBeNull()
   })
 })
 

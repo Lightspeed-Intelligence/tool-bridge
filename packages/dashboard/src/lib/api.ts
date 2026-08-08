@@ -142,6 +142,72 @@ export async function getHealthz(baseUrl: string) {
   return (await res.json()) as { healthy: boolean, version: string }
 }
 
+/** 当前同源网关是否配置了飞书登录;旧版/未配置网关由调用页降级到手工 SK。 */
+export async function getFeishuLoginStatus(): Promise<{ enabled: boolean }> {
+  let res: Response
+  try {
+    res = await fetch('/~feishu/login-status', {
+      headers: { accept: 'application/json' },
+      cache: 'no-store',
+    })
+  } catch {
+    throw new ApiError('network', 0, '无法检查飞书登录状态', true)
+  }
+  if (res.status === 404) return { enabled: false }
+  if (!res.ok) throw new ApiError('internal', res.status, `登录状态 HTTP ${res.status}`)
+  const body = (await res.json().catch(() => null)) as { enabled?: unknown } | null
+  if (typeof body?.enabled !== 'boolean') {
+    throw new ApiError('internal', res.status, '登录状态响应格式无效')
+  }
+  return { enabled: body.enabled }
+}
+
+export interface FeishuLoginHandoff {
+  baseUrl: string
+  profile: string
+  sk: string
+  userName?: string
+}
+
+/**
+ * OAuth 回调后的同源交接:HttpOnly Cookie 由浏览器自动携带,SK 仅出现在 no-store 响应体,
+ * 不进入 URL、重定向参数或服务端日志。网关无论成功失败都会清除交接 Cookie。
+ */
+export async function consumeFeishuLogin(): Promise<FeishuLoginHandoff> {
+  let res: Response
+  try {
+    res = await fetch('/~feishu/handoff', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { accept: 'application/json' },
+      cache: 'no-store',
+    })
+  } catch {
+    throw new ApiError('network', 0, '飞书登录交接失败：网关不可达', true)
+  }
+  if (!res.ok) {
+    const fallback: TBErrorBody = {
+      code: 'permission_denied',
+      message: '飞书登录交接已失效，请重新登录',
+      retryable: false,
+    }
+    const body = (await res.json().catch(() => fallback)) as TBErrorBody
+    throw new ApiError(body.code ?? fallback.code, res.status, body.message, body.retryable)
+  }
+  const body = (await res.json().catch(() => null)) as Partial<FeishuLoginHandoff> | null
+  if (
+    body === null
+    || typeof body.baseUrl !== 'string'
+    || typeof body.profile !== 'string'
+    || typeof body.sk !== 'string'
+    || !body.sk.startsWith('tbk_')
+    || (body.userName !== undefined && typeof body.userName !== 'string')
+  ) {
+    throw new ApiError('internal', res.status, '飞书登录交接响应格式无效')
+  }
+  return body as FeishuLoginHandoff
+}
+
 // --- ~feedback 保留段(per-path Agent 反馈,对等 `tb feedback`)---
 
 /** GET /<path>/~feedback;hidden 含净分 ≤ 阈值的隐藏条目。 */

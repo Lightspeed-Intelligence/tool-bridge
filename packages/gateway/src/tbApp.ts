@@ -68,6 +68,7 @@ import {
   type TreePath,
   virtualizeTools,
 } from '@tool-bridge/core'
+import { generateCookie, getCookie } from 'hono/cookie'
 import { type Context, Hono } from 'hono'
 import type { UpstreamProvider } from './providers/types'
 import {
@@ -76,11 +77,18 @@ import {
   DEFAULT_KEY_TTL_SEC,
   exchangeUserToken,
   FEISHU_CALLBACK_PATH,
+  FEISHU_DASHBOARD_PATH,
+  FEISHU_HANDOFF_COOKIE,
+  FEISHU_HANDOFF_PATH,
+  FEISHU_LOGIN_STATUS_PATH,
   feishuAppAccessToken,
   fetchUserInfo,
+  HANDOFF_TTL_SEC,
   type MeegoBindDeps,
+  newLoginHandoff,
   newLoginState,
   openIdToUnionId,
+  openLoginHandoff,
   openLoginState,
   parseFeishuCredential,
   parseMeegoCredential,
@@ -250,6 +258,41 @@ async function runHandler(fn: () => Response | Promise<Response>): Promise<Respo
     if (isTBError(err)) return tbErrorResponse(err)
     return tbErrorResponse(new TBError('internal', 'internal error'))
   }
+}
+
+/** Dashboard 飞书登录交接 Cookie:仅交给同源消费端点,不进 URL/JS/普通 API 请求。 */
+function loginHandoffCookie(value: string, requestUrl: string, maxAge = HANDOFF_TTL_SEC): string {
+  return generateCookie(FEISHU_HANDOFF_COOKIE, value, {
+    httpOnly: true,
+    maxAge,
+    path: FEISHU_HANDOFF_PATH,
+    sameSite: 'Strict',
+    secure: new URL(requestUrl).protocol === 'https:',
+  })
+}
+
+/** 消费成功/失败均清 Cookie;浏览器正常流程只能交接一次。 */
+function clearLoginHandoffCookie(requestUrl: string): string {
+  return loginHandoffCookie('', requestUrl, 0)
+}
+
+/** 交接端点失败保持统一 TBError 形状,且不区分缺失、篡改、过期。 */
+function loginHandoffError(requestUrl: string, status: 401 | 403): Response {
+  return new Response(
+    JSON.stringify({
+      code: 'permission_denied',
+      message: status === 403 ? '飞书登录交接只允许同源控制台消费' : '飞书登录交接已失效，请重新登录',
+      retryable: false,
+    } satisfies TBErrorBody),
+    {
+      status,
+      headers: {
+        'content-type': 'application/json; charset=utf-8',
+        'cache-control': 'private, no-store',
+        'set-cookie': clearLoginHandoffCookie(requestUrl),
+      },
+    },
+  )
 }
 
 /** cmd → scope 表(builtin help() 静态声明);未知 cmd → undefined。 */
@@ -1299,6 +1342,28 @@ export function createTbApp(deps: TbAppDeps): Hono<{ Variables: Vars }> {
   // GET /healthz → 200 JSON,树外免认证。version 单一真源:宿主 package.json。
   app.get('/healthz', c => c.json({ healthy: true, version: deps.version }))
 
+  // Dashboard 启动时探测飞书登录是否真正可用:实例已初始化 + 凭证存在且形状正确。
+  // 只回布尔值,不向公开端点泄露具体缺项、引用名或凭证内容。
+  app.get(FEISHU_LOGIN_STATUS_PATH, async () => {
+    let enabled = false
+    const secretRef = deps.feishuLoginSecretRef
+    if (deps.encryptionKey !== undefined && secretRef !== undefined) {
+      try {
+        await deps.ensureReady?.()
+        parseFeishuCredential(await deps.secrets.resolve(secretRef), secretRef)
+        enabled = true
+      } catch {
+        // fail closed:配置未就绪时 Dashboard 自动降级到手工 SK。
+      }
+    }
+    return new Response(JSON.stringify({ enabled }), {
+      headers: {
+        'content-type': 'application/json; charset=utf-8',
+        'cache-control': 'private, no-store',
+      },
+    })
+  })
+
   // GET /~ref/<token> → 大对象中转下载,树外免认证(中转下载路由)。
   // 注册在认证中间件之前:token 本身即凭证(HMAC 限时签名);验签失败/过期一律 404 不泄露。
   app.get('/~ref/:token', c =>
@@ -1420,6 +1485,40 @@ export function createTbApp(deps: TbAppDeps): Hono<{ Variables: Vars }> {
   const loginRedirectUri = (c: AppContext): string =>
     `${deps.canonicalOrigin ?? new URL(c.req.url).origin}${FEISHU_CALLBACK_PATH}`
 
+  // Dashboard 用飞书 OAuth 换到 SK 后,在同源 POST 中消费短时 HttpOnly 交接 Cookie。
+  // Origin 必须精确匹配当前请求 origin;成功/失败都清 Cookie,响应与缓存隔离。
+  app.post(FEISHU_HANDOFF_PATH, c =>
+    runHandler(async () => {
+      const requestUrl = c.req.url
+      const requestOrigin = new URL(requestUrl).origin
+      if (c.req.header('origin') !== requestOrigin) return loginHandoffError(requestUrl, 403)
+
+      const encKey = deps.encryptionKey
+      const value = getCookie(c, FEISHU_HANDOFF_COOKIE)
+      if (encKey === undefined || value === undefined) return loginHandoffError(requestUrl, 401)
+
+      const payload = await openLoginHandoff(value, encKey)
+      if (payload === null || payload.exp * 1000 <= Date.now()) {
+        return loginHandoffError(requestUrl, 401)
+      }
+      return new Response(
+        JSON.stringify({
+          baseUrl: payload.b,
+          sk: payload.s,
+          profile: 'feishu',
+          ...(payload.u !== undefined ? { userName: payload.u } : {}),
+        }),
+        {
+          headers: {
+            'content-type': 'application/json; charset=utf-8',
+            'cache-control': 'private, no-store',
+            'set-cookie': clearLoginHandoffCookie(requestUrl),
+          },
+        },
+      )
+    }),
+  )
+
   // GET /login → 生成加密 state,302 跳飞书授权页。树外免认证(无 SK 时可访问)。
   app.get('/login', c =>
     runHandler(async () => {
@@ -1428,9 +1527,20 @@ export function createTbApp(deps: TbAppDeps): Hono<{ Variables: Vars }> {
       if (encKey === undefined || secretRef === undefined) {
         return renderLoginFailedHtml('飞书登录未启用(缺 encryptionKey 或 feishuLoginSecretRef)')
       }
-      await deps.ensureReady?.()
-      const cred = parseFeishuCredential(await deps.secrets.resolve(secretRef), secretRef)
-      const state = await newLoginState(encKey, Date.now())
+      let cred: ReturnType<typeof parseFeishuCredential> | null = null
+      try {
+        await deps.ensureReady?.()
+        cred = parseFeishuCredential(await deps.secrets.resolve(secretRef), secretRef)
+      } catch {
+        return renderLoginFailedHtml('飞书登录当前不可用，请联系管理员检查网关初始化与应用凭证')
+      }
+      const continueTo = c.req.query('continue')
+      if (continueTo !== undefined && continueTo !== FEISHU_DASHBOARD_PATH) {
+        return renderLoginFailedHtml('登录回跳目标不受支持')
+      }
+      const state = await newLoginState(encKey, Date.now(), {
+        dashboard: continueTo === FEISHU_DASHBOARD_PATH,
+      })
       const url = buildAuthorizeUrl(cred.app_id, loginRedirectUri(c), state)
       return c.redirect(url, 302)
     }),
@@ -1482,6 +1592,17 @@ export function createTbApp(deps: TbAppDeps): Hono<{ Variables: Vars }> {
           : `meego 身份未自动绑定(${r.reason}),如需 meego 写操作请联系管理员绑定。`
       }
       const baseUrl = deps.canonicalOrigin ?? new URL(c.req.url).origin
+      if (payload.d === true) {
+        const handoff = await newLoginHandoff(
+          { secret, baseUrl, ...(name !== undefined ? { name } : {}) },
+          encKey,
+          Date.now(),
+        )
+        const response = c.redirect(`${FEISHU_DASHBOARD_PATH}?login=feishu`, 302)
+        response.headers.set('cache-control', 'private, no-store')
+        response.headers.append('set-cookie', loginHandoffCookie(handoff, c.req.url))
+        return response
+      }
       return renderLoginSuccessHtml({
         secret,
         baseUrl,
