@@ -735,6 +735,9 @@ async function providerFor(
       allowInsecure: insecure,
       // 会话复用凭证存 StateStore(mcpsession:<path>);调用结果不缓存(providers/mcp.ts)。
       session: { store: deps.state, nodePath: node.path },
+      // 个人凭证覆盖:节点标了 credentialDomain 且调用方在该域配了个人 token 时,
+      // 以本人 token 落地(否则回落 authRef 默认)。owner 取自 ctx,用户无法冒充他人。
+      callerOwner: ctx.owner,
       // auth:'oauth' 节点的托管凭证存取面(mcpoauth:*);密钥缺省 → provider 内报 unavailable。
       ...(deps.encryptionKey !== undefined
         ? { oauth: { store: deps.state, encryptionKey: deps.encryptionKey } }

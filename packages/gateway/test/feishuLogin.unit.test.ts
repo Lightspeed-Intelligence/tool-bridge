@@ -107,15 +107,27 @@ describe('Dashboard 登录交接封解', () => {
 })
 
 describe('defaultLoginScopes', () => {
-  it('覆盖 mcp/plugins/skills 的 read+call+write,不含 system/admin', () => {
+  it('覆盖 mcp/plugins/skills 的 read+call+write,加 system/usercred(仅本人凭证面),不含 admin', () => {
     const scopes = defaultLoginScopes()
-    expect(scopes.map(s => s.pattern).sort()).toEqual(['mcp/**', 'plugins/**', 'skills/**'])
+    expect(scopes.map(s => s.pattern).sort()).toEqual([
+      'mcp/**',
+      'plugins/**',
+      'skills/**',
+      'system/usercred',
+    ])
     for (const s of scopes) {
-      expect(s.actions).toEqual(['read', 'call', 'write'])
+      if (s.pattern === 'system/usercred') {
+        // 个人凭证自助面:只给 read+call(执行 set/list/delete),不给 write/admin。
+        expect(s.actions).toEqual(['read', 'call'])
+      } else {
+        expect(s.actions).toEqual(['read', 'call', 'write'])
+      }
     }
     const flat = JSON.stringify(scopes)
     expect(flat).not.toContain('admin')
-    expect(flat).not.toContain('system')
+    // 除 system/usercred 这个明确开放的本人面外,不触及其它 system/* admin 面。
+    expect(scopes.some(s => s.pattern.startsWith('system/') && s.pattern !== 'system/usercred'))
+      .toBe(false)
   })
 })
 
@@ -130,7 +142,12 @@ describe('rotateLoginKey', () => {
     expect(key.owner).toBe('user:ou_abc')
     expect(key.description?.startsWith(LOGIN_KEY_TAG)).toBe(true)
     expect(key.expiresAt).toBeDefined()
-    expect(key.scopes.map(s => s.pattern).sort()).toEqual(['mcp/**', 'plugins/**', 'skills/**'])
+    expect(key.scopes.map(s => s.pattern).sort()).toEqual([
+      'mcp/**',
+      'plugins/**',
+      'skills/**',
+      'system/usercred',
+    ])
   })
 
   it('rotate:同 owner 的旧登录 key 被删,只剩新的', async () => {

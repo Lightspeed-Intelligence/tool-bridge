@@ -12,6 +12,7 @@ import type { NodeRegistryStore } from '../tree/registry'
 import type { ScopeChecker } from '../tree/visibility'
 import type { SKRegistryStore } from '../auth/sk'
 import type { BuiltinModule } from './types'
+import { createUserCredModule, type CredentialDomainInfo } from './usercred'
 import { createPluginModule, type PluginModuleDeps } from './plugin'
 import { createAnnotationModule } from './annotation'
 import { createFederationModule } from './federation'
@@ -48,6 +49,40 @@ export interface BuiltinDeps {
   visibility?: ScopeChecker
 }
 
+/** 翻页扫描节点注册表,聚合声明了 credentialDomain 的节点 → 可配个人凭证的域列表。 */
+async function listCredentialDomains(
+  registry: NodeRegistryStore,
+): Promise<CredentialDomainInfo[]> {
+  const byDomain = new Map<string, { description?: string, nodePaths: string[] }>()
+  let cursor: string | undefined
+  do {
+    const page = await registry.list(undefined, {
+      limit: LIST_LIMIT_MAX,
+      ...(cursor !== undefined ? { cursor } : {}),
+    })
+    for (const node of page.items) {
+      const cfg = node.config
+      const domain
+        = cfg !== undefined && cfg.kind === 'mcp' && typeof cfg.credentialDomain === 'string'
+          ? cfg.credentialDomain
+          : undefined
+      if (domain === undefined || domain.length === 0) continue
+      const entry = byDomain.get(domain) ?? { nodePaths: [] }
+      entry.nodePaths.push(node.path)
+      if (entry.description === undefined && node.description.length > 0) {
+        entry.description = node.description
+      }
+      byDomain.set(domain, entry)
+    }
+    cursor = page.cursor
+  } while (cursor !== undefined)
+  return [...byDomain.entries()].map(([domain, v]) => ({
+    domain,
+    nodePaths: v.nodePaths,
+    ...(v.description !== undefined ? { description: v.description } : {}),
+  }))
+}
+
 /** 翻页统计 registry 全量节点数(status.nodeCount)。 */
 async function countNodes(registry: NodeRegistryStore): Promise<number> {
   let count = 0
@@ -69,6 +104,9 @@ export function createBuiltins(deps: BuiltinDeps): Map<string, BuiltinModule> {
   const modules = new Map<string, BuiltinModule>()
   modules.set('sk', createSkModule(deps.sk, now))
   modules.set('secret', createSecretModule(deps.secret, now))
+  // 个人凭证自助面:复用 secret 存储(SecretStoreImpl),名字空间 usercred:<owner>:<domain>。
+  // domains cmd 需发现「哪些节点声明了 credentialDomain」——从 registry 扫描聚合。
+  modules.set('usercred', createUserCredModule(deps.secret, now, () => listCredentialDomains(deps.registry)))
   modules.set('registry', createRegistryModule(deps.registry, now, deps.visibility))
   modules.set(
     'status',
@@ -116,3 +154,10 @@ export { createSecretModule } from './secret'
 export { createSkModule } from './sk'
 export { createStatusModule, type StatusDeps, type StatusSummary } from './status'
 export type { BuiltinModule } from './types'
+export {
+  createUserCredModule,
+  type CredentialDomainInfo,
+  type ListCredentialDomains,
+  resolveUserCredential,
+  USERCRED_PREFIX,
+} from './usercred'

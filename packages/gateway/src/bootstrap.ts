@@ -45,6 +45,7 @@ const BUILTIN_MODULES = [
   'plugin',
   'federation',
   'annotation',
+  'usercred',
 ] as const
 
 const BUILTIN_DESCRIPTIONS: Record<string, string> = {
@@ -55,6 +56,7 @@ const BUILTIN_DESCRIPTIONS: Record<string, string> = {
   plugin: 'Plugin registry',
   federation: 'Remote federation host allowlist',
   annotation: 'Admin notes shown in ~help of any path',
+  usercred: 'Your personal upstream credentials (per-user, write-only)',
 }
 
 let bootstrapOnce: Promise<void> | undefined

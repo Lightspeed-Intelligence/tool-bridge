@@ -1,4 +1,13 @@
-import { Boxes, Cpu, Globe, KeySquare, type LucideIcon, Plug2, ShieldEllipsis } from 'lucide-react'
+import {
+  Boxes,
+  Cpu,
+  Globe,
+  KeyRound,
+  KeySquare,
+  type LucideIcon,
+  Plug2,
+  ShieldEllipsis,
+} from 'lucide-react'
 
 export interface ManageLink {
   icon: LucideIcon
@@ -15,4 +24,5 @@ export const MANAGE_LINKS: readonly ManageLink[] = [
   { to: '/manage/devices', label: '设备', shortLabel: '设备', icon: Cpu },
   { to: '/manage/plugins', label: 'Plugin', shortLabel: '插件', icon: Plug2 },
   { to: '/manage/federation', label: '联邦白名单', shortLabel: '联邦', icon: Globe },
+  { to: '/me/credentials', label: '我的凭证', shortLabel: '凭证', icon: KeyRound },
 ] as const

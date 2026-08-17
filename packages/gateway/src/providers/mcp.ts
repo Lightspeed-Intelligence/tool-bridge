@@ -29,7 +29,9 @@ import {
   authHeaderFor,
   isTBError,
   normalizeUpstreamError,
+  resolveUserCredential,
   type SecretStoreImpl,
+  sha256Hex,
   type StateStore,
   TBError,
   type ToolResult,
@@ -54,6 +56,8 @@ export interface McpConfig {
   authRef?: string
   /** 凭证前缀;空串 = 原样注入(默认 Bearer)。 */
   authScheme?: string
+  /** 个人凭证域:调用方在此域配了个人 token 则覆盖 authRef 默认(见 usercred)。 */
+  credentialDomain?: string
   /** 静态明文请求头(非机密);authRef 凭证头覆盖同名项。 */
   headers?: Record<string, string>
   url: string
@@ -138,23 +142,34 @@ interface CachedSession {
 
 const SESSION_KEY_PREFIX = 'mcpsession:'
 
-function sessionKey(nodePath: TreePath): string {
-  return `${SESSION_KEY_PREFIX}${nodePath}`
+/**
+ * 会话缓存 key = `mcpsession:<nodePath>[#<bucket>]`。bucket 为注入凭证的指纹
+ * (per-owner 个人凭证 / 管理员默认各自不同);缺省(无凭证或无 owner)退化为原 key,
+ * 与历史行为一致。注册面失效(invalidateMcpSession)按 `mcpsession:<nodePath>` 前缀清全部桶。
+ */
+function sessionKey(nodePath: TreePath, bucket?: string): string {
+  return bucket !== undefined
+    ? `${SESSION_KEY_PREFIX}${nodePath}#${bucket}`
+    : `${SESSION_KEY_PREFIX}${nodePath}`
 }
 
 function isCachedSession(v: unknown): v is CachedSession {
   return typeof v === 'object' && v !== null && typeof (v as CachedSession).sessionId === 'string'
 }
 
-async function loadSession(s: McpSessionStore | undefined): Promise<CachedSession | null> {
+async function loadSession(
+  s: McpSessionStore | undefined,
+  bucket?: string,
+): Promise<CachedSession | null> {
   if (s === undefined) return null
-  const raw = await s.store.get(sessionKey(s.nodePath))
+  const raw = await s.store.get(sessionKey(s.nodePath, bucket))
   return isCachedSession(raw) ? raw : null
 }
 
 async function saveSession(
   s: McpSessionStore | undefined,
   transport: StreamableHTTPClientTransport,
+  bucket?: string,
 ): Promise<void> {
   if (s === undefined || transport.sessionId === undefined) return
   const record: CachedSession = {
@@ -164,17 +179,29 @@ async function saveSession(
       : {}),
     updatedAt: new Date().toISOString(),
   }
-  await s.store.put(sessionKey(s.nodePath), record)
+  await s.store.put(sessionKey(s.nodePath, bucket), record)
 }
 
-async function clearSession(s: McpSessionStore | undefined): Promise<void> {
+async function clearSession(s: McpSessionStore | undefined, bucket?: string): Promise<void> {
   if (s === undefined) return
-  await s.store.delete(sessionKey(s.nodePath))
+  await s.store.delete(sessionKey(s.nodePath, bucket))
 }
 
-/** 删除某节点的会话缓存(注册面 Write/Update/Delete 时调用:URL/authRef 变更后旧凭证作废)。 */
+/**
+ * 删除某节点的会话缓存(注册面 Write/Update/Delete 时调用:URL/authRef 变更后旧凭证作废)。
+ * 按 `mcpsession:<nodePath>` 前缀清除所有凭证分桶(含 `#<bucket>` 后缀的个人会话)。
+ */
 export async function invalidateMcpSession(store: StateStore, nodePath: string): Promise<void> {
-  await store.delete(`${SESSION_KEY_PREFIX}${nodePath}`)
+  const prefix = `${SESSION_KEY_PREFIX}${nodePath}`
+  let cursor: string | undefined
+  do {
+    const page = await store.list(prefix, cursor !== undefined ? { cursor } : undefined)
+    for (const { key } of page.items) {
+      // 前缀匹配须精确到 nodePath 边界:node "a" 的失效不得误删 node "ab"。
+      if (key === prefix || key.startsWith(`${prefix}#`)) await store.delete(key)
+    }
+    cursor = page.cursor
+  } while (cursor !== undefined)
 }
 
 /** 上游宣告会话失效的状态码(spec 规定 404;部分实现回 400)。 */
@@ -207,6 +234,7 @@ async function withSession<T>(
   session: McpSessionStore | undefined,
   fn: (client: Client) => Promise<T>,
   forceFresh = false,
+  bucket?: string,
 ): Promise<SessionOutcome<T>> {
   const makeTransport = (sessionId: string | undefined): StreamableHTTPClientTransport =>
     new StreamableHTTPClientTransport(new URL(url), {
@@ -229,11 +257,11 @@ async function withSession<T>(
     const transport = makeTransport(undefined)
     const client = makeClient()
     await client.connect(transport) // initialize 握手;成功后 transport 持有新 sessionId(如有)
-    await saveSession(session, transport)
+    await saveSession(session, transport, bucket)
     return { value: await fn(client), viaCachedSession: false }
   }
 
-  const cached = forceFresh ? null : await loadSession(session)
+  const cached = forceFresh ? null : await loadSession(session, bucket)
   if (cached !== null) {
     const transport = makeTransport(cached.sessionId)
     const client = makeClient()
@@ -245,7 +273,7 @@ async function withSession<T>(
       return { value: await fn(client), viaCachedSession: true }
     } catch (err) {
       if (!isSessionInvalid(err)) throw err
-      await clearSession(session)
+      await clearSession(session, bucket)
       // 落回完整握手重试一次
     }
   }
@@ -278,6 +306,8 @@ export function createMcpProvider(
   secrets: SecretStoreImpl,
   opts: {
     allowInsecure: boolean
+    /** 调用方 owner(ctx.owner);与 config.credentialDomain 都在时查个人凭证覆盖 authRef 默认。 */
+    callerOwner?: string
     /** 托管 OAuth 的存取面(auth:'oauth' 节点必需;encryptionKey 缺省时不传)。 */
     oauth?: { encryptionKey: string, store: StateStore }
     session?: McpSessionStore
@@ -287,32 +317,51 @@ export function createMcpProvider(
   if (secErr) throw secErr
 
   const nodePath = opts.session?.nodePath ?? ''
-  const makeAuth = async (): Promise<UpstreamAuth> => {
+  // makeAuth 除返回注入形态外,还给出会话分桶键 bucket:同一节点下不同注入凭证
+  // (个人 token / 管理员默认)各自一条上游会话,互不复用——否则 A 的会话被 B 复用会串号。
+  const makeAuth = async (): Promise<{ auth: UpstreamAuth, bucket?: string }> => {
     if (config.auth === 'oauth') {
       if (opts.oauth === undefined) {
         throw new TBError('unavailable', 'OAuth-backed mcp 需要 TB_SECRET_ENCRYPTION_KEY', {
           retryable: false,
         })
       }
+      // OAuth 托管凭证按调用方 owner 分桶(每人各自授权;owner 缺省则单桶,行为不变)。
       return {
-        oauth: new GatewayMcpOAuthProvider({
-          store: opts.oauth.store,
-          nodePath,
-          encryptionKey: opts.oauth.encryptionKey,
-          mode: 'deny',
-        }),
+        auth: {
+          oauth: new GatewayMcpOAuthProvider({
+            store: opts.oauth.store,
+            nodePath,
+            encryptionKey: opts.oauth.encryptionKey,
+            mode: 'deny',
+          }),
+        },
+        ...(opts.callerOwner !== undefined
+          ? { bucket: await sha256Hex(`oauth\n${opts.callerOwner}`) }
+          : {}),
       }
     }
-    // 静态头形态:headers(明文)+ authRef 凭证头(authHeaderFor 语义,覆盖同名)。
+    // 静态头形态:headers(明文)+ 凭证头(authHeaderFor 语义,覆盖同名)。
+    // 凭证解析顺序:个人凭证(usercred:<owner>:<domain>)优先,否则回落节点默认 authRef。
     const h: Record<string, string> = { ...(config.headers ?? {}) }
+    let bucket: string | undefined
     if (config.authRef !== undefined) {
-      const cred = await secrets.resolve(config.authRef)
+      const personal
+        = opts.callerOwner !== undefined && config.credentialDomain !== undefined
+          ? await resolveUserCredential(secrets, opts.callerOwner, config.credentialDomain)
+          : undefined
+      const cred = personal ?? (await secrets.resolve(config.authRef))
       if (cred !== undefined) {
         const [hn, hv] = authHeaderFor(config, cred)
         h[hn] = hv
+        // 指纹只作分桶键(注入头名+值的 sha256),不落明文。个人与默认凭证指纹不同 → 不同会话。
+        bucket = await sha256Hex(`${hn}\n${hv}`)
       }
     }
-    return Object.keys(h).length > 0 ? { headers: h } : {}
+    return {
+      auth: Object.keys(h).length > 0 ? { headers: h } : {},
+      ...(bucket !== undefined ? { bucket } : {}),
+    }
   }
 
   // SDK 静默刷新失败/无 token 时抛 UnauthorizedError(非 OAuthError 子类,guard 会归一成
@@ -332,7 +381,7 @@ export function createMcpProvider(
     list: () =>
       guard(() =>
         mapUnauthorized(async () => {
-          const auth = await makeAuth()
+          const { auth, bucket } = await makeAuth()
           const listOnce = (forceFresh = false): Promise<SessionOutcome<{ tools: McpTool[] }>> =>
             withSession(
               config.url,
@@ -340,13 +389,14 @@ export function createMcpProvider(
               opts.session,
               c => c.listTools(),
               forceFresh,
+              bucket,
             ) as Promise<SessionOutcome<{ tools: McpTool[] }>>
           let res = await listOnce()
           // 空列表防御(见文件头):复用缓存会话拿到空列表 → 清会话、强制完整重握手再取
           // 一次。重试必须 forceFresh:清会话后回读 KV 会命中边缘读缓存拿回旧会话,
           // 重试再次复用死会话,防御被击穿。
           if (res.viaCachedSession && res.value.tools.length === 0) {
-            await clearSession(opts.session)
+            await clearSession(opts.session, bucket)
             res = await listOnce(true)
           }
           return res.value.tools.map(toSpec)
@@ -355,9 +405,14 @@ export function createMcpProvider(
     call: (name, args) =>
       guard(() =>
         mapUnauthorized(async () => {
-          const auth = await makeAuth()
-          const { value } = await withSession(config.url, auth, opts.session, c =>
-            c.callTool({ name, arguments: args }),
+          const { auth, bucket } = await makeAuth()
+          const { value } = await withSession(
+            config.url,
+            auth,
+            opts.session,
+            c => c.callTool({ name, arguments: args }),
+            false,
+            bucket,
           )
           return toToolResult(value as { content?: unknown, isError?: boolean })
         }),

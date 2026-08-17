@@ -1,4 +1,10 @@
-import { MemoryStateStore, parseHelpDsl, SecretStoreImpl, type StateStore } from '@tool-bridge/core'
+import {
+  base64urlEncode,
+  MemoryStateStore,
+  parseHelpDsl,
+  SecretStoreImpl,
+  type StateStore,
+} from '@tool-bridge/core'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { env, SELF } from 'cloudflare:test'
 import { createMcpProvider } from '../src/providers/mcp'
@@ -773,6 +779,81 @@ describe('mcp 自定义请求头(飞书形态:凭证进自定义头 + 静态白�
       expect(h.get('X-Lark-MCP-Allowed-Tools')).toBe('search-doc,fetch-doc')
       expect(h.get('Authorization')).toBeNull()
     }
+  })
+})
+
+describe('个人凭证覆盖(usercred:<owner>:<domain> 优先于 authRef 默认)', () => {
+  // 直接构造 provider(如 stale-store 用例):owner + credentialDomain 命中个人凭证则注入本人 token,
+  // 否则回落 authRef 默认;个人 token 与默认 token 各自一条上游会话,互不复用。
+  function setup(): {
+    secrets: SecretStoreImpl
+    store: MemoryStateStore
+    upstream: ReturnType<typeof mcpUpstreamMock>
+  } {
+    const upstream = mcpUpstreamMock([{ name: 'echo', description: 'echo back' }])
+    vi.stubGlobal('fetch', upstream.fetchMock)
+    const store = new MemoryStateStore()
+    return { secrets: new SecretStoreImpl(store, undefined), store, upstream }
+  }
+  const NOW = '2026-08-12T00:00:00.000Z'
+
+  it('命中个人凭证 → 注入本人 token;缺失 → 回落 authRef 默认', async () => {
+    const { upstream } = setup()
+    // authRef 默认凭证 + 一个人的个人凭证,都用可用主密钥的 store。
+    const store = new MemoryStateStore()
+    const key = base64urlEncode(crypto.getRandomValues(new Uint8Array(32)))
+    const secrets = new SecretStoreImpl(store, key)
+    await secrets.set('yunxiao', 'ADMIN-DEFAULT', NOW)
+    await secrets.set('usercred:user:ou_alice:yunxiao', 'ALICE-PAT', NOW)
+
+    const cfg = { url: 'https://mcp-mock.test/mcp', authRef: 'yunxiao', credentialDomain: 'yunxiao' }
+    // alice:命中个人凭证。
+    const pa = createMcpProvider(cfg, secrets, {
+      allowInsecure: false,
+      callerOwner: 'user:ou_alice',
+      session: { store, nodePath: 'ext/y' },
+    })
+    await pa.call('echo', {})
+    // bob:无个人凭证 → 回落默认。
+    const pb = createMcpProvider(cfg, secrets, {
+      allowInsecure: false,
+      callerOwner: 'user:ou_bob',
+      session: { store, nodePath: 'ext/y' },
+    })
+    await pb.call('echo', {})
+
+    const auths = upstream.headersSeen().map(h => h.get('Authorization'))
+    expect(auths).toContain('Bearer ALICE-PAT')
+    expect(auths).toContain('Bearer ADMIN-DEFAULT')
+  })
+
+  it('个人 token 与默认 token 会话分桶:不复用彼此会话(各自 initialize)', async () => {
+    const { upstream } = setup()
+    const store = new MemoryStateStore()
+    const key = base64urlEncode(crypto.getRandomValues(new Uint8Array(32)))
+    const secrets = new SecretStoreImpl(store, key)
+    await secrets.set('yunxiao', 'ADMIN-DEFAULT', NOW)
+    await secrets.set('usercred:user:ou_alice:yunxiao', 'ALICE-PAT', NOW)
+    const cfg = { url: 'https://mcp-mock.test/mcp', authRef: 'yunxiao', credentialDomain: 'yunxiao' }
+
+    // alice 先 list(完整握手,回填自己桶的会话),再 list(应复用自己的会话,不再握手)。
+    const pa = createMcpProvider(cfg, secrets, {
+      allowInsecure: false,
+      callerOwner: 'user:ou_alice',
+      session: { store, nodePath: 'ext/y' },
+    })
+    await pa.list()
+    await pa.list()
+    expect(upstream.initializeCalls()).toBe(1)
+
+    // bob 用默认凭证 list:不同桶,必须自己完整握手(不复用 alice 的会话)。
+    const pb = createMcpProvider(cfg, secrets, {
+      allowInsecure: false,
+      callerOwner: 'user:ou_bob',
+      session: { store, nodePath: 'ext/y' },
+    })
+    await pb.list()
+    expect(upstream.initializeCalls()).toBe(2)
   })
 })
 

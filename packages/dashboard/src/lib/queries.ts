@@ -3,6 +3,7 @@ import { useSyncExternalStore } from 'react'
 import type {
   ContextEntry,
   ContextEntryMeta,
+  CredentialDomainState,
   FederationHost,
   Page,
   PluginManifest,
@@ -205,6 +206,19 @@ export function useFederationList() {
     queryFn: async () => {
       const r = await invoke(conn, 'system/federation', 'list', {})
       return r.json as { items: FederationHost[] }
+    },
+  })
+}
+
+/** 个人凭证:可配域(节点声明的 credentialDomain)⋈ 本人已配状态。登录用户自助面。 */
+export function useMyCredentials() {
+  const conn = useConn()
+  const base = useKeyBase()
+  return useQuery({
+    queryKey: [...base, 'my-credentials'],
+    queryFn: async () => {
+      const r = await invoke(conn, 'system/usercred', 'domains', {})
+      return r.json as { items: CredentialDomainState[] }
     },
   })
 }

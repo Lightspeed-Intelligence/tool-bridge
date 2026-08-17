@@ -33,6 +33,9 @@ const SecretsPage = lazy(() =>
 const SkPage = lazy(() =>
   import('@/pages/system/SkPage').then(module => ({ default: module.SkPage })),
 )
+const MyCredentialsPage = lazy(() =>
+  import('@/pages/MyCredentialsPage').then(module => ({ default: module.MyCredentialsPage })),
+)
 
 function AppBooting() {
   return (
@@ -138,6 +141,14 @@ export default function App() {
               </DeferredPage>
             )}
             path="manage/federation"
+          />
+          <Route
+            element={(
+              <DeferredPage>
+                <MyCredentialsPage />
+              </DeferredPage>
+            )}
+            path="me/credentials"
           />
           <Route element={<Navigate replace to="/" />} path="*" />
         </Route>

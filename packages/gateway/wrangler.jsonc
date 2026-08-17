@@ -22,7 +22,12 @@
     "TB_R2_BUCKET": "tb-r2",
     "TB_R2_S3_ENDPOINT": "https://041d4868e5611b45f9959f4f58c1e4c7.r2.cloudflarestorage.com",
     // 飞书登录:复用 feishu plugin 的 SecretStore 凭证(feishu-app),设置即启用 /login。
-    "TB_FEISHU_LOGIN_SECRET_REF": "feishu-app"
+    "TB_FEISHU_LOGIN_SECRET_REF": "feishu-app",
+    // meego 自动绑定(登录后 open_id → union_id → user_key 写入节点 userKeys)。
+    // ⚠️ 必须留在此文件:wrangler deploy 的 vars 以本文件为准、不合并线上已有值——
+    // 2026-08-08 的部署曾因此把这两项抹掉,导致此后登录全部静默跳过绑定。
+    "TB_MEEGO_BIND_NODE": "plugins/meego",
+    "TB_MEEGO_SECRET_REF": "meego-app"
   },
   // KV:树配置 / SK 哈希表 / manifest。id 为占位,由 scripts/provision.mjs
   // 幂等创建后回填;本地 wrangler dev / vitest-pool-workers 用 miniflare 本地实例,不校验该 id。

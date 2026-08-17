@@ -186,6 +186,8 @@ export type NodeConfig
     authRef?: string
     /** 凭证前缀;空串 = 原样注入(默认 Bearer)。 */
     authScheme?: string
+    /** 个人凭证域:调用方在此域下配了个人 token(usercred:<owner>:<domain>)则覆盖 authRef 默认。 */
+    credentialDomain?: string
     /** 静态明文请求头(非机密,如上游要求的工具白名单头);authRef 头优先。 */
     headers?: Record<string, string>
     kind: 'mcp'
