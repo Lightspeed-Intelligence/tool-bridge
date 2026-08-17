@@ -121,6 +121,20 @@ export interface FederationHost {
   updatedAt?: string
 }
 
+/** 个人凭证域状态(system/usercred domains):可配域 + 本人是否已配。 */
+export interface CredentialDomainState {
+  /** 是否已配置个人 token(否则回落管理员默认)。 */
+  configured: boolean
+  /** 首个用该域的节点描述(说明用途)。 */
+  description?: string
+  /** 凭证域名(如 yunxiao)。 */
+  domain: string
+  /** 用该域的节点路径(展示影响面)。 */
+  nodePaths: string[]
+  /** 本人该域凭证更新时间(configured 时有)。 */
+  updatedAt?: string
+}
+
 /** system/plugin 的 manifest(plugin/manifest.ts 契约手抄)。 */
 export type PluginKind = 'tool-provider' | 'context-provider'
 
