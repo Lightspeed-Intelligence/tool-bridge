@@ -64,6 +64,10 @@ export function defaultLoginScopes(): Scope[] {
     { pattern: 'mcp/**', actions },
     { pattern: 'plugins/**', actions },
     { pattern: 'skills/**', actions },
+    // 个人凭证自助面(system/usercred):仅此一个 system 节点开放给登录用户,
+    // read 看自己已配的域、call 执行 set/list/delete。隔离靠 dispatch 内 ctx.owner 硬圈定,
+    // 不波及 system/sk、system/secret 等 admin 面。
+    { pattern: 'system/usercred', actions: ['read', 'call'] },
   ]
 }
 

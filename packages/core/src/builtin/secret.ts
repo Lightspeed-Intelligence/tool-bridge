@@ -96,8 +96,12 @@ export function createSecretModule(store: SecretStoreImpl, now: () => string): B
           await store.set(name, requireString(args, 'value'), now())
           return VOID_ACK
         }
-        case 'list':
-          return store.list(optListOptions(args))
+        case 'list': {
+          // 过滤个人凭证(usercred:<owner>:<domain>):admin 面不得泄露其存在与 owner。
+          // 它们只经 system/my-credentials 的本人面读写。
+          const page = await store.list(optListOptions(args))
+          return { ...page, items: page.items.filter(it => !it.name.startsWith('usercred:')) }
+        }
         case 'delete': {
           const name = requireString(args, 'name')
           assertUserSecretName(name)
