@@ -53,10 +53,16 @@ import { BuiltinCatalog } from './BuiltinCatalog'
 const NODE_KIND_BY_PROFILE = { 'tools/v1': 'tool', 'context/v1': 'context' } as const
 
 /** export 徽标：`<id> · <profile>`。 */
-function ExportBadges({ exports }: { exports: PluginExport[] }) {
+function ExportBadges({ exports }: { exports?: PluginExport[] }) {
+  // 防御:存量 manifest / 健康快照可能缺 exports(旧 v1 记录或部分字段未回填),
+  // 直接 .map 会整页崩(Cannot read properties of undefined)。缺省视为空列表。
+  const list = exports ?? []
+  if (list.length === 0) {
+    return <span className="text-[10px] text-muted-foreground">无 export</span>
+  }
   return (
     <>
-      {exports.map(e => (
+      {list.map(e => (
         <Badge className="font-mono text-[10px]" key={e.id} variant="outline">
           {e.id}
           {' · '}
