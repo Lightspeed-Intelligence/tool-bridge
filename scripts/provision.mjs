@@ -35,9 +35,12 @@ const apiToken = env.CLOUDFLARE_API_TOKEN || process.env.CLOUDFLARE_API_TOKEN
 const domain = env.TB_DOMAIN || process.env.TB_DOMAIN
 const baseUrl = env.TB_BASE_URL || process.env.TB_BASE_URL
 
-const kvTitle = `${prefix}-kv`
-const r2Bucket = `${prefix}-r2`
-const d1Name = `${prefix}-search`
+// 资源名默认从 prefix 派生;但存量部署的库名可能与该约定不符(如本仓生产 KV 实为
+// "TENANTS"),故允许 TB_KV_TITLE / TB_R2_BUCKET_NAME / TB_D1_NAME 显式覆盖,让 provision
+// 按真实名查到现有资源而非新建空库。缺省回落 `${prefix}-*`。
+const kvTitle = env.TB_KV_TITLE || process.env.TB_KV_TITLE || `${prefix}-kv`
+const r2Bucket = env.TB_R2_BUCKET_NAME || process.env.TB_R2_BUCKET_NAME || `${prefix}-r2`
+const d1Name = env.TB_D1_NAME || process.env.TB_D1_NAME || `${prefix}-search`
 const wranglerPath = resolve(
   root,
   process.env.TB_PROVISION_WRANGLER_CONFIG ?? join('packages', 'gateway', 'wrangler.jsonc'),

@@ -48,7 +48,7 @@
     {
       "binding": "TB_SEARCH",
       "database_name": "tb-search",
-      "database_id": "00000000-0000-0000-0000-000000000000"
+      "database_id": "9244c856-f58a-4443-bed3-dfa85ac32ded"
     }
   ],
   // R2:context r2 provider 与大对象 $ref。
