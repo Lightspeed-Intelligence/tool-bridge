@@ -17,6 +17,7 @@ import {
 import {
   createTbApp,
   dispatchContextCmd,
+  parseOAuthDelegationClients,
   runBootstrap,
   type TbAppDeps,
   type UpstreamProvider,
@@ -179,6 +180,15 @@ export function createToolBridge(config: ToolBridgeConfig): ToolBridge {
     },
   }
   if (config.reservedRoots !== undefined) deps.reservedRoots = config.reservedRoots
+  if (config.feishuLoginSecretRef !== undefined) {
+    deps.feishuLoginSecretRef = config.feishuLoginSecretRef
+  }
+  if (config.feishuLoginKeyTtlSec !== undefined) {
+    deps.feishuLoginKeyTtlSec = config.feishuLoginKeyTtlSec
+  }
+  if (config.oauthDelegationClients !== undefined) {
+    deps.oauthDelegationClients = parseOAuthDelegationClients(config.oauthDelegationClients)
+  }
   if (config.pluginBindings !== undefined) deps.pluginBindings = config.pluginBindings
   if (config.pluginCatalog !== undefined) deps.pluginCatalog = config.pluginCatalog
   if (config.objects !== undefined) {

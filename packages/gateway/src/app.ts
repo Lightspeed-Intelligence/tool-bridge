@@ -1,6 +1,7 @@
 import {
   createTbApp,
   ensureBootstrapped,
+  parseOAuthDelegationClientsJson,
   parseS3Credentials,
   type PluginBindings,
   type RemoteSettings,
@@ -53,6 +54,8 @@ export interface Env {
   TB_MEEGO_LOGIN_SECRET_REF?: string
   /** meego 自动绑定:meego 插件凭证 {plugin_id,plugin_secret} 的 SecretStore 引用(如 "meego-app")。 */
   TB_MEEGO_SECRET_REF?: string
+  /** JSON array of exact confidential-client redirects and named delegated scope bundles. */
+  TB_OAUTH_DELEGATION_CLIENTS?: string
   TB_R2: R2Bucket
   /** r2 presign 凭证链的 env 段(SecretStore 'r2-presign' 优先)。 */
   TB_R2_ACCESS_KEY_ID?: string
@@ -172,6 +175,8 @@ function depsFromEnv(env: Env): TbAppDeps {
   }
   const loginTtl = positiveIntEnv(env.TB_FEISHU_LOGIN_KEY_TTL_SEC)
   if (loginTtl !== undefined) deps.feishuLoginKeyTtlSec = loginTtl
+  const oauthDelegationClients = parseOAuthDelegationClientsJson(env.TB_OAUTH_DELEGATION_CLIENTS)
+  if (oauthDelegationClients.length > 0) deps.oauthDelegationClients = oauthDelegationClients
   // meego 自动绑定:节点路径 + meego 凭证引用都配了才启用(open_id → union_id → user_key)。
   if (
     env.TB_MEEGO_BIND_NODE !== undefined && env.TB_MEEGO_BIND_NODE !== ''

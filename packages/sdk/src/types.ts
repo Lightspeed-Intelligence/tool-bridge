@@ -1,4 +1,4 @@
-import type { PluginBindings } from '@tool-bridge/app'
+import type { OAuthDelegationClient, PluginBindings } from '@tool-bridge/app'
 import { type BuiltinCatalog,
   type ContextProvider,
   type DeviceClientState,
@@ -43,10 +43,16 @@ export interface ToolBridgeConfig {
   allowInsecureHttp?: boolean
   /** secrets 缺省实现的主密钥(base64url 32B);缺省取 env TB_SECRET_ENCRYPTION_KEY。 */
   encryptionKey?: string
+  /** Existing interactive-login SK lifetime in seconds. */
+  feishuLoginKeyTtlSec?: number
+  /** SecretStore reference for the Feishu app used to authenticate delegated users. */
+  feishuLoginSecretRef?: string
   /** 本实例 X-TB-Via 标识(缺省用入站 host 派生)。 */
   instanceId?: string
   /** X-TB-Via 跳数上限;默认 4。 */
   maxHops?: number
+  /** Exact confidential-client redirect and scope allowlists for OAuth delegation. */
+  oauthDelegationClients?: OAuthDelegationClient[]
   /** context 对象('r2' 平台 provider 的落点);缺省 → 该 provider unavailable。 */
   objects?: ObjectStore
   /** 进程内插件装配表(binding 名 → fetch handler);`binding:<name>` 插件经此直调。 */

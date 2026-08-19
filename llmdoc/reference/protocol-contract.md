@@ -10,6 +10,8 @@
 - `GET|POST|DELETE /<path>/~feedback[/<id>]`：具体路径的使用反馈、投票与管理；不是集中 builtin。
 - `ALL /~mcp`：把当前身份可见工具投影为 MCP server。
 - `GET /healthz`：公开健康信息，不证明认证数据面可用。
+- `GET /oauth/authorize`、`POST /oauth/token|revoke`：预注册机密客户端的飞书用户委托；
+  使用 OAuth 错误形状，完整契约见 [oauth-delegation-contract.md](oauth-delegation-contract.md)。
 - 错误统一为 `{code,message,retryable}`；主要 code：not_found、permission_denied、invalid_argument、conflict、unavailable、rate_limited、internal。
 
 未知 Help DSL 行与未知可选 capability 应忽略，这是协议演进能力；安全字段和未知写入参数不得静默忽略。

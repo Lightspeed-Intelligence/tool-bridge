@@ -4,7 +4,11 @@
  * 解析函数镜像 app.ts 的 allowInsecure / remoteSettingsFromEnv / positiveIntEnv。
  */
 
-import type { PluginBindings } from '@tool-bridge/app'
+import {
+  type OAuthDelegationClient,
+  parseOAuthDelegationClientsJson,
+  type PluginBindings,
+} from '@tool-bridge/app'
 import { type BuiltinCatalog, normalizeCanonicalOrigin } from '@tool-bridge/core'
 
 const DEFAULT_PORT = 8787
@@ -32,7 +36,13 @@ export interface ServerConfig {
   deviceReclaimSec: number
   /** SecretStore 主密钥 + $ref 中转 token 签名密钥(base64url 32B)。 */
   encryptionKey?: string
+  /** Existing interactive-login SK lifetime; also kept host-parity with Workers. */
+  feishuLoginKeyTtlSec?: number
+  /** SecretStore reference for the Feishu app used to authenticate delegated users. */
+  feishuLoginSecretRef?: string
   host: string
+  /** Pre-registered confidential clients; secrets stay in deployment configuration. */
+  oauthDelegationClients?: OAuthDelegationClient[]
   /**
    * 进程内插件装配表(binding 名 → fetch handler)。缺省时 bin 入口装配**全量内置目录**
    * (见 `main.ts`);程序化嵌入方可给自己的表来覆盖或裁剪。
@@ -103,6 +113,15 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): ServerConfi
   if (env.TB_SECRET_ENCRYPTION_KEY !== undefined && env.TB_SECRET_ENCRYPTION_KEY.length > 0) {
     config.encryptionKey = env.TB_SECRET_ENCRYPTION_KEY
   }
+  if (env.TB_FEISHU_LOGIN_SECRET_REF !== undefined && env.TB_FEISHU_LOGIN_SECRET_REF.length > 0) {
+    config.feishuLoginSecretRef = env.TB_FEISHU_LOGIN_SECRET_REF
+  }
+  const loginTtl = positiveIntEnv(env.TB_FEISHU_LOGIN_KEY_TTL_SEC)
+  if (loginTtl !== undefined) config.feishuLoginKeyTtlSec = loginTtl
+  const oauthDelegationClients = parseOAuthDelegationClientsJson(
+    env.TB_OAUTH_DELEGATION_CLIENTS,
+  )
+  if (oauthDelegationClients.length > 0) config.oauthDelegationClients = oauthDelegationClients
   const ttl = positiveIntEnv(env.TB_TOOL_CACHE_TTL)
   if (ttl !== undefined) config.toolCacheTtlSec = ttl
   const refThreshold = positiveIntEnv(env.TB_REF_THRESHOLD_BYTES)

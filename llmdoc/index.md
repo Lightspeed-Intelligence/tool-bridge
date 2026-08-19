@@ -22,6 +22,7 @@
 | Dashboard 数据流与表单边界 | [architecture/dashboard.md](architecture/dashboard.md) |
 | 认证、密钥、出站与日志边界 | [architecture/security-boundaries.md](architecture/security-boundaries.md) |
 | HTBP、节点、builtin、CLI 契约 | [reference/protocol-contract.md](reference/protocol-contract.md) |
+| 飞书用户向机密客户端委托短期 SK | [reference/oauth-delegation-contract.md](reference/oauth-delegation-contract.md) |
 | CLI 参数与三入口对等 | [guides/cli-argument-contract-review.md](guides/cli-argument-contract-review.md) |
 | Linux 设备 daemon 安装与生命周期 | [guides/device-daemon.md](guides/device-daemon.md) |
 | Agent Skill 接入、feedback 工作流与验收 | [guides/agent-skill-integration.md](guides/agent-skill-integration.md) |

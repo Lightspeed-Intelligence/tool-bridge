@@ -45,6 +45,11 @@ import {
   rotateLoginKey,
 } from '../feishuLogin'
 import {
+  assertRegisteredAuthorizationRequest,
+  createAuthorizationCode,
+  delegationClient,
+} from '../oauthDelegation'
+import {
   finishMcpAuthorization,
   OAUTH_CALLBACK_PATH,
   openOAuthState,
@@ -433,7 +438,33 @@ export function registerPublicRoutes(app: TbHono, env: RouteEnv): void {
         return renderLoginFailedHtml('飞书登录未启用')
       }
       const q = c.req.query()
-      if (q.error !== undefined) return renderLoginFailedHtml(`飞书返回:${q.error}`)
+      if (q.error !== undefined) {
+        const state = q.state
+        if (state !== undefined) {
+          const denied = await openLoginState(state, encKey)
+          const delegation = denied?.delegation
+          if (denied !== null && delegation !== undefined && denied.exp * 1000 > Date.now()) {
+            const client = delegationClient(deps.oauthDelegationClients, delegation.clientId)
+            if (client !== null) {
+              try {
+                assertRegisteredAuthorizationRequest(
+                  client,
+                  delegation.redirectUri,
+                  delegation.grantNames,
+                )
+                const target = new URL(delegation.redirectUri)
+                target.searchParams.set('error', 'access_denied')
+                target.searchParams.set('state', delegation.clientState)
+                return c.redirect(target.toString(), 302)
+              } catch {
+                // Configuration changed while the user was in Feishu; fail locally instead of
+                // redirecting to a destination that is no longer registered.
+              }
+            }
+          }
+        }
+        return renderLoginFailedHtml(`飞书返回:${q.error}`)
+      }
       const code = q.code
       const state = q.state
       if (code === undefined || state === undefined) {
@@ -454,6 +485,37 @@ export function registerPublicRoutes(app: TbHono, env: RouteEnv): void {
         name = info.name
       } catch (err) {
         return renderLoginFailedHtml(isTBError(err) ? err.message : '飞书授权失败')
+      }
+      if (payload.delegation !== undefined) {
+        const delegation = payload.delegation
+        const client = delegationClient(deps.oauthDelegationClients, delegation.clientId)
+        if (client === null) return renderLoginFailedHtml('委托客户端已停用，请返回 TCode 重试')
+        try {
+          assertRegisteredAuthorizationRequest(
+            client,
+            delegation.redirectUri,
+            delegation.grantNames,
+          )
+        } catch {
+          return renderLoginFailedHtml('委托请求已失效，请返回 TCode 重试')
+        }
+        const code = await createAuthorizationCode(
+          encKey,
+          {
+            clientId: delegation.clientId,
+            redirectUri: delegation.redirectUri,
+            subject: openId,
+            grantNames: delegation.grantNames,
+            codeChallenge: delegation.codeChallenge,
+          },
+          Date.now(),
+        )
+        const target = new URL(delegation.redirectUri)
+        target.searchParams.set('code', code)
+        target.searchParams.set('state', delegation.clientState)
+        const response = c.redirect(target.toString(), 302)
+        response.headers.set('cache-control', 'private, no-store')
+        return response
       }
       const now = new Date().toISOString()
       const sk = new SKRegistryStore(deps.state)

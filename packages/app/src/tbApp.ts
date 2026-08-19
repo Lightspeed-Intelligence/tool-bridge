@@ -18,6 +18,7 @@ import {
   handleFeedbackPost,
 } from './routes/feedback'
 import { runHandler, tbErrorResponse, withSecurityHeaders } from './responses'
+import { registerOAuthDelegationRoutes } from './routes/oauthDelegation'
 import { handleAuthorize, handleRegister } from './routes/register'
 import { handleDescribe, handleSkill } from './routes/describe'
 import { registerPublicRoutes } from './routes/publicRoutes'
@@ -51,6 +52,7 @@ export function createTbApp(deps: TbAppDeps): Hono<{ Variables: Vars }> {
 
   // 树外免认证路由(healthz / ~ref 中转 / /ui 静态资源 / OAuth 回调),须在认证中间件之前。
   registerPublicRoutes(app, env)
+  registerOAuthDelegationRoutes(app, env)
 
   // 认证中间件(/healthz、/~ref、/~oauth/callback、/ui 静态资源之外全路由):Bearer → identify → 401 或注入 ctx。
   app.use('*', async (c, next) => {
