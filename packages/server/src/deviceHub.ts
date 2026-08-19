@@ -14,21 +14,27 @@
  *   探活(isAlive + 周期 ping + terminate)踢半开死连接,避免调用一律吃 60s 超时。
  */
 
-import type { DeviceInvokeRequest } from '@tool-bridge/gateway/tbApp'
 import type { Duplex } from 'node:stream'
 import type * as http from 'node:http'
 import {
+  checkRegisterPath,
   decodeDeviceFrame,
   type DeviceCallResult,
   DeviceGatewaySession,
   encodeDeviceFrame,
   identify,
+  type MutableSearchIndex,
   NodeRegistryStore,
   type StateStore,
   TBError,
   type TreePath,
 } from '@tool-bridge/core'
-import { assertDeviceId, processDeviceHello } from '@tool-bridge/gateway/deviceHello'
+import {
+  assertDeviceId,
+  type DeviceInvokeRequest,
+  processDeviceHello,
+  SearchSynchronizer,
+} from '@tool-bridge/app'
 import { type WebSocket, WebSocketServer } from 'ws'
 
 export const DEVICE_WS_PATH = '/system/device/ws'
@@ -48,6 +54,8 @@ interface Conn {
   deviceId: string
   isAlive: boolean
   keyId?: string
+  /** hello 落库后的挂载路径;invoke 热路径复核 register 授权收紧用。 */
+  mountPath?: TreePath
   session: DeviceGatewaySession
   ws: WebSocket
 }
@@ -78,6 +86,7 @@ function rejectUpgrade(socket: Duplex, error: TBError): void {
 
 export class DeviceHub {
   private readonly store: StateStore
+  private readonly search: MutableSearchIndex | undefined
   private readonly reclaimSec: number
   private readonly wss = new WebSocketServer({ noServer: true })
   private readonly activeByDevice = new Map<string, Conn>()
@@ -85,8 +94,14 @@ export class DeviceHub {
   private readonly reclaimTimers = new Map<string, NodeJS.Timeout>()
   private heartbeat: NodeJS.Timeout | undefined
 
-  constructor(opts: { heartbeatMs?: number, reclaimSec: number, store: StateStore }) {
+  constructor(opts: {
+    heartbeatMs?: number
+    reclaimSec: number
+    search?: MutableSearchIndex
+    store: StateStore
+  }) {
     this.store = opts.store
+    this.search = opts.search
     this.reclaimSec = opts.reclaimSec
     const heartbeatMs = opts.heartbeatMs ?? DEFAULT_HEARTBEAT_MS
     this.heartbeat = setInterval(() => this.pingConnections(), heartbeatMs)
@@ -107,17 +122,35 @@ export class DeviceHub {
 
   /** DeviceChannel.invoke:HTTP→WS 调用转发(无活连接 → deviceOffline)。 */
   async invoke(deviceId: string, req: DeviceInvokeRequest): Promise<unknown> {
+    const offline: DeviceCallResult = { ok: false, error: TBError.deviceOffline().toJSON() }
     const conn = this.activeByDevice.get(deviceId)
-    if (conn === undefined) {
-      const offline: DeviceCallResult = { ok: false, error: TBError.deviceOffline().toJSON() }
-      return offline
-    }
+    if (conn === undefined) return offline
+    // 重验:凭据有效 + keyId 一致 + 用 hello 落库同一个 checkRegisterPath 复核该 SK 现在
+    // 仍能注册 mountPath(scope 与 registerPaths 事后收紧都失效)。mountPath 未设 = hello
+    // 未完成,按未授权拒绝(安全判定默认分支必须是拒)。identify 是异步 I/O,期间可能有新
+    // 连接顶替本设备,故重验后复核 activeByDevice 仍是本连接,避免调用发给已被取代的旧连接。
     const authCtx = await identify(this.store, conn.authorization, new Date().toISOString())
-    if (authCtx === null || authCtx.keyId !== conn.keyId) {
+    const authorized
+      = authCtx !== null
+        && authCtx.keyId === conn.keyId
+        && conn.mountPath !== undefined
+        && checkRegisterPath({
+          sk: {
+            scopes: authCtx.scopes,
+            id: authCtx.keyId,
+            ...(authCtx.registerPaths !== undefined
+              ? { registerPaths: authCtx.registerPaths }
+              : {}),
+          },
+          targetPath: conn.mountPath,
+          action: 'write',
+          existing: null,
+        }).allow
+    if (!authorized) {
       conn.session.reject(TBError.unauthenticated())
-      const offline: DeviceCallResult = { ok: false, error: TBError.deviceOffline().toJSON() }
       return offline
     }
+    if (this.activeByDevice.get(deviceId) !== conn) return offline
     return await new Promise<DeviceCallResult>(resolve => conn.session.call(req, resolve))
   }
 
@@ -241,10 +274,12 @@ export class DeviceHub {
       deviceIdHint: conn.deviceId,
       hello,
       now,
+      ...(this.search === undefined ? {} : { search: this.search }),
     })
     const meta: DeviceMeta = { deviceId: conn.deviceId, mountPath, keyId, connectedAt: now }
     await this.store.put(KEY_DEVICE_META + conn.deviceId, meta)
     conn.keyId = keyId
+    conn.mountPath = mountPath
     this.cancelReclaim(conn.deviceId)
     const prev = this.activeByDevice.get(conn.deviceId)
     if (prev !== undefined && prev !== conn) prev.ws.close(1000, 'replaced')
@@ -294,11 +329,16 @@ export class DeviceHub {
     if (this.activeByDevice.has(deviceId)) return
     const raw = await this.store.get(KEY_DEVICE_META + deviceId)
     if (!isDeviceMeta(raw)) return
+    const searchSync = this.search === undefined
+      ? undefined
+      : new SearchSynchronizer(this.store, this.search)
+    const marker = await searchSync?.markSubtree(raw.mountPath)
     try {
       await new NodeRegistryStore(this.store).deleteSubtree(raw.mountPath)
     } catch {
       // 已被外部清理时,meta 仍要删。
     }
+    await searchSync?.removeSubtreeQuietly(raw.mountPath, marker)
     await this.store.delete(KEY_DEVICE_META + deviceId)
   }
 

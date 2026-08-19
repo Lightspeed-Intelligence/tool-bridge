@@ -1,0 +1,725 @@
+/**
+ * `@tool-bridge/plugin-sdk` —— 写 tool-bridge plugin 的作者面。
+ *
+ * 作者只声明**操作**(名字 + Zod schema + 语义 + handler);协议那一整套由 SDK 接管:
+ * 健康检查、`/~describe`(v2 exports)、`/~help`、envelope 编解码、Bearer 鉴权、
+ * 按 `X-TB-Request-Id` 去重、上游凭证解包、Zod 校验与 JSON Schema 派生、错误归一。
+ *
+ * 此前每个 plugin 都要手写这些(见 plugin-feishu 的历史实现),协议细节因此泄漏进业务代码,
+ * 且每个 plugin 都可能写出细微不同的行为。现在它们只有一份实现。
+ *
+ * **Web 标准 only**:产物不含 Node 内建,可直接跑在 Cloudflare Worker / Deno / Bun。
+ * 入口就是一个 `fetch(request, env)`,`export default plugin` 即可部署。
+ *
+ * ```ts
+ * import { createPlugin } from '@tool-bridge/plugin-sdk'
+ * import { z } from 'zod/v4'
+ *
+ * const plugin = createPlugin<Env>({ token: env => env.PLUGIN_TOKEN })
+ *
+ * plugin.tools('actions', { description: 'Feishu actions' })
+ *   .register('create_document', {
+ *     description: 'Create a document',
+ *     inputSchema: z.object({ title: z.string(), content: z.string() }),
+ *     effect: 'write',
+ *   }, async ({ title, content }, ctx) => createDoc(ctx.upstreamAuth, title, content))
+ *
+ * plugin.context('documents', {
+ *   description: 'Feishu documents',
+ *   get: async ({ path }, ctx) => loadDoc(path),
+ *   list: async ({ path, opts }, ctx) => listDocs(path, opts),
+ * })
+ *
+ * export default plugin
+ * ```
+ */
+
+import {
+  type CallContext,
+  type ContextEntryInput,
+  type ContextPatch,
+  decodeCallContext,
+  decodePluginCall,
+  HEADER_TB_CONTEXT,
+  HEADER_TB_REQUEST_ID,
+  HEADER_TB_UPSTREAM_AUTH,
+  type InferInput,
+  type InputSchemaLike,
+  isTBError,
+  type ListOptions,
+  OperationRegistry,
+  type OperationSpec,
+  parseCredentialValues,
+  type PluginCredentialField,
+  type PluginCredentialValues,
+  type PluginExportAuth,
+  type PluginMountConfigField,
+  type PluginOAuth,
+  RequestDedupe,
+  type SearchOptions,
+  TBError,
+  type ToolSpec,
+  toToolResult,
+} from '@tool-bridge/core'
+
+/**
+ * 作者面必需的错误原语:handler 里 `throw TBError.notFound(...)` 即得到平台归一后的
+ * 404/`not_found`。不导出它,作者就只能抛裸 Error(一律归为 internal 500),
+ * 语义会在传输层丢失 —— 这是写样例 plugin 时暴露出来的缺口。
+ */
+export { TBError }
+export type { ToolResult, ToolSpec } from '@tool-bridge/core'
+
+/** 平台传给 handler 的调用上下文。 */
+export interface PluginCallContext<Env = unknown> {
+  /** 平台透传的完整 CallContext(keyId/owner/scopes/traceId/mountPath/mountConfig/exportId)。 */
+  readonly caller: CallContext
+  /**
+   * 多字段凭证的字段表(仅在本 export 声明了 `credentials([...])` 时有值)。
+   * 平台注入的凭证已按声明解析并校验过必填项,handler 直接取用即可。
+   */
+  readonly credentials: PluginCredentialValues | undefined
+  readonly env: Env
+  /** 命中的 export id(多 export 时用得上)。 */
+  readonly exportId: string
+  /**
+   * 挂载节点的 `providerConfig`(每挂载**非敏感**配置)。只有该节点对应的 plugin 会收到
+   * 自己那份,插件之间不共享。
+   *
+   * **别往这里放密钥**:它明文进节点记录,`system/registry get` 会回显给任何对该节点有
+   * `read` 的 SK。密钥走 `credentials`(即 `authRef` 指向的 secret)—— 加密、只写不读、
+   * 绑定时要 `system/secret` admin。
+   */
+  readonly mountConfig: Record<string, unknown> | undefined
+  readonly mountPath: string | undefined
+  /**
+   * 平台代解析的上游凭证明文(挂载配置了 authRef 时才有)。
+   * plugin 自身不持有凭证:轮换只需在平台 `tb secret set`,无须重新部署。
+   */
+  readonly upstreamAuth: string | undefined
+}
+
+export type ToolHandler<S extends InputSchemaLike | undefined, Env>
+  = (input: InferInput<S>, ctx: PluginCallContext<Env>) => unknown | Promise<unknown>
+
+/**
+ * **代理型** tools export 的 handler:工具表来自上游、只有拿到调用凭证才能枚举
+ * (典型是转发到另一个 MCP/HTTP 服务),因此声明期列不出来,只能给 `list`/`call` 两个函数。
+ *
+ * 静态注册(`plugin.tools().register()`)仍是首选 —— 它能派生 JSON Schema、校验入参。
+ * 代理型放弃这些是因为**上游才是 schema 的真源**,由 plugin 复述一遍只会漂移。
+ */
+export interface ProxyToolsHandlers<Env = unknown> {
+  auth?: PluginExportAuth
+  call: (
+    input: { args: Record<string, unknown>, name: string },
+    ctx: PluginCallContext<Env>,
+  ) => unknown | Promise<unknown>
+  /**
+   * 需要**多字段凭证**时声明字段(缺省单值)。与静态 tools 的 `.credentials([...])` 同义 ——
+   * 两种 export 对外都是 `tools/v1`,凭证形态不该因"工具表是声明期写死还是运行时枚举"而异。
+   */
+  credentialFields?: PluginCredentialField[]
+  description?: string
+  list: (ctx: PluginCallContext<Env>) => Promise<ToolSpec[]> | ToolSpec[]
+}
+
+/**
+ * context 动词的入参形状(SDK 统一维护,作者不必重复声明 schema)。
+ * entry/patch/opts 直接复用平台的 Context 类型 —— 作者拿到的就是定形对象
+ * (`entry.metadata?.title`),不必在每个 handler 里把 `Record<string, unknown>` 断言回去。
+ */
+export interface ContextListInput { opts?: ListOptions, path: string }
+export interface ContextGetInput { path: string }
+export interface ContextWriteInput { entry: ContextEntryInput, path: string }
+export interface ContextUpdateInput { patch: ContextPatch, path: string }
+export interface ContextDeleteInput { path: string }
+export interface ContextSearchInput { opts?: SearchOptions, query: string }
+
+/**
+ * context export 的 handler 集合。**全部可选** —— 写了哪个就有哪个能力,
+ * `/~describe` 的 methods 与 capabilities 由存在性推导(与平台侧 Round 7 的语义一致)。
+ */
+export interface ContextHandlers<Env = unknown> {
+  auth?: PluginExportAuth
+  delete?: (input: ContextDeleteInput, ctx: PluginCallContext<Env>) => unknown | Promise<unknown>
+  description?: string
+  get?: (input: ContextGetInput, ctx: PluginCallContext<Env>) => unknown | Promise<unknown>
+  list?: (input: ContextListInput, ctx: PluginCallContext<Env>) => unknown | Promise<unknown>
+  mountConfigFields?: PluginMountConfigField[]
+  search?: (input: ContextSearchInput, ctx: PluginCallContext<Env>) => unknown | Promise<unknown>
+  update?: (input: ContextUpdateInput, ctx: PluginCallContext<Env>) => unknown | Promise<unknown>
+  write?: (input: ContextWriteInput, ctx: PluginCallContext<Env>) => unknown | Promise<unknown>
+}
+
+/** context handler 名 → 协议动词名。 */
+const CONTEXT_VERB_BY_HANDLER = {
+  list: 'List',
+  get: 'Get',
+  write: 'Write',
+  update: 'Update',
+  delete: 'Delete',
+  search: 'Search',
+} as const
+
+/** 可选能力(进 `/~describe` 的 capabilities)。 */
+const CAPABILITY_BY_VERB: Record<string, string> = { Search: 'search', Delete: 'delete' }
+
+export interface CreatePluginOptions<Env = unknown> {
+  /** 健康检查路径(须以 '/' 开头);缺省 '/healthz'。 */
+  healthPath?: string
+  /**
+   * 平台调用本 plugin 时应携带的 Bearer token。返回 undefined 表示**未配置**:
+   * 此时只要求 Authorization 非空(便于本地开发),生产务必配置。
+   */
+  token?: (env: Env) => string | undefined
+}
+
+interface ToolsExportState<Env> {
+  auth: PluginExportAuth | undefined
+  credentialFields: PluginCredentialField[] | undefined
+  credentialProbe: string | undefined
+  description: string | undefined
+  id: string
+  kind: 'tools'
+  mountConfigFields: PluginMountConfigField[] | undefined
+  oauth: PluginOAuth | undefined
+  registry: OperationRegistry<PluginCallContext<Env>>
+}
+
+interface ContextExportState<Env> {
+  auth: PluginExportAuth | undefined
+  description: string | undefined
+  handlers: ContextHandlers<Env>
+  id: string
+  kind: 'context'
+  mountConfigFields: PluginMountConfigField[] | undefined
+}
+
+interface ProxyToolsExportState<Env> {
+  auth: PluginExportAuth | undefined
+  credentialFields: PluginCredentialField[] | undefined
+  description: string | undefined
+  handlers: ProxyToolsHandlers<Env>
+  id: string
+  kind: 'proxyTools'
+}
+
+type ExportState<Env>
+  = | ContextExportState<Env>
+    | ProxyToolsExportState<Env>
+    | ToolsExportState<Env>
+
+/** tools export 的注册面(链式)。 */
+export interface ToolsExport<Env> {
+  /** 明确声明无需上游凭证,或声明单值凭证的展示/必填语义。 */
+  auth: (config: PluginExportAuth) => ToolsExport<Env>
+  /**
+   * 声明本 export 需要**多字段凭证**(默认单值:一个 API key)。
+   *
+   * 平台据此:把 secret 当 JSON 对象存、挂载时校验必填字段齐全、管理面提示该填哪些字段。
+   * 传输契约不变(仍是 `X-TB-Upstream-Auth` 那个字符串,内容变成 JSON),
+   * handler 里用 `ctx.credentials` 取字段表。
+   */
+  credentials: (fields: PluginCredentialField[]) => ToolsExport<Env>
+  /**
+   * 声明本 export 挂载时还需要哪些**非凭证配置**(如自建实例的 baseUrl、region)。
+   *
+   * 与 `credentials()` 是两条通道:那条进加密的 SecretStore,这里的值明文进节点记录
+   * (`ctx.mountConfig` 取用,`system/registry get` 会回显)。**故这里只放非密钥配置** ——
+   * 声明本身没有 `secret` 选项,就是不给"把密钥藏进明文通道"留口子。
+   *
+   * 声明了它,平台的挂载向导据此渲染带标签的输入框、必填项缺失可在挂载前拦下 ——
+   * 而不是让用户对着一个自由 k=v 框猜该配什么。与 `credentials()`/`oauth()` **不互斥**:
+   * 一个 export 可以既要凭证又要 baseUrl。
+   */
+  mountConfig: (fields: PluginMountConfigField[]) => ToolsExport<Env>
+  /**
+   * 声明本 export 走**平台托管的 provider 型 OAuth2**(授权码 + PKCE)。
+   *
+   * 与 `credentials()` 的分工:那条是"authRef 指向的 secret 里存什么字段",这条下
+   * 那个 secret 固定存 client 凭证(`clientId`/`clientSecret`),由**平台**读取并去换令牌;
+   * 插件拿到的是平台换来、按需刷新的 **access token**(仍走 `ctx.upstreamAuth`,
+   * 与单值 API key 同一通道 —— 插件不需要知道它是 OAuth 换来的)。
+   *
+   * 故三者**互斥**,这里当场拒而不是等平台注册时才 400:
+   * - `credentials()`:oauth 模式下 secret 存什么已经定死了
+   * - `probeCredentialWith()`:凭证可用性由授权流程本身证明,拿 client 凭证去调用既
+   *   证明不了什么、又会把 clientSecret 送进插件
+   *
+   * client_id/secret **不写在这里** —— 它们是每个部署自己去 provider 后台注册的应用凭证。
+   */
+  oauth: (config: PluginOAuth) => ToolsExport<Env>
+  /**
+   * 指定**凭证探针**:一个只读、零副作用、无必填入参的工具名。
+   *
+   * 平台的凭证是 `tb secret set` 存进 SecretStore、挂载只写 `authRef`,插件要到第一次
+   * 业务调用才拿得到它 —— 配错的 key 不会在存入或挂载时报错,而是等某个 agent 真去调用
+   * 时才 401。声明探针后,挂载时平台会用注入的凭证真实调一次它,当场判定凭证是否可用。
+   *
+   * 名字必须是已注册的工具(在 `~describe` 里报出去之前就校验,免得平台挂载时才发现)。
+   */
+  probeCredentialWith: (name: string) => ToolsExport<Env>
+  register: <S extends InputSchemaLike | undefined = undefined>(
+    name: string,
+    spec: OperationSpec<S>,
+    handler: ToolHandler<S, Env>,
+  ) => ToolsExport<Env>
+}
+
+export interface Plugin<Env = unknown> {
+  /** 声明一个 context export(handler 全可选)。 */
+  context: (id: string, handlers: ContextHandlers<Env>) => Plugin<Env>
+  /** Worker/Deno/Bun 入口。 */
+  fetch: (request: Request, env: Env) => Promise<Response>
+  /** 声明一个**代理型** tools export(工具表来自上游,运行时枚举)。 */
+  proxyTools: (id: string, handlers: ProxyToolsHandlers<Env>) => Plugin<Env>
+  /** 声明一个 tools export。 */
+  tools: (id: string, meta?: { description?: string }) => ToolsExport<Env>
+}
+
+const PROTOCOL_VERSION = 'plugin/v2'
+
+function json(value: unknown, status = 200): Response {
+  return new Response(JSON.stringify(value), {
+    status,
+    headers: { 'content-type': 'application/json; charset=utf-8' },
+  })
+}
+
+function errorResponse(err: unknown): Response {
+  if (isTBError(err)) return json(err.toJSON(), err.httpStatus)
+  return json(new TBError('internal', 'internal plugin error').toJSON(), 500)
+}
+
+/** context handler 存在性 → 协议动词集合。 */
+function contextVerbs<Env>(handlers: ContextHandlers<Env>): string[] {
+  const verbs: string[] = []
+  for (const [key, verb] of Object.entries(CONTEXT_VERB_BY_HANDLER)) {
+    if (typeof handlers[key as keyof ContextHandlers<Env>] === 'function') verbs.push(verb)
+  }
+  return verbs
+}
+
+/**
+ * `~help` 的 cmd 表。代理型 export 返回空表并标 `dynamic` —— 枚举工具需要调用凭证,
+ * 而 `~help` 是不鉴权的生命周期端点;宁可如实说"要经 List 才知道",不编一份可能过时的表。
+ */
+function helpCmds<Env>(state: ExportState<Env>): Array<{ name: string }> {
+  if (state.kind === 'tools') return state.registry.list()
+  if (state.kind === 'proxyTools') return []
+  return contextVerbs(state.handlers).map(name => ({ name }))
+}
+
+export function createPlugin<Env = unknown>(opts: CreatePluginOptions<Env> = {}): Plugin<Env> {
+  const healthPath = opts.healthPath ?? '/healthz'
+  const exports = new Map<string, ExportState<Env>>()
+  const dedupe = new RequestDedupe()
+
+  const assertFreshId = (id: string): void => {
+    if (id.length === 0) throw new TBError('invalid_argument', 'export id must be non-empty')
+    if (exports.has(id)) {
+      throw new TBError('invalid_argument', `export '${id}' is already declared`)
+    }
+  }
+
+  function describe(): unknown {
+    return {
+      protocolVersion: PROTOCOL_VERSION,
+      exports: [...exports.values()].map((state) => {
+        // 代理型与静态 tools 对外**同一形状**:export 是什么由 profile 说了算,
+        // 至于工具表是声明期写死还是运行时枚举,是 plugin 的内部实现,平台不必知道。
+        if (state.kind === 'tools' || state.kind === 'proxyTools') {
+          return {
+            id: state.id,
+            profile: 'tools/v1',
+            ...(state.description !== undefined ? { description: state.description } : {}),
+            ...(state.auth !== undefined ? { auth: state.auth } : {}),
+            ...(state.kind === 'tools' && state.credentialProbe !== undefined
+              ? { credentialProbe: state.credentialProbe }
+              : {}),
+            ...(state.credentialFields !== undefined
+              ? { credentialFields: state.credentialFields }
+              : {}),
+            ...(state.kind === 'tools' && state.mountConfigFields !== undefined
+              ? { mountConfigFields: state.mountConfigFields }
+              : {}),
+            ...(state.kind === 'tools' && state.oauth !== undefined
+              ? { oauth: state.oauth }
+              : {}),
+          }
+        }
+        const methods = contextVerbs(state.handlers)
+        const capabilities = methods
+          .map(verb => CAPABILITY_BY_VERB[verb])
+          .filter((c): c is string => c !== undefined)
+        return {
+          id: state.id,
+          profile: 'context/v1',
+          ...(state.description !== undefined ? { description: state.description } : {}),
+          ...(state.auth !== undefined ? { auth: state.auth } : {}),
+          methods,
+          ...(capabilities.length > 0 ? { capabilities } : {}),
+          ...(state.mountConfigFields !== undefined
+            ? { mountConfigFields: state.mountConfigFields }
+            : {}),
+        }
+      }),
+    }
+  }
+
+  /** `/~help`:按 export 列出真实存在的操作(人读用;v2 契约校验不依赖它)。 */
+  function help(): unknown {
+    return {
+      protocolVersion: PROTOCOL_VERSION,
+      exports: [...exports.values()].map(state => ({
+        id: state.id,
+        ...(state.kind === 'proxyTools' ? { dynamic: true } : {}),
+        cmds: helpCmds(state),
+      })),
+    }
+  }
+
+  function assertAuthorized(request: Request, env: Env): void {
+    // **进程内 binding 直调:调用方就是平台本身**,token 比对在这里是同义反复 ——
+    // 平台从 SecretStore 取出自己 mint 的 token、发给同进程的自己去比对,而宿主装配时
+    // 根本拿不到那个值(它在注册时才生成、按 plugin id 存),这条路因此从来打不通。
+    //
+    // 标识走 **env 而不是 header**:env 是宿主装配时闭包持有的,任何网络请求都碰不到它;
+    // 用 header 表达"我是进程内调用"等于把 fail-closed 拆了 —— 公网发一个同名头即可绕过。
+    // 外挂 https 插件仍走下面的 token 比对,那条 fail-closed 一点没动。
+    if ((env as { TB_PLUGIN_IN_PROCESS?: unknown } | undefined)?.TB_PLUGIN_IN_PROCESS === true) {
+      return
+    }
+    const header = request.headers.get('authorization') ?? ''
+    const presented = header.startsWith('Bearer ') ? header.slice('Bearer '.length) : ''
+    const expected = opts.token?.(env)
+    if (expected === undefined) {
+      // **fail closed**。此前这里只要求 Bearer 非空("避免完全裸奔"),但那让一个部署错误
+      // (忘了 `wrangler secret put PLUGIN_TOKEN`)变成:公网任何人自造一个 X-TB-Context
+      // 就能调这个插件的全部 action,拿它当匿名出站中转、烧 quota —— 而且毫无征兆。
+      //
+      // 本地开发的便利该由**显式**开关表达(`TB_PLUGIN_ALLOW_ANY_TOKEN=true`),而不是让
+      // 缺配置这条路默认放行。
+      const devBypass = (env as { TB_PLUGIN_ALLOW_ANY_TOKEN?: unknown } | undefined)
+        ?.TB_PLUGIN_ALLOW_ANY_TOKEN
+      if (devBypass !== 'true') {
+        throw new TBError(
+          'unavailable',
+          'plugin 未配置 PLUGIN_TOKEN:生产部署必须配置;本地开发可设 TB_PLUGIN_ALLOW_ANY_TOKEN=true',
+          { retryable: false },
+        )
+      }
+      if (presented.length === 0) throw TBError.unauthenticated()
+      return
+    }
+    if (presented !== expected) throw TBError.unauthenticated()
+  }
+
+  function decodeUpstreamAuth(request: Request): string | undefined {
+    const raw = request.headers.get(HEADER_TB_UPSTREAM_AUTH)
+    if (raw === null || raw.length === 0) return undefined
+    // base64url → 明文(平台侧 base64urlEncode(TextEncoder));Web 标准解码。
+    const b64 = raw.replaceAll('-', '+').replaceAll('_', '/')
+    const padded = b64.padEnd(b64.length + ((4 - (b64.length % 4)) % 4), '=')
+    try {
+      const bytes = Uint8Array.from(atob(padded), c => c.charCodeAt(0))
+      return new TextDecoder().decode(bytes)
+    } catch {
+      // 坏头是**调用方**送来的坏输入,不是 plugin 内部故障 —— 归 invalid_argument(400),
+      // 否则 atob 抛裸 Error 会被归一成 internal 500,把配置错误说成服务故障。
+      throw new TBError('invalid_argument', `${HEADER_TB_UPSTREAM_AUTH} is not valid base64url`)
+    }
+  }
+
+  async function dispatchTools(
+    state: ToolsExportState<Env>,
+    method: string,
+    args: Record<string, unknown>,
+    ctx: PluginCallContext<Env>,
+  ): Promise<unknown> {
+    // 平台只发 List 与 Call —— v1 强制的 Get 是纯样板,v2 不再要求实现。
+    if (method === 'List') return state.registry.list() satisfies ToolSpec[]
+    if (method === 'Call') {
+      const name = args.name
+      if (typeof name !== 'string') {
+        throw new TBError('invalid_argument', 'Call requires a string \'name\'')
+      }
+      const callArgs = (args.args ?? {}) as Record<string, unknown>
+      return await state.registry.call(name, callArgs, ctx)
+    }
+    throw new TBError('invalid_argument', `unknown method '${method}' on a tools export`)
+  }
+
+  async function dispatchProxyTools(
+    state: ProxyToolsExportState<Env>,
+    method: string,
+    args: Record<string, unknown>,
+    ctx: PluginCallContext<Env>,
+  ): Promise<unknown> {
+    if (method === 'List') return await state.handlers.list(ctx)
+    if (method === 'Call') {
+      const name = args.name
+      if (typeof name !== 'string' || name === '') {
+        throw new TBError('invalid_argument', 'Call requires a non-empty string \'name\'')
+      }
+      const callArgs
+        = typeof args.args === 'object' && args.args !== null
+          ? (args.args as Record<string, unknown>)
+          : {}
+      // 上游返回值形状不由我们决定:裸值包成 ToolResult,已是结果形状则透传(与静态路径同规则)。
+      return toToolResult(await state.handlers.call({ name, args: callArgs }, ctx))
+    }
+    throw new TBError('invalid_argument', `unknown method '${method}' on a tools export`)
+  }
+
+  async function dispatchContext(
+    state: ContextExportState<Env>,
+    method: string,
+    args: Record<string, unknown>,
+    ctx: PluginCallContext<Env>,
+  ): Promise<unknown> {
+    const handlers = state.handlers
+    switch (method) {
+      case 'List':
+        if (handlers.list === undefined) break
+        return await handlers.list(
+          { path: String(args.path ?? ''), ...(args.opts !== undefined ? { opts: args.opts as ListOptions } : {}) },
+          ctx,
+        )
+      case 'Get':
+        if (handlers.get === undefined) break
+        return await handlers.get({ path: String(args.path ?? '') }, ctx)
+      case 'Write':
+        if (handlers.write === undefined) break
+        return await handlers.write(
+          { path: String(args.path ?? ''), entry: (args.entry ?? {}) as ContextEntryInput },
+          ctx,
+        )
+      case 'Update':
+        if (handlers.update === undefined) break
+        return await handlers.update(
+          { path: String(args.path ?? ''), patch: (args.patch ?? {}) as ContextPatch },
+          ctx,
+        )
+      case 'Delete':
+        if (handlers.delete === undefined) break
+        return await handlers.delete({ path: String(args.path ?? '') }, ctx)
+      case 'Search':
+        if (handlers.search === undefined) break
+        return await handlers.search(
+          { query: String(args.query ?? ''), ...(args.opts !== undefined ? { opts: args.opts as SearchOptions } : {}) },
+          ctx,
+        )
+      default:
+        throw new TBError('invalid_argument', `unknown method '${method}' on a context export`)
+    }
+    // 未实现的动词:与平台侧「~help 只列真实存在的操作」一致 —— 宣告与可调用集合始终吻合。
+    throw new TBError('invalid_argument', `method '${method}' is not implemented by export '${state.id}'`)
+  }
+
+  async function handleEnvelope(request: Request, env: Env): Promise<Response> {
+    assertAuthorized(request, env)
+
+    const ctxHeader = request.headers.get(HEADER_TB_CONTEXT)
+    if (ctxHeader === null) {
+      throw new TBError('invalid_argument', `missing ${HEADER_TB_CONTEXT}`)
+    }
+    const caller = decodeCallContext(ctxHeader)
+    const call = decodePluginCall(await request.text())
+
+    const exportId = caller.exportId ?? (exports.size === 1 ? [...exports.keys()][0] : undefined)
+    if (exportId === undefined) {
+      throw new TBError('invalid_argument', 'call context carries no exportId and this plugin declares multiple exports')
+    }
+    const state = exports.get(exportId)
+    if (state === undefined) throw new TBError('invalid_argument', `unknown export '${exportId}'`)
+
+    const upstreamAuth = decodeUpstreamAuth(request)
+    // 声明了多字段凭证就在这里解析一次:每个 handler 各自 JSON.parse 一遍是重复劳动,
+    // 且各写各的校验会让"缺字段"的报错措辞不一致。解析失败 → invalid_argument(配置错)。
+    const credentialFields = state.kind === 'context' ? undefined : state.credentialFields
+    const ctx: PluginCallContext<Env> = {
+      env,
+      caller,
+      exportId,
+      mountPath: caller.mountPath,
+      mountConfig: caller.mountConfig,
+      upstreamAuth,
+      credentials: credentialFields !== undefined && upstreamAuth !== undefined
+        ? parseCredentialValues(upstreamAuth, credentialFields)
+        : undefined,
+    }
+
+    const requestId = request.headers.get(HEADER_TB_REQUEST_ID)
+    const run = async (): Promise<unknown> => {
+      if (state.kind === 'tools') return await dispatchTools(state, call.tool, call.arguments, ctx)
+      if (state.kind === 'proxyTools') {
+        return await dispatchProxyTools(state, call.tool, call.arguments, ctx)
+      }
+      return await dispatchContext(state, call.tool, call.arguments, ctx)
+    }
+
+    const value = requestId === null ? await run() : await dedupe.run(requestId, run)
+    return json(value ?? null)
+  }
+
+  const plugin: Plugin<Env> = {
+    tools(id, meta) {
+      assertFreshId(id)
+      const state: ToolsExportState<Env> = {
+        auth: undefined,
+        kind: 'tools',
+        id,
+        description: meta?.description,
+        credentialProbe: undefined,
+        credentialFields: undefined,
+        mountConfigFields: undefined,
+        oauth: undefined,
+        registry: new OperationRegistry<PluginCallContext<Env>>(),
+      }
+      exports.set(id, state)
+      const surface: ToolsExport<Env> = {
+        auth(config) {
+          if (state.oauth !== undefined || state.credentialFields !== undefined) {
+            throw new TBError(
+              'invalid_argument',
+              `export '${id}' 已声明 oauth/credentials(),不能再声明 auth`,
+            )
+          }
+          if (config.kind === 'none' && state.credentialProbe !== undefined) {
+            throw new TBError(
+              'invalid_argument',
+              `export '${id}' 已声明 credentialProbe,不能再声明 auth:none`,
+            )
+          }
+          state.auth = config
+          return surface
+        },
+        register(name, spec, handler) {
+          state.registry.register(name, spec, handler)
+          return surface
+        },
+        credentials(fields) {
+          if (fields.length === 0) {
+            throw new TBError('invalid_argument', 'credentials() 至少要声明一个字段')
+          }
+          // 互斥双向拒:oauth 模式下 authRef 那个 secret 固定存 client 凭证,
+          // 再声明字段表是矛盾的。两个方向都拦,声明顺序不影响。
+          if (state.oauth !== undefined) {
+            throw new TBError(
+              'invalid_argument',
+              `export '${id}' 已声明 oauth,不能再声明 credentials()`
+              + '(oauth 模式下 authRef 指向的 secret 固定存 clientId/clientSecret)',
+            )
+          }
+          if (state.auth !== undefined) {
+            throw new TBError('invalid_argument', `export '${id}' 已声明 auth,不能再声明 credentials()`)
+          }
+          state.credentialFields = fields
+          return surface
+        },
+        mountConfig(fields) {
+          if (fields.length === 0) {
+            throw new TBError('invalid_argument', 'mountConfig() 至少要声明一个字段')
+          }
+          state.mountConfigFields = fields
+          return surface
+        },
+        oauth(config) {
+          if (state.credentialFields !== undefined) {
+            throw new TBError(
+              'invalid_argument',
+              `export '${id}' 已声明 credentials(),不能再声明 oauth`
+              + '(oauth 模式下 authRef 指向的 secret 固定存 clientId/clientSecret)',
+            )
+          }
+          if (state.auth !== undefined) {
+            throw new TBError('invalid_argument', `export '${id}' 已声明 auth,不能再声明 oauth`)
+          }
+          if (state.credentialProbe !== undefined) {
+            throw new TBError(
+              'invalid_argument',
+              `export '${id}' 已声明 credentialProbe,不能再声明 oauth`
+              + '(凭证可用性由授权流程本身证明;拿 client 凭证去调探针既证明不了什么,'
+              + '又会把 clientSecret 送进插件)',
+            )
+          }
+          state.oauth = config
+          return surface
+        },
+        probeCredentialWith(name) {
+          // 立刻校验而不是等 ~describe:声明一个不存在的探针,平台挂载时会拿它去 Call
+          // 然后收到 invalid_argument —— 那个错误看起来像"凭证有问题",实际是拼错了工具名。
+          if (!state.registry.list().some(tool => tool.name === name)) {
+            throw new TBError(
+              'invalid_argument',
+              `credentialProbe '${name}' 不是 export '${id}' 已注册的工具`,
+            )
+          }
+          if (state.oauth !== undefined) {
+            throw new TBError(
+              'invalid_argument',
+              `export '${id}' 已声明 oauth,不能再声明 credentialProbe`
+              + '(凭证可用性由授权流程本身证明;拿 client 凭证去调探针既证明不了什么,'
+              + '又会把 clientSecret 送进插件)',
+            )
+          }
+          if (state.auth?.kind === 'none') {
+            throw new TBError('invalid_argument', `export '${id}' 声明 auth:none,不能再声明 credentialProbe`)
+          }
+          state.credentialProbe = name
+          return surface
+        },
+      }
+      return surface
+    },
+
+    proxyTools(id, handlers) {
+      assertFreshId(id)
+      if (handlers.auth !== undefined && handlers.credentialFields !== undefined) {
+        throw new TBError('invalid_argument', `export '${id}' 的 auth 不能与 credentialFields 同时声明`)
+      }
+      exports.set(id, {
+        auth: handlers.auth,
+        kind: 'proxyTools',
+        id,
+        description: handlers.description,
+        credentialFields: handlers.credentialFields,
+        handlers,
+      })
+      return plugin
+    },
+
+    context(id, handlers) {
+      assertFreshId(id)
+      exports.set(id, {
+        auth: handlers.auth,
+        kind: 'context',
+        id,
+        description: handlers.description,
+        handlers,
+        mountConfigFields: handlers.mountConfigFields,
+      })
+      return plugin
+    },
+
+    async fetch(request, env) {
+      try {
+        const url = new URL(request.url)
+        if (request.method === 'GET') {
+          if (url.pathname === healthPath) return json({ healthy: true })
+          if (url.pathname === '/~describe') return json(describe())
+          if (url.pathname === '/~help') return json(help())
+          throw TBError.notFound('no such path')
+        }
+        if (request.method !== 'POST') throw TBError.notFound('no such path')
+        return await handleEnvelope(request, env)
+      } catch (err) {
+        return errorResponse(err)
+      }
+    },
+  }
+
+  return plugin
+}

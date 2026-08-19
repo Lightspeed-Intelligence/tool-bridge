@@ -5,14 +5,14 @@
  * 定时器,注册时探活 + health cmd 按需探活)。
  *
  * dispatch 只做纯逻辑与存储(KV key `plugin:<id>` / `pluginhealth:<id>` / `pluginmeta:<id>`);
- * 探活与抓 ~describe/~help 的 I/O 经 deps 注入的回调(probe / fetchContract),core 无 I/O。
+ * 探活与抓 /~describe 的 I/O 经 deps 注入的回调(probe / fetchContract),core 无 I/O。
  *
  * write 流程(注册流程):manifest 校验 → 探活(失败 → unavailable 拒)→
  * 契约校验(validatePluginContract,失败 → invalid_argument 拒)→ platform-token 时
  * mint SK(owner `plugin:<id>`,scopes 空)+ 明文存 SecretStore 保留名 `plugin-token:<id>`
- * → 存 manifest → 返回 PluginRegistration(pluginToken 仅此一次;get/list 永不回显)。
+ * → 存 manifest → 返回 PluginView + pluginToken(仅此一次;get/list 永不回显)。
  *
- * update 流程:patch 合并重校验;endpoint/healthPath/kind/interfaceVersion 任一变更时
+ * update 流程:patch 合并重校验;endpoint/healthPath/protocolVersion 任一变更时
  * 走 write 同款重探活 + 重契约校验并刷新 meta/health(失败拒更新不落库),仅本地字段
  * (enabled 等)变更跳过;auth.kind 切换时吊销/换发 pluginToken(新 token 仅本响应一次)。
  */
@@ -22,19 +22,18 @@ import type { CmdSpec, HelpModel } from '../htbp/model'
 import type { SKRegistryStore } from '../auth/sk'
 import type { BuiltinModule } from './types'
 import {
-  parsePluginManifest,
-  type PluginManifest,
-  type PluginRegistration,
-} from '../plugin/manifest'
-import {
   LIST_LIMIT_DEFAULT,
   LIST_LIMIT_MAX,
   type Timestamp,
   type TreePath,
 } from '../types'
+import { type PluginDescribe, type PluginExport, validatePluginContract } from '../plugin/contract'
 import { cmdPath, LIST_OPTS_SCHEMA, optListOptions, requireString, VOID_ACK } from './util'
 import { KEY_PLUGIN, KEY_PLUGIN_HEALTH, KEY_PLUGIN_META, type StateStore } from '../store'
-import { validatePluginContract } from '../plugin/contract'
+import {
+  parsePluginManifest,
+  type PluginManifest,
+} from '../plugin/manifest'
 import { TBError } from '../errors'
 import { omit } from '../omit'
 
@@ -69,11 +68,29 @@ function projectManifest(record: StoredPlugin): PluginManifest {
   return omit(record, 'tokenSkId')
 }
 
+/**
+ * 管理面投影:manifest + 注册时缓存的 `~describe.exports`。
+ *
+ * v1 的 manifest 有 `kind`,管理面据此回答"这个 plugin 是什么、能挂成什么";v2 把它下沉到
+ * export 之后,若管理面只回 manifest,`tb plugin ls` 与 Dashboard 就再也答不出这个问题
+ * ——也没法知道挂载时 `config.export` 该填什么(多 export plugin 必须显式指定)。
+ * 故 get/list/write/update 一并回 exports:与网关挂载时读的是**同一份** `pluginmeta:<id>` 缓存,
+ * 不另起真源。注册记录缺 meta 属于损坏状态，读操作响亮失败。
+ */
+export interface PluginView extends PluginManifest {
+  exports: PluginExport[]
+}
+
+/** write/update 的返回:PluginView + pluginToken(仅该次响应出现一次)。 */
+export interface PluginRegistration extends PluginView {
+  pluginToken?: string
+}
+
 export interface PluginModuleDeps {
   /** 放行 http:// endpoint(仅本地开发;宿主按 env `TB_ALLOW_INSECURE_HTTP=true` 注入)。 */
   allowInsecureHttp?: boolean
-  /** 抓 `~describe`/`~help`(带 Accept: application/json);失败抛 TBError(原样透传)。 */
-  fetchContract(manifest: PluginManifest): Promise<{ describe: unknown, help: unknown }>
+  /** 抓 `/~describe`(带 Accept: application/json);失败抛 TBError(原样透传)。 */
+  fetchContract(manifest: PluginManifest): Promise<{ describe: unknown }>
   now: () => string
   /** GET {endpoint}{healthPath} 探活;网络失败按 healthy:false 返回(I/O 在宿主)。 */
   probe(manifest: PluginManifest): Promise<PluginProbeResult>
@@ -98,7 +115,7 @@ function pluginCmds(nodePath: TreePath): CmdSpec[] {
       path,
       h: 'list registered plugins (pluginToken never returned)',
       inputSchema: { type: 'object', properties: { opts: LIST_OPTS_SCHEMA } },
-      returns: 'Page<PluginManifest>',
+      returns: 'Page<PluginView> — manifest + the exports declared by its /~describe',
       scope: 'admin',
     },
     {
@@ -107,39 +124,42 @@ function pluginCmds(nodePath: TreePath): CmdSpec[] {
       path,
       h: 'fetch one plugin manifest by id',
       inputSchema: idSchema,
-      returns: 'PluginManifest',
+      returns: 'PluginView — manifest + the exports declared by its /~describe',
       scope: 'admin',
     },
     {
       name: 'write',
       method: 'POST',
       path,
-      h: 'register a plugin: probes health and validates its contract before accepting; then mount it via system/registry (kind "tool"/"context" with config.provider = "plugin:<id>")',
+      h: 'register a plugin: probes health and validates its /~describe exports before accepting; then mount an export via system/registry (config.provider = plugin id, config.export = export id)',
       inputSchema: {
         type: 'object',
         properties: {
           id: { type: 'string', description: 'unique plugin id' },
-          kind: { type: 'string', enum: ['tool-provider', 'context-provider'] },
-          interfaceVersion: { type: 'string', description: 'plugin interface version, e.g. "v1"' },
+          protocolVersion: {
+            type: 'string',
+            enum: ['plugin/v2'],
+            description: 'transport protocol version; what the plugin provides is declared by its /~describe exports',
+          },
           endpoint: { type: 'string', description: 'https base URL of the plugin service' },
           auth: {
             type: 'object',
             description:
-              '{ kind: "platform-token" } — gateway mints the token (shown once in the response); or { kind: "bearer", token }',
+              '{ kind: "platform-token" } — gateway mints the token (shown once in the response); or { kind: "bearer", secretRef }',
           },
           healthPath: { type: 'string', description: 'GET probe path, e.g. "/healthz"' },
           enabled: { type: 'boolean' },
         },
-        required: ['id', 'kind', 'interfaceVersion', 'endpoint', 'auth', 'healthPath', 'enabled'],
+        required: ['id', 'endpoint', 'auth', 'healthPath', 'enabled'],
       },
-      returns: 'PluginRegistration — pluginToken shown once (platform-token only)',
+      returns: 'PluginView + pluginToken shown once (platform-token only)',
       scope: 'admin',
     },
     {
       name: 'update',
       method: 'POST',
       path,
-      h: 'patch a registration; endpoint/kind changes re-probe and re-validate the contract before applying',
+      h: 'patch a registration; endpoint changes re-probe and re-validate the exports before applying',
       inputSchema: {
         type: 'object',
         properties: {
@@ -151,7 +171,7 @@ function pluginCmds(nodePath: TreePath): CmdSpec[] {
         },
         required: ['id', 'patch'],
       },
-      returns: 'PluginManifest — pluginToken shown once if auth switched to platform-token',
+      returns: 'PluginView — pluginToken shown once if auth switched to platform-token',
       scope: 'admin',
     },
     {
@@ -193,6 +213,19 @@ export function createPluginModule(deps: PluginModuleDeps): BuiltinModule {
     return record
   }
 
+  /** manifest + `pluginmeta:<id>` 里缓存的 exports。 */
+  async function view(record: StoredPlugin): Promise<PluginView> {
+    const describe = (await store.get(KEY_PLUGIN_META + record.id)) as PluginDescribe | null
+    if (describe === null) {
+      throw new TBError(
+        'unavailable',
+        `plugin '${record.id}' 缺少 ~describe 缓存,请重新注册`,
+        { retryable: false },
+      )
+    }
+    return { ...projectManifest(record), exports: describe.exports }
+  }
+
   /** 吊销上一代 platform-token(换发/注销/切到 bearer 时;SK 删除幂等)。 */
   async function revokeToken(record: StoredPlugin): Promise<void> {
     if (record.tokenSkId !== undefined) await sk.delete(record.tokenSkId)
@@ -232,11 +265,7 @@ export function createPluginModule(deps: PluginModuleDeps): BuiltinModule {
 
     // 契约校验(方法集合 / ~describe 一致性;失败 TBError 原样抛)。
     const contract = await deps.fetchContract(manifest)
-    const describe = validatePluginContract({
-      manifest,
-      describe: contract.describe,
-      help: contract.help,
-    })
+    const describe = validatePluginContract({ manifest, describe: contract.describe })
 
     // platform-token:mint SK(owner plugin:<id>,scopes 空)+ 明文存保留名;重注册换发并吊销上一代。
     const existing = await read(manifest.id)
@@ -262,28 +291,34 @@ export function createPluginModule(deps: PluginModuleDeps): BuiltinModule {
     }
     await store.put(KEY_PLUGIN + manifest.id, record)
 
-    return { ...manifest, ...(pluginToken !== undefined ? { pluginToken } : {}) }
+    return {
+      ...manifest,
+      exports: describe.exports,
+      ...(pluginToken !== undefined ? { pluginToken } : {}),
+    }
   }
 
-  async function update(id: string, patch: Record<string, unknown>): Promise<PluginRegistration> {
+  async function update(
+    id: string,
+    patch: Record<string, unknown>,
+  ): Promise<PluginRegistration> {
     const existing = await require(id)
     if (patch.id !== undefined && patch.id !== id) {
       throw new TBError('invalid_argument', 'id 不可通过 update 变更')
     }
     const prev = projectManifest(existing)
-    // merge 后整体重校验(kind↔interfaceVersion 一致性、endpoint https 强制照旧生效)。
+    // merge 后整体重校验(protocolVersion 合法性、endpoint https 强制照旧生效)。
     const merged = parsePluginManifest(
       { ...prev, ...patch },
       { allowInsecureHttp: deps.allowInsecureHttp ?? false },
     )
 
-    // 契约相关字段变更 → 与 write 同流程重探活 + 重抓 ~describe/~help,刷新 meta/health;
+    // 契约相关字段变更 → 与 write 同流程重探活 + 重抓 ~describe,刷新 meta/health;
     // 失败即拒不落库。仅本地字段(enabled 等)变更跳过——禁用一个已挂掉的 plugin 不应被探活挡住。
     const contractChanged
       = merged.endpoint !== prev.endpoint
         || merged.healthPath !== prev.healthPath
-        || merged.kind !== prev.kind
-        || merged.interfaceVersion !== prev.interfaceVersion
+        || merged.protocolVersion !== prev.protocolVersion
     if (contractChanged) {
       const probed = await deps.probe(merged)
       if (!probed.healthy) {
@@ -297,7 +332,6 @@ export function createPluginModule(deps: PluginModuleDeps): BuiltinModule {
       const describe = validatePluginContract({
         manifest: merged,
         describe: contract.describe,
-        help: contract.help,
       })
       await store.put(KEY_PLUGIN_META + id, describe)
       await store.put(KEY_PLUGIN_HEALTH + id, {
@@ -324,11 +358,13 @@ export function createPluginModule(deps: PluginModuleDeps): BuiltinModule {
       }
     }
 
-    await store.put(KEY_PLUGIN + id, {
+    const record: StoredPlugin = {
       ...merged,
       ...(tokenSkId !== undefined ? { tokenSkId } : {}),
-    } satisfies StoredPlugin)
-    return { ...merged, ...(pluginToken !== undefined ? { pluginToken } : {}) }
+    }
+    await store.put(KEY_PLUGIN + id, record)
+    // exports 从刚刷新的(或原有的)meta 缓存回读,与 get/list 同一来源。
+    return { ...(await view(record)), ...(pluginToken !== undefined ? { pluginToken } : {}) }
   }
 
   async function remove(id: string): Promise<void> {
@@ -356,11 +392,13 @@ export function createPluginModule(deps: PluginModuleDeps): BuiltinModule {
           const listOpts: { cursor?: string, limit: number } = { limit: clampLimit(opts?.limit) }
           if (opts?.cursor !== undefined) listOpts.cursor = opts.cursor
           const page = await store.list(KEY_PLUGIN, listOpts)
-          const items = page.items.map(({ value }) => projectManifest(value as StoredPlugin))
+          const items = await Promise.all(
+            page.items.map(({ value }) => view(value as StoredPlugin)),
+          )
           return page.cursor !== undefined ? { items, cursor: page.cursor } : { items }
         }
         case 'get':
-          return projectManifest(await require(requireString(args, 'id')))
+          return await view(await require(requireString(args, 'id')))
         case 'write':
           return write(args)
         case 'update': {

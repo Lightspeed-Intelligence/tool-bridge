@@ -113,6 +113,20 @@ export interface Page<T> {
   items: T[]
 }
 
+/** root `~search` 返回的虚拟化后 ToolSpec。 */
+export interface ToolSpec {
+  confirm?: boolean
+  description?: string
+  effect?: string
+  inputSchema?: unknown
+  name: string
+}
+
+export interface ToolSearchItem {
+  path: string
+  tool: ToolSpec
+}
+
 /** system/federation list 的一行:remote 联邦 host 白名单合并视图。 */
 export interface FederationHost {
   host: string
@@ -135,20 +149,115 @@ export interface CredentialDomainState {
   updatedAt?: string
 }
 
-/** system/plugin 的 manifest(plugin/manifest.ts 契约手抄)。 */
-export type PluginKind = 'tool-provider' | 'context-provider'
+/** system/plugin 的 manifest（plugin/manifest.ts + builtin/plugin.ts 的 PluginView 契约手抄）。 */
+export type PluginProfile = 'tools/v1' | 'context/v1'
+
+/** `~describe` 里的一个 export：plugin/v2 把「提供什么」从部署身份移到了 export 上。 */
+/**
+ * 多字段凭证的一个字段声明(来自 plugin 的 `~describe`,注册时缓存进 manifest)。
+ *
+ * **`secret` 只管展示,不管通道**:声明了 `credentialFields` 的 export,它的**全部**字段
+ * 都进 authRef 指向的那个 secret(运行时 `parseCredentialValues` 就是这个口径)。
+ * `secret: false` 的含义仅是"这个值不敏感,输入框不必遮蔽" —— 比如 baseUrl。
+ *
+ * 曾按它把字段分流进 providerConfig,那是个真 bug:照分流后的引导操作,挂载必被拒
+ * (8 个 provider 中招)。非凭证的挂载配置该由 export 独立声明,不混在凭证字段里。
+ */
+export interface PluginCredentialField {
+  description?: string
+  key: string
+  label?: string
+  required?: boolean
+  /** 仅控制输入是否遮蔽;不影响存储通道。 */
+  secret?: boolean
+}
+
+/**
+ * 非凭证挂载配置的字段声明(providerConfig,如 baseUrl / region)。
+ *
+ * 与 {@link PluginCredentialField} 是两条通道:凭证进加密的 SecretStore,这里的值明文进
+ * 节点记录(`system/registry get` 会回显)。**故没有 `secret` 字段** —— 密钥永远走
+ * credentialFields。`required` 缺省视为非必填(providerConfig "有就用、没有走默认")。
+ */
+export interface PluginMountConfigField {
+  description?: string
+  key: string
+  label?: string
+  required?: boolean
+}
+
+export type PluginExportAuth
+  = | { kind: 'none' }
+    | { description?: string, kind: 'single', label?: string, required?: boolean }
+
+export interface PluginExport {
+  /** 明确声明无凭证/单值凭证；与 oauth/credentialFields 三选一。 */
+  auth?: PluginExportAuth
+  capabilities?: string[]
+  /** 该 export 需要的多字段凭证;缺省表示单值 API key(或不需要凭证)。 */
+  credentialFields?: PluginCredentialField[]
+  /** 挂载时平台会用真实凭证空参调一次这个只读工具,当场判定凭证可用。 */
+  credentialProbe?: string
+  description?: string
+  id: string
+  methods?: string[]
+  /** 该 export 挂载时需要的非凭证配置(如 baseUrl);缺省表示无需额外配置。 */
+  mountConfigFields?: PluginMountConfigField[]
+  /** 声明了它就走平台托管的 OAuth2 授权码流程(与 credentialFields/Probe 互斥)。 */
+  oauth?: {
+    authorizationUrl: string
+    scopes?: string[]
+    tokenUrl: string
+  }
+  profile: PluginProfile
+}
 
 export interface PluginManifest {
   auth: { kind: 'platform-token' } | { kind: 'bearer', secretRef: string }
   enabled: boolean
   /** https:// 或 `binding:<name>`。 */
   endpoint: string
+  /** 注册时缓存的 `~describe.exports`（挂载时 config.export 从中选）。 */
+  exports: PluginExport[]
   /** 如 "/healthz";必须以 '/' 开头。 */
   healthPath: string
   id: string
-  /** "tool-provider/v1" | "context-provider/v1";前缀必须与 kind 一致。 */
-  interfaceVersion: string
-  kind: PluginKind
+  /** 传输协议版本；当前仅 "plugin/v2"。 */
+  protocolVersion: string
+}
+
+/**
+ * 内置集成目录的一项(`system/catalog` list/search;对等 `tb integration catalog`)。
+ *
+ * 这是**挂载向导的数据源**:它直接回答"能挂成什么 kind、有哪几个 export、要填哪些凭证
+ * 字段、要不要再授权一步",故表单可以从它生成而不必让用户去翻插件源码。
+ *
+ * 内置集成**不落库**；目录项与它的代码是同一份构建产物。
+ */
+export interface CatalogListItem {
+  description?: string
+  /** descriptor 指纹(升级检测/三宿主对拍)。 */
+  digest: string
+  /** 每个 export 的精确 auth/config/kind 契约；挂载逻辑的唯一真源。 */
+  exportDetails: Record<string, CatalogExportDetails>
+  /** 可挂载的 export id;长度 > 1 时挂载必须显式选一个。 */
+  exports: string[]
+  id: string
+  nodeKinds: Array<'context' | 'tool'>
+}
+
+export type CatalogExportAuth
+  = | { fields: PluginCredentialField[], kind: 'fields' }
+    | { kind: 'none' }
+    | { kind: 'oauth' }
+    | { description?: string, kind: 'single', label?: string, required: boolean }
+
+export interface CatalogExportDetails {
+  auth: CatalogExportAuth
+  description?: string
+  id: string
+  kind: 'context' | 'tool'
+  mountConfigFields?: PluginMountConfigField[]
 }
 
 /** write/update 返回:pluginToken 仅该次响应出现一次(auth=platform-token 时)。 */

@@ -1,11 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import type { PluginManifest, PluginRegistration } from '../../src/plugin/manifest'
+import type { PluginManifest } from '../../src/plugin/manifest'
 import type { BuiltinModule } from '../../src/builtin/types'
 import type { CallContext } from '../../src/types'
 import {
   createPluginModule,
   type PluginHealthRecord,
   type PluginProbeResult,
+  type PluginRegistration,
   pluginTokenSecretName,
 } from '../../src/builtin/plugin'
 import { KEY_PLUGIN, KEY_PLUGIN_HEALTH, KEY_PLUGIN_META, MemoryStateStore } from '../../src/store'
@@ -20,8 +21,7 @@ declare const crypto: { getRandomValues(array: Uint8Array): Uint8Array }
 
 const MANIFEST: PluginManifest = {
   id: 'feishu-docs',
-  kind: 'context-provider',
-  interfaceVersion: 'context-provider/v1',
+  protocolVersion: 'plugin/v2',
   endpoint: 'https://plugin.example.com',
   auth: { kind: 'platform-token' },
   healthPath: '/healthz',
@@ -29,17 +29,21 @@ const MANIFEST: PluginManifest = {
 }
 
 const DESCRIBE = {
-  kind: 'context-provider',
-  interfaceVersion: 'context-provider/v1',
-  capabilities: ['search'],
+  protocolVersion: 'plugin/v2',
+  exports: [
+    {
+      auth: { kind: 'none' },
+      id: 'documents',
+      profile: 'context/v1',
+      methods: ['List', 'Get', 'Update', 'Write', 'Search'],
+      capabilities: ['search'],
+    },
+  ],
 }
-
-const HELP = { cmds: ['List', 'Get', 'Update', 'Write', 'Search'].map(name => ({ name })) }
 
 function makeHarness(
   overrides: {
     describe?: unknown
-    help?: unknown
     probe?: (m: PluginManifest) => Promise<PluginProbeResult>
   } = {},
 ) {
@@ -50,10 +54,7 @@ function makeHarness(
     base64urlEncode(crypto.getRandomValues(new Uint8Array(32))),
   )
   const probe = vi.fn(overrides.probe ?? (async () => ({ healthy: true })))
-  const fetchContract = vi.fn(async () => ({
-    describe: overrides.describe ?? DESCRIBE,
-    help: overrides.help ?? HELP,
-  }))
+  const fetchContract = vi.fn(async () => ({ describe: overrides.describe ?? DESCRIBE }))
   const mod: BuiltinModule = createPluginModule({
     store,
     sk,
@@ -109,12 +110,37 @@ describe('builtin plugin 模块', () => {
     })
   })
 
-  it('get/list 不回显 pluginToken 与 tokenSkId', async () => {
+  it('get/list 不回显 pluginToken 与 tokenSkId,但回 ~describe 的 exports', async () => {
     await h.mod.dispatch('write', { ...MANIFEST }, ctx)
+    // v2 的"这个 plugin 提供什么"在 export 上,管理面(tb plugin / Dashboard)靠它回答,
+    // 也靠它知道挂载时 config.export 能填什么 —— 来源就是网关挂载时读的同一份 meta 缓存。
+    const expected = { ...MANIFEST, exports: DESCRIBE.exports }
     const got = (await h.mod.dispatch('get', { id: MANIFEST.id }, ctx)) as Record<string, unknown>
-    expect(got).toEqual(MANIFEST)
+    expect(got).toEqual(expected)
     const page = (await h.mod.dispatch('list', {}, ctx)) as { items: Record<string, unknown>[] }
-    expect(page.items).toEqual([MANIFEST])
+    expect(page.items).toEqual([expected])
+  })
+
+  it('write/update 的返回也带 exports(注册完即可直接挂载,不必再 get 一次)', async () => {
+    const reg = (await h.mod.dispatch('write', { ...MANIFEST }, ctx)) as PluginRegistration
+    expect(reg.exports).toEqual(DESCRIBE.exports)
+    const updated = (await h.mod.dispatch(
+      'update',
+      { id: MANIFEST.id, patch: { enabled: false } },
+      ctx,
+    )) as PluginRegistration
+    // 仅本地字段变更不重抓契约,exports 从缓存回读(与 get 同源)。
+    expect(h.fetchContract).toHaveBeenCalledTimes(1)
+    expect(updated.exports).toEqual(DESCRIBE.exports)
+    expect(updated.enabled).toBe(false)
+  })
+
+  it('meta 缓存缺失 → unavailable，拒绝返回不完整记录', async () => {
+    await h.mod.dispatch('write', { ...MANIFEST }, ctx)
+    await h.store.delete(KEY_PLUGIN_META + MANIFEST.id)
+    await expect(h.mod.dispatch('get', { id: MANIFEST.id }, ctx)).rejects.toSatisfy(
+      e => isTBError(e) && e.code === 'unavailable' && e.message.includes('重新注册'),
+    )
   })
 
   it('重注册换发 pluginToken 并吊销上一代 SK', async () => {
@@ -145,12 +171,26 @@ describe('builtin plugin 模块', () => {
     expect(failing.fetchContract).not.toHaveBeenCalled()
   })
 
-  it('契约缺必需方法 → invalid_argument 拒注册', async () => {
-    const missing = makeHarness({ help: { cmds: [{ name: 'List' }, { name: 'Get' }] } })
-    await expect(missing.mod.dispatch('write', { ...MANIFEST }, ctx)).rejects.toSatisfy(
-      e => isTBError(e) && e.code === 'invalid_argument' && e.message.includes('Update'),
+  it('export 声明与 capability 自相矛盾 → invalid_argument 拒注册', async () => {
+    // 声明了 search 能力却没把 Search 列进 methods:平台永远不会调用它。
+    const bad = makeHarness({
+      describe: {
+        protocolVersion: 'plugin/v2',
+        exports: [
+          {
+            auth: { kind: 'none' },
+            id: 'documents',
+            profile: 'context/v1',
+            methods: ['List', 'Get'],
+            capabilities: ['search'],
+          },
+        ],
+      },
+    })
+    await expect(bad.mod.dispatch('write', { ...MANIFEST }, ctx)).rejects.toSatisfy(
+      e => isTBError(e) && e.code === 'invalid_argument' && e.message.includes('Search'),
     )
-    expect(await missing.store.get(KEY_PLUGIN + MANIFEST.id)).toBeNull()
+    expect(await bad.store.get(KEY_PLUGIN + MANIFEST.id)).toBeNull()
   })
 
   it('manifest 形状非法 → invalid_argument(不探活)', async () => {
@@ -167,13 +207,13 @@ describe('builtin plugin 模块', () => {
       { id: MANIFEST.id, patch: { enabled: false } },
       ctx,
     )) as PluginManifest
-    expect(updated).toEqual({ ...MANIFEST, enabled: false })
+    expect(updated).toEqual({ ...MANIFEST, enabled: false, exports: DESCRIBE.exports })
     await expect(
       h.mod.dispatch('update', { id: MANIFEST.id, patch: { id: 'other' } }, ctx),
     ).rejects.toSatisfy(e => isTBError(e) && e.code === 'invalid_argument')
     await expect(
-      h.mod.dispatch('update', { id: MANIFEST.id, patch: { kind: 'tool-provider' } }, ctx),
-    ).rejects.toSatisfy(e => isTBError(e) && e.code === 'invalid_argument') // interfaceVersion 前缀不符
+      h.mod.dispatch('update', { id: MANIFEST.id, patch: { protocolVersion: 'plugin/v1' } }, ctx),
+    ).rejects.toSatisfy(e => isTBError(e) && e.code === 'invalid_argument') // 未知协议版本
     await expect(h.mod.dispatch('update', { id: 'nope', patch: {} }, ctx)).rejects.toSatisfy(
       e => isTBError(e) && e.code === 'not_found',
     )

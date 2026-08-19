@@ -1,0 +1,34 @@
+{
+  "name": "@tool-bridge/plugins",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Built-in plugin catalog: every provider under src/ can be mounted directly by an assembled host",
+  "type": "module",
+  "exports": {
+    ".": "./src/registry.ts",
+    "./feishu": "./src/feishu/index.ts",
+    "./notes": "./src/notes/index.ts"
+  },
+  "scripts": {
+    "deploy:feishu:cf": "wrangler deploy --config wrangler.feishu.jsonc",
+    "generate": "pnpm generate:registry && pnpm generate:catalog",
+    "generate:catalog": "tsx scripts/generateCatalog.ts",
+    "generate:registry": "node scripts/generateRegistry.mjs",
+    "serve": "tsx scripts/serve.ts",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json"
+  },
+  "dependencies": {
+    "@cfworker/json-schema": "catalog:",
+    "@modelcontextprotocol/sdk": "catalog:",
+    "@tool-bridge/plugin-sdk": "workspace:*",
+    "zod": "catalog:"
+  },
+  "devDependencies": {
+    "@hono/node-server": "catalog:",
+    "@tool-bridge/core": "workspace:*",
+    "tsx": "catalog:",
+    "vitest": "catalog:",
+    "wrangler": "catalog:"
+  }
+}

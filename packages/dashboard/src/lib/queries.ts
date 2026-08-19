@@ -1,6 +1,7 @@
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useSyncExternalStore } from 'react'
 import type {
+  CatalogListItem,
   ContextEntry,
   ContextEntryMeta,
   CredentialDomainState,
@@ -12,6 +13,7 @@ import type {
   SkillDetail,
   SkillFile,
   SkillSummary,
+  ToolSearchItem,
 } from './types'
 import {
   type ApiError,
@@ -23,6 +25,7 @@ import {
   getTree,
   invoke,
   type InvokeResult,
+  searchTools,
   startOAuthAuthorize,
 } from './api'
 import {
@@ -47,6 +50,28 @@ export function useTree(path = '', depth = 8, options?: { enabled?: boolean }) {
     queryKey: [...base, 'tree', path, depth],
     queryFn: ({ signal }) => getTree(conn, path, depth, signal),
     enabled: options?.enabled ?? true,
+  })
+}
+
+/** root 全局工具搜索；cursor 只作为 pageParam，不混入首屏请求。 */
+export function useToolSearch(
+  query: string,
+  mode: 'keyword' | 'semantic' = 'keyword',
+  limit = 50,
+) {
+  const conn = useConn()
+  const base = useKeyBase()
+  const normalized = query.trim()
+  return useInfiniteQuery<Page<ToolSearchItem>>({
+    queryKey: [...base, 'tool-search', normalized, mode, limit],
+    queryFn: ({ pageParam, signal }) => searchTools(conn, normalized, {
+      mode,
+      limit,
+      ...(typeof pageParam === 'string' ? { cursor: pageParam } : {}),
+    }, signal),
+    enabled: normalized.length > 0,
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: last => last.cursor,
   })
 }
 
@@ -195,6 +220,26 @@ export function useSecretList() {
 
 export function usePluginList() {
   return usePagedBuiltin<PluginManifest>('plugin-list', 'system/plugin')
+}
+
+/**
+ * 内置集成目录(`system/catalog`,对等 `tb integration catalog`)。
+ *
+ * 挂载向导要的是后者:只有它能把"该填什么"从 descriptor 直接渲染成表单,而且 read scope
+ * 意味着非 admin 的用户也看得见(挂载只要 register scope,浏览不该更严)。
+ */
+export function useIntegrationCatalog() {
+  const conn = useConn()
+  const base = useKeyBase()
+  return useQuery({
+    queryKey: [...base, 'integration-catalog'],
+    queryFn: async () => {
+      const r = await invoke(conn, 'system/catalog', 'list', { opts: { limit: 200 } })
+      return (r.json as { items: CatalogListItem[] }).items ?? []
+    },
+    // descriptor 是编译期常量:同一部署内不会变,没必要反复拉。
+    staleTime: 5 * 60 * 1000,
+  })
 }
 
 /** remote 联邦 host 白名单合并视图(env 基线 + 运行时条目;对等 `tb federation ls`)。 */

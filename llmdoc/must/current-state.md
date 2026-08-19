@@ -1,8 +1,12 @@
-# 当前状态(MUST)
+# 当前状态
 
-> 用途:每次会话开场必读的易变状态快照(部署、代码现状、凭据配置、工具链、未竟事项)。更新时机:部署/凭据/工具链/能力面变化时,由当轮 Agent 更新本文件。最后核实日期:2026-07-24。
+## 阶段
 
-## 项目状态
+项目处于 pre-launch 开发期。核心树、认证、插件、Search、设备通道、CLI、Dashboard、Cloudflare 与 Node 宿主均已有实现；共享部署仅作开发验收，不代表正式上线。
+
+## Lightspeed fork 里程碑(changelog)
+
+<!-- TODO(sync): 上游主线已把本文件收敛为"当前事实/近期重点/验收入口"的精简形态、不留 dated changelog;fork 侧保留下列生产落地记录(飞书/bytebase 插件、安全修复、CLI/Dashboard 发布)。这些记录里的 gateway 落点表述早于上游 app 重构,涉及具体包路径时以架构文档新事实为准。 -->
 
 - **初步实现阶段已完成**(2026-07-07 "破壳"):SK 鉴权与作用域、HTBP 核心树与内容协商、Tool 层(mcp/http/remote 联邦 + 虚拟化)、Context 层(r2/s3 四动词 + Search + `$ref` 大对象)、设备反向注册(DO WebSocket hibernation)、SDK、Plugin 系统、Dashboard 均已落地并经生产验证。
 - 2026-07-29:**挂载路径归位到 `plugins/` 并清掉旧直挂节点**——两个 bytebase 节点从根下移到 `plugins/bytebase` 与 `plugins/bytebase-rw`(与 `plugins/feishu`、`plugins/meego` 同级);树无 move 命令,走"新路径挂载 → 复验 → 删旧节点"(先验后删,无不可用窗口),迁移后新路径读写与只读边界复验通过、旧路径 `not found`。同时删掉 2026-07-16 建的旧直挂节点 `mcp/bytebase`(`kind:mcp` + `auth:'oauth'`,同一实例但需 `tb tool auth --local` 人工授权)——已被 plugin 形态完全取代。**调用路径变更**:`tb call bytebase/...` → `tb call plugins/bytebase/...`。
@@ -31,7 +35,16 @@
 - 2026-07-10:**Dashboard 0.6.0 整站大修已发布并在生产生效**——信息架构重整为 `ActivityRail` + 可折叠 `ExplorerPanel` + 全宽 Workspace,移动端资源抽屉关闭后恢复焦点;TreeNav 保持 root depth=1、本地截断懒取 depth=1、remote 及后代纯透传 depth=3、仅非空过滤取 root depth=8,并以受控展开/可见顺序/焦点状态实现 ARIA tree roving focus。`NodePage` 继续作为通用协议回退,`CommandWorkspace` 只挂当前 `CmdPanel`,Context 使用桌面 master-detail/移动 dialog 且保持正文/version/`$ref` 原子基线;六个系统页对齐 builtin/CLI 的已知工作流、cursor 边界与危险操作 Promise 结算,历史/session/lazy route 安全边界延续 0.5.0。真实浏览器终验覆盖桌面/移动全部路由、树请求边界与键盘导航,无 document 横向溢出且 console 无 error/warning;SK 一次性值、Secret upsert 与 Registry replace 警告均已实操。`pnpm verify` 全仓 **1005 passed / 7 skipped**,退出码 0。发布证据:commit `e363e01`,tag `dashboard-v0.6.0`,Actions run `29068385868` 成功,npm `@tool-bridge/dashboard` 的 `latest=0.6.0`;生产 `/ui/` 首次由 Worker version 44(`eb4e8daf-7b5d-44ff-a91b-5b8074348854`)承载,HTML SHA-256 为 `2420378ce98842928fdad91c5ad87ae2f3956bb83c2853c929f1abd7d550a264`,生产 smoke 通过。后续纯文档提交可能生成内容等价的新 Worker version,故当前部署序号应以 `wrangler deployments list` 为准;Gateway `/healthz` 版本仍为 0.4.0。
 - 2026-07-10:**CLI Agent 体验修复**(本轮,源自真实 agent 使用反馈:参数试错/超时不可控/retryable 丢失/feedback 机制零使用)——①`tb call` 第二 positional 收裸 JSON arguments(`tb call <path> '{...}'`;与 `--args`/`--args-file` 三源互斥,误写 `--json '{...}'` 形态自然工作,严格解析不破坏:第三个 positional 仍硬失败);②CLI 错误呈现 TBError `retryable`(此前在 `toCliError` 被丢弃):人类模式加 `(retryable — try again)` 尾注、`--json` 错误对象带 `retryable` 字段;③全局 `--timeout <seconds>`(默认 120s,`AbortSignal.timeout` 实现,超时报 retryable 错误并提示加大 --timeout);④**失败现场 feedback 引导**:`tb call` 失败(unavailable/internal/invalid_argument/rate_limited)时尽力拉取该 path `~feedback`(限时 5s、失败静默),有条目 stderr 列 top 3 + `tb feedback get` 下钻命令(--json 带结构化 `feedback`),无条目引导 `tb feedback submit`——把已建成但闲置的经验闭环推到 agent 注意力所在的报错现场;⑤core 上游错误 message 英文化(upstream unavailable/returned HTTP N,统一英文口径)。落点:cli `http.ts`(CliError+retryable/hint/feedback、apiFetch 超时)/ `args.ts`(--timeout)/ `output.ts`(reportError)/ `commands/call.ts`(positional+attachFeedbackHint)、core `tool/upstreamError.ts`。新增 `test/callUx.test.ts`(16 例),CLI 178 测试全绿,verify 全仓通过;生产实测 positional 双形态/超时/invalid_argument 触发 submit 引导。**已发布**(`@tool-bridge/cli` 0.7.0,PR #22 merge 后 tag `cli-v0.7.0` 触发 run `29092102298` 成功,npm `latest=0.7.0`)。
 
-## 已部署资源(DJJ 账户)
+## 当前事实
+
+- 宿主中立应用在 `packages/app`，Cloudflare、Node、SDK 分别位于 gateway、server、sdk。
+- 节点 kind 与 builtin 清单以 core 类型和 app bootstrap 常量为准，不在 MUST 手抄数量。
+- 内置集成由生成 catalog + binding 成对装配，直接挂载；`system/plugin` 只承担显式注册管理。
+- `system/catalog` 只返回逐 export 的 `exportDetails` 精确契约，不兼容 provider 级聚合字段。
+- 首次 bootstrap 默认要求显式 Admin SK；Node server 只在显式本地开发开关下允许随机生成。
+- 仓库内 Cloudflare 配置是账户中立模板，真实账户、域名和资源 ID 由 provision 回填，不提交。
+
+## Lightspeed fork 生产资源(账户中立原则的例外:此表仅记 fork 实际部署,不作为通用模板)
 
 | 资源 | 名称/地址 | 备注 |
 |---|---|---|
@@ -42,7 +55,15 @@
 | Worker | `tb-plugin-feishu` @ https://tb-plugin-feishu.shuaiqijianhao.workers.dev | 飞书 MCP tool-provider plugin,secrets 仅 `PLUGIN_TOKEN`(飞书凭证存平台 SecretStore `feishu-app`,经挂载 authRef 注入),生产网关注册 id=feishu、挂载路径 `feishu`(authRef=feishu-app) |
 | Worker | `tb-plugin-bytebase` @ https://tb-plugin-bytebase.heco.workers.dev | Bytebase MCP tool-provider plugin(**Lightspeed 账户**),secrets 仅 `PLUGIN_TOKEN`;vars `BYTEBASE_BASE_URL=https://bytebase.infra.fantacy.live`、`BYTEBASE_ALLOWED_TOOLS=""`(放行全部);生产网关注册 id=bytebase。**同一 plugin 部署服务两个挂载(权限分级,凭证缓存按 key 摘要隔离)**,均在 `plugins/` 下与 feishu/meego 同级:`plugins/bytebase`(authRef=`bytebase-sa` → SA `tool-bridge@`,仅 `roles/sqlEditorReadUser`,纯只读)/ `plugins/bytebase-rw`(authRef=`bytebase-rw` → SA `tool-bridge-rw@`,test 环境可直接写 + 全环境可提工单) |
 
-## 代码现状(pnpm monorepo,测试数为 2026-07-22 实跑)
+## 近期重点
+
+- 保持 pre-launch 契约收敛，避免重新引入隐藏别名、旧 wire fallback 或未实现公共面。
+- 接口面变化继续执行 API / CLI / Dashboard 对等审计。
+- 对宿主、搜索、插件与安全边界的修改，以可重跑测试和 build 产物为验收。
+
+## Lightspeed fork 包结构与测试(快照,精确数字以当前工作树实查为准)
+
+<!-- TODO(sync): 下列包清单成文于上游 gateway→app 重构之前(把宿主中立业务、createTbApp 都归在 gateway)。上游已新增 `packages/app`(宿主中立)与 `packages/plugins`(内置 provider 单体包 + 生成 catalog),gateway 降为 Workers adapter。涉及 gateway 落点、plugin 打包边界的描述需按架构文档新事实订正;fork 独有的 plugin-feishu/meego/bytebase Worker 与 fantacy.live 生产资源保留。 -->
 
 - `packages/core` — 纯逻辑内核(唯一运行时依赖 zod),**699 个单测**,模块族:
   - `auth/`(scope 判定 / authorizer / 注册路径规则 / sk 签发与哈希)、`tree/`(path 规则 / NodeRegistryStore / visibility 裁剪)、`htbp/`(helpDsl / helpMarkdown / summary / HelpModel / negotiate / tree 构建)、`secret/`(AES-256-GCM 只写不读)
@@ -64,7 +85,16 @@
 - CI(.github/workflows/):`publish-cli.yml`(tag `cli-v*`)/ `publish-sdk.yml`(tag `sdk-v*`)/ `publish-gateway.yml`(tag `gateway-v*`)/ `publish-dashboard.yml`(tag `dashboard-v*`)/ `publish-server.yml` + `publish-docker.yml`(同 tag `server-v*`:npm 发布 + GHCR 镜像 `ghcr.io/tokenrollai/tool-bridge`),npm Trusted Publishing(OIDC);**无主干测试 CI**。
 - 工具链:lint 用 biome;测试 vitest 4 + @cloudflare/vitest-pool-workers 0.18(API 变更注意见 [../guides/workers-kv-pitfalls.md](../guides/workers-kv-pitfalls.md))。
 
-## 常用命令
+## 验收入口
+
+```sh
+pnpm verify
+pnpm turbo run build   # 改 public package、打包配置或依赖时必跑
+```
+
+真实外部资源验证只在任务明确需要且得到授权时执行；每轮最多一次，并把证据留在 PR/CI，而不是追加到本文件。
+
+## Lightspeed fork 验收命令与环境快照
 
 - `pnpm verify` — typecheck + lint + 单测 + 集成测试一把过(2026-07-24 实跑:699 core + 233 cli + 12 sdk + 131 gateway + 24 server + 8 plugin-feishu = **1107 passed**;SDK 1 + gateway 6 opt-in = **7 skipped**;退出码 0;根 `test:integration` 含 gateway + server + plugin-feishu)。
 - `pnpm deploy:all` — 幂等 provision + dashboard build + 部署 gateway。

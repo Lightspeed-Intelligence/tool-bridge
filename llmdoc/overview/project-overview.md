@@ -1,44 +1,49 @@
-# 项目总览
+# 项目概览
 
-> 用途:理解 tool-bridge 的产品形态、模块全景与部署形态的入口文档;比 [../must/project-brief.md](../must/project-brief.md) 更展开,比 [../architecture/modules-and-boundaries.md](../architecture/modules-and-boundaries.md) 更浅。更新时机:产品定位或模块划分变化时。
+## 用户模型
 
-## 要解决的五个痛点
+tool-bridge 将异构能力投影为带路径的树：目录负责组织，工具节点负责调用，上下文节点负责内容，设备节点承载反向连接，remote 节点联邦另一棵 HTBP 树。调用方先发现、再按同一权限模型访问。
 
-1. **工具接入受限于运行环境**:边缘函数/浏览器/受限 sandbox 等 Agent 环境跑不了 MCP client。
-2. **上下文碎片化**:知识散落 R2/S3、文件系统、内部系统,无统一读写检索面。
-3. **机器能力够不着**:内网服务器的 shell 与 fs 对云上 Agent 不可见。
-4. **发现即文档**:每接一个工具写一份说明,说明与实现漂移。
-5. **权限缺失**:key 要么全能要么不能,缺少"只能读 `docs/`、只能调 `search/`"的表达。
+主要入口：
 
-## 核心主张
+- HTTP：`~help`、`~tree`、`~describe`、可选的 `~search`、节点调用与管理 builtin。
+- CLI：`tb` 对常用数据面和管理面提供脚本友好的命令。
+- Dashboard：消费同一 API，提供树、搜索、插件、集成和系统管理界面。
+- MCP：`/~mcp` 将可见工具投影给 MCP 客户端。
+- Agent Skill：独立仓库 `TokenRollAI/tool-bridge-skill` 教 Agent 经 `tb` 做运行时发现、调用与 feedback 闭环；不静态复制实例工具目录。
 
-一棵树一个入口 / 自描述(每级 `~help`)/ 上游开放供给 / Context 统一读写面 / 设备反向注册 / SK 即权限 / 廉价云上运行(CF)+ 易拓展(SDK+Plugin)。
+## 能力面
 
-**非目标**:不做 Agent Runtime(那是 Watt 等上层职责)、不做事件总线、不做模型托管计量、初期不做多云抽象(仅 CF + Docker 两条路径)。
-
-## 模块总览
-
-| 模块 | 一句话职责 | 状态 |
-|---|---|---|
-| HTBP Tree(核心) | 节点注册表、路由、`~help`/`~skill`/`~tree`/`~describe`、内容协商、调用分发 | 已落地 |
-| Tool Layer | mcp/http/builtin ToolProvider 聚合与调用代理、虚拟化、remote 联邦 | 已落地 |
-| Context Layer | 多来源上下文统一读写检索面(四动词 + Search + `$ref`) | 已落地(r2/s3) |
-| Device Gateway | 设备 WebSocket 反向注册 + 调用转发 | 已落地 |
-| Auth(横切) | SK 签发/作用域/访问判定(`Authorizer.Check` 唯一入口) | 已落地 |
-| SDK | 内嵌 TB Server / 程序化注册 / 反向连接 | 已落地(npm 发布) |
-| CLI | 纯 API 客户端 `tb`,子命令一一映射接口面 | 已落地(npm 发布) |
-| Plugin System | 自定义 Provider 注册与生命周期 | 已落地 |
-| Dashboard | `~help` 通用渲染器 + 管理表单(无专用后端) | 已落地 |
-| Server/部署 | CF 与 Docker 两条部署路径产出同一棵树 | 均已落地(CF 生产上线;Docker 镜像验收通过) |
-
-职责边界与依赖方向详见 [../architecture/modules-and-boundaries.md](../architecture/modules-and-boundaries.md)。
+- 树与权限：路径级 read/write/call/register/admin，deny 优先，可见性裁剪。
+- Provider：MCP、HTTP、plugin tools/context、本地 SDK provider、R2/S3 context。
+- 集成：编译期内置 catalog 与显式外部 plugin 注册。
+- Search：从权威节点/工具描述派生索引，再按请求身份 hydrate 和裁剪。
+- Feedback：使用经验附着在具体节点或工具路径；高分条目进入 `~help` 与 Search 投影，CLI 与 Dashboard 均可读写和投票。
+- 设备：CLI/SDK 反向连接，将本地工具、文件或自定义节点挂到远端树。
+- 运维：SK、SecretStore、registry、status、catalog、federation、annotation。
 
 ## 部署形态
 
-- **Cloudflare(默认宿主,已上线)**:单 Worker `tb-gateway`(Hono 路由,API + Dashboard 静态资源一体,Dashboard 挂 `/ui`);KV `tb-kv`(树配置/SK 哈希/manifest);R2 `tb-r2`(context + 大对象);每设备一个 Durable Object `DeviceSession`(WS hibernation)。云上资源统一 `tb-` 前缀(`TB_NAME_PREFIX` 派生)。
-- **Docker/Node(自部署,已落地)**:`@tool-bridge/server` 单进程(better-sqlite3 StateStore + FS ObjectStore + ws 设备通道 + Dashboard 静态托管),`/data` 卷持久化;根 Dockerfile 产出镜像 `ghcr.io/tokenrollai/tool-bridge`(node:22 bookworm-slim)。见 [../guides/docker-host.md](../guides/docker-host.md)。
-- 两条路径的差异全部收敛在四个宿主注入点 StateStore/ObjectStore/SecretStore/DeviceTransport,业务代码零分叉;SDK 的 `createToolBridge(deps)` 即该装配面。
+| 形态 | 入口 | 适配器 |
+|---|---|---|
+| Cloudflare Deploy Button 模板 | `template/src/index.ts` | KV、R2、Durable Objects、Static Assets；不含 D1 Search |
+| Cloudflare Workers | `packages/gateway/src/deployEntry.ts` | KV、R2、D1、Durable Objects、Static Assets |
+| Node / Docker | `packages/server` | SQLite、文件对象存储、ws、静态 Dashboard |
+| 嵌入式 SDK | `packages/sdk` | Node 22+；调用方注入 StateStore、ObjectStore、SecretStore 与本地 provider；当前不提供 SearchIndex 注入 |
+| 应用层库 | `packages/app` | 不绑定具体运行时，由宿主注入依赖 |
 
-## 三入口对等原则
+宿主共享 app/core 的行为，但存储一致性、设备会话持久性、Search 和静态资源托管存在明确适配差异。Deploy Button 是轻量模板，不能写成与完整源码 gateway 等价；详见 modules 与各宿主 guide。
 
-Agent(直接 HTTP)、CLI(`tb`)、Dashboard 三个入口对同一棵树的操作行为一致。CLI 做不到而 Dashboard/API 做得到 = "管理旁路" = 缺陷;Dashboard 无专用后端,只渲染 `~help`。
+## 公共文档边界
+
+产品首页和面向用户的公开文档由独立仓库 `TokenRollAI/tool-bridge-site` 维护，已通过 Cloudflare Pages 上线；正式入口是 [toolbridge.tokenroll.ai](https://toolbridge.tokenroll.ai/)，文档从 [/docs/](https://toolbridge.tokenroll.ai/docs/) 进入。本仓库继续拥有实现、发布产物与面向开发 agent 的 llmdoc。不要把 llmdoc 整体复制到公共站点，它包含工程工作流、内部边界和会随实现收敛的维护知识。
+
+Agent 使用入口由独立仓库 [`TokenRollAI/tool-bridge-skill`](https://github.com/TokenRollAI/tool-bridge-skill) 维护，可用 `npx skills add TokenRollAI/tool-bridge-skill` 安装。Skill 只固化 Agent 的发现、schema 下钻、安全调用和 feedback 消费/贡献流程；目标实例的 URL、SK、动态工具清单和运行结果不进入仓库。维护与验收见 [Agent Skill 接入与验收](../guides/agent-skill-integration.md)。
+
+公共站点按“开始使用 → 核心概念 → 部署 → 接入能力 → 使用与治理 → 参考排障”组织任务型页面。每篇操作指南应交代适用边界、前置权限、可复制步骤、成功证据、安全与 SecretStore、常见失败、回滚和下一步；参考页负责把读者送回任务流，而不是成为孤立终点。
+
+公共站点解释稳定的产品模型、上手路径和部署方式，不维护某个实例动态生成的完整工具目录。动态事实要区分入口：`~tree` 是当前可见树；Provider 节点级 `~help` 是工具索引，工具级 `~help` 才给完整 schema；`~describe` 是 Search/Context capability 真源；`~search` 只在宿主装配后存在。发生差异时，真源优先级是：目标实例在当前身份下返回的运行时描述、对应版本的代码与发布说明、公共教程。用户可感知的契约或部署入口变化要同轮评估是否更新公共文档。
+
+站点仓库的 `pnpm verify` 同时检查格式、Astro 类型与内容、生产构建和构建产物站内链接。站点使用 Cloudflare Pages Git Integration：`main` 构建生产站点，其他分支与 PR 使用预览部署；Git 连接、构建和上传由 Cloudflare 管理，不要求在 GitHub Actions 中保存 Cloudflare API token。发布验收以 Pages 构建结果、生产 URL 和对应预览 URL 为准。
+
+公共文档当前是 Starlight 静态多页站点：切换页面会读取新的 HTML，哈希 `_astro` 资产长期缓存，Starlight 默认在 hover 后预取站内链接。遇到“文档切页慢”时，先用 canonical 自定义域名区分 HTML TTFB、渲染时间和资产缓存；不要只按页面内容量猜测，也不要重复开启已经存在的 hover prefetch。短 HTML TTL、更激进的预取或 ClientRouter 都属于有陈旧窗口、带宽或兼容性取舍的后续优化。

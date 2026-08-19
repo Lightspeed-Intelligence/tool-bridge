@@ -1,5 +1,5 @@
 /**
- * builtin 装配:把四个 system/* 模块组装为 `module → BuiltinModule` 映射。
+ * builtin 装配:把基础模块与宿主可选模块组装为 `module → BuiltinModule` 映射。
  *
  * 存储实例(SKRegistryStore / SecretStoreImpl / NodeRegistryStore)由网关注入并复用;
  * status 的 nodeCount 经翻页统计 registry 全量节点(当前树规模小,可接受)。
@@ -13,6 +13,7 @@ import type { ScopeChecker } from '../tree/visibility'
 import type { SKRegistryStore } from '../auth/sk'
 import type { BuiltinModule } from './types'
 import { createUserCredModule, type CredentialDomainInfo } from './usercred'
+import { type CatalogModuleDeps, createCatalogModule } from './catalog'
 import { createPluginModule, type PluginModuleDeps } from './plugin'
 import { createAnnotationModule } from './annotation'
 import { createFederationModule } from './federation'
@@ -25,6 +26,11 @@ import { createSkModule } from './sk'
 export interface BuiltinDeps {
   /** annotation 模块装配(Path 补充说明;registry 复用上方注入)。缺省不装配。 */
   annotation?: { store: AnnotationStore }
+  /**
+   * catalog 模块装配:内置插件目录的只读浏览面(read scope)。
+   * 缺省不装配 system/catalog —— 没装内置插件的宿主不该多一个恒空的节点。
+   */
+  catalog?: CatalogModuleDeps
   /**
    * federation 模块装配:remote host 白名单的运行时存储 + env 基线。
    * 缺省不装配 system/federation(纯逻辑单测无需)。
@@ -98,7 +104,7 @@ async function countNodes(registry: NodeRegistryStore): Promise<number> {
   return count
 }
 
-/** 构造 module 名 → BuiltinModule 映射(sk / secret / registry / status / plugin)。 */
+/** 构造 module 名 → BuiltinModule 映射；可选模块只在宿主提供依赖时装配。 */
 export function createBuiltins(deps: BuiltinDeps): Map<string, BuiltinModule> {
   const now = deps.now ?? (() => new Date().toISOString())
   const modules = new Map<string, BuiltinModule>()
@@ -117,6 +123,9 @@ export function createBuiltins(deps: BuiltinDeps): Map<string, BuiltinModule> {
       'plugin',
       createPluginModule({ ...deps.plugin, sk: deps.sk, secrets: deps.secret, now }),
     )
+  }
+  if (deps.catalog !== undefined) {
+    modules.set('catalog', createCatalogModule(deps.catalog))
   }
   if (deps.federation !== undefined) {
     modules.set(
@@ -137,6 +146,7 @@ export {
   type AnnotationModuleDeps,
   createAnnotationModule,
 } from './annotation'
+export { type CatalogListItem, type CatalogModuleDeps, createCatalogModule } from './catalog'
 export {
   createFederationModule,
   type FederationHost,
@@ -147,7 +157,9 @@ export {
   type PluginHealthRecord,
   type PluginModuleDeps,
   type PluginProbeResult,
+  type PluginRegistration,
   pluginTokenSecretName,
+  type PluginView,
 } from './plugin'
 export { createRegistryModule, parseNodeInput } from './registry'
 export { createSecretModule } from './secret'

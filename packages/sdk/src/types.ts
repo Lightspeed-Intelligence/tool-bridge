@@ -1,55 +1,46 @@
-import type {
-  ContextProvider,
-  DeviceClientState,
-  DeviceExpose,
-  NodeInput,
-  ObjectStore,
-  SecretStoreImpl,
-  StateStore,
-  ToolResult,
-  ToolSpec,
-  TreePath,
-} from '@tool-bridge/core'
+import type { PluginBindings } from '@tool-bridge/app'
+import { type BuiltinCatalog,
+  type ContextProvider,
+  type DeviceClientState,
+  type DeviceExpose,
+  type NodeInput,
+  type ObjectStore,
+  type OperationRegistry,
+  type SecretStoreImpl,
+  type StateStore,
+  type ToolResult,
+  type ToolSpec,
+  type TreePath } from '@tool-bridge/core'
 
 /** 值或其 Promise(SDK 使用者的 Provider 方法可同步亦可异步)。 */
 export type Awaitable<T> = T | Promise<T>
 
 /**
- * SDK 使用者实现的工具源(ToolProvider 的放宽形态:
- * 方法允许返回 Promise;core 的同步 ToolProvider 天然可赋值)。
+ * SDK 使用者手写的工具源:**只有 List 与 Call 两个动词**。
+ * 此前还强制 `Get`,但平台从不发 Get(`~help` 的数据源是 List 产出的 ToolSpec[]),
+ * 那是纯样板 —— 已随 core 的 `ToolProvider` 一并删除。方法可同步可异步。
  */
 export interface ToolProviderLike {
   Call(name: string, args: Record<string, unknown>): Awaitable<ToolResult>
-  Get(name: string): Awaitable<ToolSpec>
   List(): Awaitable<ToolSpec[]>
 }
 
 /**
- * 设备 WS 的网关侧宿主注入点。SDK 未实现其消费,注入将得到 unimplemented。
+ * `registerTool` 收的工具源:手写 Provider **或**直接交一个 core `OperationRegistry`。
+ * 后者是零样板路径 —— 用 Zod 声明入参,JSON Schema、校验、裸返回值包装都不用自己写,
+ * 与 plugin 作者面(`@tool-bridge/plugin-sdk`)同一套内核。
  */
-export interface DeviceTransport {
-  onConnection(handler: (conn: DeviceConn) => void): void
-}
-
-export interface DeviceConn {
-  readonly authorization?: string
-  close(code?: number): void
-  onClose(handler: () => void): void
-  onFrame(handler: (frame: unknown) => void): void
-  send(frame: unknown): void
-}
+export type ToolSource = OperationRegistry | ToolProviderLike
 
 /** createToolBridge 配置(标准签名 + SDK 引导扩展,后者见各字段注释)。 */
 export interface ToolBridgeConfig {
   /**
    * Admin SK 明文(引导时 sha256 入库,与 gateway TB_BOOTSTRAP_ADMIN_SK 同语义);
-   * 缺省取 env TB_BOOTSTRAP_ADMIN_SK;皆无 → 首次引导随机生成并 console.log 一次。
+   * 缺省取 env TB_BOOTSTRAP_ADMIN_SK；首次引导时两者皆无则拒绝启动。
    */
   adminSk?: string
   /** 放行 http:// 上游(仅本地开发)。 */
   allowInsecureHttp?: boolean
-  /** 设备 WS 的网关侧宿主;未注入则 device 能力禁用。当前注入 → unimplemented。 */
-  deviceTransport?: DeviceTransport
   /** secrets 缺省实现的主密钥(base64url 32B);缺省取 env TB_SECRET_ENCRYPTION_KEY。 */
   encryptionKey?: string
   /** 本实例 X-TB-Via 标识(缺省用入站 host 派生)。 */
@@ -58,6 +49,17 @@ export interface ToolBridgeConfig {
   maxHops?: number
   /** context 对象('r2' 平台 provider 的落点);缺省 → 该 provider unavailable。 */
   objects?: ObjectStore
+  /** 进程内插件装配表(binding 名 → fetch handler);`binding:<name>` 插件经此直调。 */
+  pluginBindings?: PluginBindings
+  /**
+   * 内置插件目录的 descriptor(编译期常量)。与 {@link pluginBindings} **同源装配** ——
+   * catalog 说"声明了什么"(挂载校验、选 export、列凭证字段),bindings 说"代码在哪"。
+   * 只给 bindings 的话插件调得动但解析不出 export。
+   *
+   * 装 `@tool-bridge/plugins` 的宿主直接传它的 `BUILTIN_CATALOG`;自建插件集的嵌入方
+   * 按同形状给自己那份。
+   */
+  pluginCatalog?: BuiltinCatalog
 
   // ---- 以下为 SDK 引导扩展(标准签名未列) ----
 
@@ -109,5 +111,5 @@ export interface ToolBridge {
   fetch(req: Request): Promise<Response>
   registerContext(path: TreePath, provider: ContextProvider, meta?: Partial<NodeInput>): void
   /** 程序化注册:本地实现 Provider 挂上树(等价 NodeRegistry.Write;写入延迟到首次 fetch/connect 前)。 */
-  registerTool(path: TreePath, provider: ToolProviderLike, meta?: Partial<NodeInput>): void
+  registerTool(path: TreePath, source: ToolSource, meta?: Partial<NodeInput>): void
 }

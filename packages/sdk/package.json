@@ -1,6 +1,6 @@
 {
   "name": "@tool-bridge/sdk",
-  "version": "0.4.0",
+  "version": "0.10.1",
   "description": "tool-bridge SDK: embed a TB instance (createToolBridge), register local providers, and connect to a remote gateway",
   "type": "module",
   "license": "MIT",
@@ -34,21 +34,21 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@cfworker/json-schema": "^4.1.1",
-    "@modelcontextprotocol/sdk": "^1.29.0",
-    "aws4fetch": "^1.0.20",
-    "hono": "^4.12.28",
-    "partysocket": "1.3.0",
-    "ws": "8.21.0"
+    "@cfworker/json-schema": "catalog:",
+    "aws4fetch": "catalog:",
+    "hono": "catalog:",
+    "partysocket": "catalog:",
+    "ws": "catalog:"
   },
   "devDependencies": {
-    "@hono/node-server": "^1.19.7",
+    "@hono/node-server": "catalog:",
+    "@tool-bridge/app": "workspace:*",
     "@tool-bridge/core": "workspace:*",
-    "@tool-bridge/gateway": "workspace:*",
-    "@types/node": "^26.1.0",
-    "@types/ws": "8.18.1",
-    "tsup": "^8.5.1",
-    "vitest": "^4.1.10"
+    "@types/node": "catalog:",
+    "@types/ws": "catalog:",
+    "tsup": "catalog:",
+    "vitest": "catalog:",
+    "zod": "catalog:"
   },
   "repository": {
     "type": "git",

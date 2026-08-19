@@ -1,11 +1,22 @@
-import { SecretStoreImpl, type StateStore } from '@tool-bridge/core'
+import {
+  createTbApp,
+  ensureBootstrapped,
+  parseS3Credentials,
+  type PluginBindings,
+  type RemoteSettings,
+  type TbAppDeps,
+} from '@tool-bridge/app'
+import {
+  type BuiltinCatalog,
+  normalizeCanonicalOrigin,
+  SecretStoreImpl,
+  type StateStore,
+} from '@tool-bridge/core'
 import { Hono } from 'hono'
-import type { RemoteSettings } from './providers/remote'
 import type { DeviceSession } from './deviceSession'
 import { createR2ObjectStore, type R2PresignCredentials } from './providers/r2Object'
-import { createTbApp, parseS3Credentials, type TbAppDeps } from './tbApp'
 import pkg from '../package.json' with { type: 'json' }
-import { ensureBootstrapped } from './bootstrap'
+import { D1SearchIndex } from './search/d1SearchIndex'
 import { KvStateStore } from './kvStateStore'
 
 /**
@@ -55,6 +66,8 @@ export interface Env {
   TB_REF_TTL_SEC?: string
   /** remote baseUrl 的 host 后缀白名单(逗号分隔;空 = 拒一切 remote)。 */
   TB_REMOTE_ALLOWLIST?: string
+  /** FTS5/trigram 工具搜索索引；发布包宿主未配置 binding 时不暴露 search capability。 */
+  TB_SEARCH?: D1Database
   TB_SECRET_ENCRYPTION_KEY?: string
   /** opt-in 集成测试:真实 MCP echo server 的 URL(仅测试注入)。 */
   TB_TEST_MCP_URL?: string
@@ -91,21 +104,6 @@ function remoteSettingsFromEnv(env: Env): RemoteSettings {
   }
 }
 
-/**
- * 规范 origin 解析:取 URL 的 origin 部分(丢弃 path/query),非法/缺省 → undefined。
- * 只接受 http/https,避免误配把 redirect_uri 钉到非法值。
- */
-function normalizeOrigin(value: string | undefined): string | undefined {
-  if (value === undefined || value.length === 0) return undefined
-  try {
-    const u = new URL(value)
-    if (u.protocol !== 'http:' && u.protocol !== 'https:') return undefined
-    return u.origin
-  } catch {
-    return undefined
-  }
-}
-
 /** 正整数 env 解析(TB_TOOL_CACHE_TTL / TB_REF_THRESHOLD_BYTES / TB_REF_TTL_SEC);非法/缺省 → undefined。 */
 function positiveIntEnv(value: string | undefined): number | undefined {
   const n = Number(value)
@@ -139,7 +137,7 @@ async function r2PresignCredentials(
   return undefined
 }
 
-/** Env → TbAppDeps(Workers 宿主适配:KV/R2/DO/Static Assets → 四注入点)。 */
+/** Env → TbAppDeps(Workers 宿主适配；D1 SearchIndex 是第五个宿主注入点)。 */
 function depsFromEnv(env: Env): TbAppDeps {
   const state: StateStore = new KvStateStore(env.TB_KV)
   const secrets = new SecretStoreImpl(state, env.TB_SECRET_ENCRYPTION_KEY)
@@ -156,8 +154,9 @@ function depsFromEnv(env: Env): TbAppDeps {
       ws: async (deviceId, request) => await env.TB_DEVICE.getByName(deviceId).fetch(request),
     },
   }
+  if (env.TB_SEARCH !== undefined) deps.search = new D1SearchIndex(env.TB_SEARCH)
   if (env.TB_SECRET_ENCRYPTION_KEY !== undefined) deps.encryptionKey = env.TB_SECRET_ENCRYPTION_KEY
-  const canonicalOrigin = normalizeOrigin(env.TB_CANONICAL_ORIGIN)
+  const canonicalOrigin = normalizeCanonicalOrigin(env.TB_CANONICAL_ORIGIN)
   if (canonicalOrigin !== undefined) deps.canonicalOrigin = canonicalOrigin
   const assets = env.ASSETS
   if (assets !== undefined) deps.assets = request => assets.fetch(request)
@@ -192,13 +191,32 @@ function depsFromEnv(env: Env): TbAppDeps {
 /**
  * Workers 入口的 Hono app。Workers 的 env 只在请求期可得,故每 isolate 按 env 惰性
  * 装配一次 tb app(env 对象在同一 isolate 内稳定,WeakMap 命中;跨 isolate 各自装配)。
+ *
+ * `opts.pluginBindings`:进程内插件装配表(构建期打包进 Worker 的插件集合按名直调)。
+ * 可以直接给一张表,也可以给一个 **`(env) => 表`** 的工厂 —— 后者是内置目录需要的形态:
+ * `builtinPluginBindings(env)` 要读 env(它内部按白名单收窄后递给插件),而 env 在
+ * `createApp()` 调用时还不存在。工厂与 app 一起按 env 缓存,每 isolate 只建一次。
+ *
+ * `opts.pluginCatalog`:那些插件的 descriptor(编译期常量,不读 env,故不需要工厂)。
+ * 与 bindings **应当同源装配** —— 只给 bindings 的话插件调得动但解析不出 export。
  */
-export function createApp(): Hono<{ Bindings: Env }> {
+export function createApp(
+  opts: {
+    pluginBindings?: PluginBindings | ((env: Env) => PluginBindings)
+    pluginCatalog?: BuiltinCatalog
+  } = {},
+): Hono<{ Bindings: Env }> {
   const apps = new WeakMap<Env, ReturnType<typeof createTbApp>>()
   const appFor = (env: Env): ReturnType<typeof createTbApp> => {
     let app = apps.get(env)
     if (app === undefined) {
-      app = createTbApp(depsFromEnv(env))
+      const bindings
+        = typeof opts.pluginBindings === 'function' ? opts.pluginBindings(env) : opts.pluginBindings
+      app = createTbApp({
+        ...depsFromEnv(env),
+        ...(bindings !== undefined ? { pluginBindings: bindings } : {}),
+        ...(opts.pluginCatalog !== undefined ? { pluginCatalog: opts.pluginCatalog } : {}),
+      })
       apps.set(env, app)
     }
     return app

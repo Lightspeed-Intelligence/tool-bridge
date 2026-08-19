@@ -1,0 +1,507 @@
+/**
+ * 工具层节点(mcp / http / tool)的 Provider 装配与工具集取用。
+ *
+ * 「取哪些工具」统一走 upstreamTools(mcp/tool 命中 toolcache + 搜索派生同步),
+ * 「找哪个 Provider」统一走 providerFor(SDK 进程内 > plugin export)。
+ * 注册面的 kind:'tool' 配置校验也在这里,保证挂载时即拒不可用的 provider。
+ */
+import {
+  type CallContext,
+  check,
+  type HelpModel,
+  isTBError,
+  NodeRegistryStore,
+  OAUTH_CLIENT_FIELDS,
+  parseCredentialValues,
+  type PluginExport,
+  type PluginManifest,
+  type PluginOAuth,
+  resolveIntegration,
+  TBError,
+  toolHelpModel,
+  type ToolSpec,
+  type TreeNode,
+  type TreePath,
+  virtualizeTools,
+} from '@tool-bridge/core'
+import type { UpstreamProvider } from './providers/types'
+import {
+  isMutableSearchIndex,
+  type SearchDirtyMarker,
+  SearchSynchronizer,
+} from './search/synchronizer'
+import { type AppContext, type TbAppDeps, TOOL_CACHE_TTL_DEFAULT } from './deps'
+import { assertNoDeviceMarker, deviceToolMarker } from './deviceNodes'
+import { createHttpProvider, type HttpConfig } from './providers/http'
+import { createMcpProvider, type McpConfig } from './providers/mcp'
+import { createPluginToolProvider } from './providers/pluginTool'
+import { resolveProviderAccessToken } from './providerOAuth'
+import { getTools } from './providers/toolCache'
+
+/** 取上游工具集:mcp/tool 走 `toolcache:<path>` 缓存(TTL + refresh);http 从 config 直接生成。 */
+export function upstreamTools(
+  node: TreeNode,
+  provider: UpstreamProvider,
+  deps: TbAppDeps,
+  refresh: boolean,
+  now: string,
+): Promise<ToolSpec[]> {
+  if (node.kind === 'mcp' || node.kind === 'tool') {
+    const sync = isMutableSearchIndex(deps.search)
+      ? new SearchSynchronizer(deps.state, deps.search)
+      : undefined
+    let marker: SearchDirtyMarker | undefined
+    return getTools(deps.state, node.path, () => provider.list(), {
+      refresh,
+      ttl: deps.toolCacheTtlSec ?? TOOL_CACHE_TTL_DEFAULT,
+      now,
+      ...(sync === undefined
+        ? {}
+        : {
+            beforeFresh: async () => {
+              marker = await sync.markNode(node.path)
+            },
+            onFreshError: async () => await sync.abort(marker),
+            onFresh: async tools => await sync.reconcileNodeQuietly(node.path, { marker, tools }),
+          }),
+    })
+  }
+  return provider.list()
+}
+// ---------- plugin 挂载消费 ----------
+
+/**
+ * 取已注册且启用的 plugin,并选出挂载目标 export(plugin/v2)。
+ *
+ * v1 用 manifest.kind 判「这个 plugin 是不是我要的类型」;v2 的类型属于 **export**,
+ * 故改为:取 manifest(存在 + 启用)→ 取注册时缓存的 `~describe` → 按挂载配置的
+ * `config.export` 与节点 kind 选出唯一 export(单 export 可省略;多 export 必须显式,
+ * 见 core resolvePluginExport)。不存在/禁用 → invalid_argument(不泄露更多)。
+ */
+/**
+ * 解析挂载目标 export:**内置目录(编译期常量)+ 注册记录(external),两条路都只读**。
+ *
+ * 第一参收 `Pick<TbAppDeps, 'pluginCatalog' | 'state'>`,而 `resolveIntegration` 只吃
+ * {@link ReadOnlyStore}(只有 `get`)—— 于是这个函数**结构上写不了库**。内置 descriptor
+ * 直接来自 catalog，读路径不创建注册状态。
+ */
+export async function requirePluginExport(
+  from: Pick<TbAppDeps, 'pluginCatalog' | 'state'>,
+  id: string,
+  nodeKind: 'tool' | 'context',
+  what: 'context' | 'tool',
+  exportId?: string,
+): Promise<{ export: PluginExport, manifest: PluginManifest }> {
+  const resolved = await resolveIntegration(
+    from.state,
+    from.pluginCatalog ?? {},
+    id,
+    nodeKind,
+    what,
+    exportId,
+  )
+  return { manifest: resolved.manifest, export: resolved.export }
+}
+
+/**
+ * plugin 调用的挂载上下文:同一 plugin 可多路径挂载,envelope 里带 mountPath 与
+ * 挂载节点的 providerConfig(mountConfig)供 plugin 区分挂载来源;老 plugin 按
+ * "未知字段忽略"原则不受影响。
+ */
+export function mountCallContext(
+  ctx: CallContext,
+  mountPath: TreePath,
+  providerConfig: Record<string, unknown> | undefined,
+  exportId?: string,
+): CallContext {
+  return {
+    ...ctx,
+    mountPath,
+    ...(providerConfig !== undefined ? { mountConfig: providerConfig } : {}),
+    // v2 多 export:plugin 据此把调用路由到正确的 export。
+    ...(exportId !== undefined ? { exportId } : {}),
+  }
+}
+
+/**
+ * plugin export 的挂载配置权威校验。CLI/Dashboard 的表单校验只改善体验,不能成为安全边界:
+ * 直接调用 registry/~register 也必须得到同样的接受/拒绝结果。
+ */
+export async function assertPluginMountContract(
+  exported: PluginExport,
+  config: { authRef?: unknown, providerConfig?: Record<string, unknown> },
+  deps: Pick<TbAppDeps, 'secrets'>,
+): Promise<void> {
+  const providerConfig = config.providerConfig ?? {}
+  const missingConfig = (exported.mountConfigFields ?? [])
+    .filter((field) => {
+      if (field.required !== true) return false
+      const value = providerConfig[field.key]
+      return value === undefined || value === null || (typeof value === 'string' && value.trim() === '')
+    })
+    .map(field => field.key)
+  if (missingConfig.length > 0) {
+    throw new TBError(
+      'invalid_argument',
+      `plugin export '${exported.id}' 缺少必填 providerConfig:${missingConfig.join(', ')}`,
+    )
+  }
+
+  const authRef = typeof config.authRef === 'string' && config.authRef.trim() !== ''
+    ? config.authRef.trim()
+    : undefined
+  if (exported.auth?.kind === 'none') {
+    if (authRef !== undefined) {
+      throw new TBError(
+        'invalid_argument',
+        `plugin export '${exported.id}' 声明 auth:none,不得绑定 authRef`,
+      )
+    }
+    return
+  }
+
+  const requiresAuth = exported.oauth !== undefined
+    || exported.credentialFields !== undefined
+    || (exported.auth?.kind === 'single' && exported.auth.required === true)
+  if (requiresAuth && authRef === undefined) {
+    throw new TBError(
+      'invalid_argument',
+      `plugin export '${exported.id}' 需要 authRef`,
+    )
+  }
+  if (authRef === undefined) return
+
+  const raw = await deps.secrets.resolve(authRef)
+  if (raw === undefined) {
+    throw new TBError('invalid_argument', `secret '${authRef}' 不存在或无法解密`)
+  }
+  if (exported.credentialFields !== undefined) {
+    parseCredentialValues(raw, exported.credentialFields)
+  } else if (exported.oauth !== undefined) {
+    parseCredentialValues(raw, [...OAUTH_CLIENT_FIELDS])
+  }
+}
+
+/**
+ * OAuth 托管挂载的 access token 取法(调用期)。过期由 resolveProviderAccessToken 内部刷新;
+ * 缺 encryptionKey 时 fail closed —— state 密封与令牌保管都要它。
+ */
+async function providerAccessTokenFor(opts: {
+  authRef: string
+  config: PluginOAuth
+  deps: TbAppDeps
+  /** 调用方收到上游 401:不看过期时刻,强制刷新一次。 */
+  force?: boolean
+  nodePath: TreePath
+}): Promise<string> {
+  const encryptionKey = opts.deps.encryptionKey
+  if (encryptionKey === undefined) {
+    throw new TBError('unavailable', 'OAuth 托管需要 TB_SECRET_ENCRYPTION_KEY', { retryable: false })
+  }
+  return await resolveProviderAccessToken({
+    authRef: opts.authRef,
+    config: opts.config,
+    encryptionKey,
+    ...(opts.force === true ? { force: true } : {}),
+    fetcher: fetch,
+    nodePath: opts.nodePath,
+    now: new Date(),
+    // 调用期不需要 origin(只在构造授权 URL 时用);传空串会被 buildAuthorizationUrl 用到,
+    // 而这条路径只走刷新,不构造授权 URL。
+    origin: opts.deps.canonicalOrigin ?? '',
+    secrets: opts.deps.secrets,
+    store: opts.deps.state,
+  })
+}
+
+/** 为 mcp/http/tool 节点构造对应 Provider(其余 kind 无 Provider → unimplemented)。 */
+export async function providerFor(
+  node: TreeNode,
+  ctx: CallContext,
+  deps: TbAppDeps,
+): Promise<UpstreamProvider> {
+  const insecure = deps.allowInsecureHttp
+  if (node.kind === 'mcp' && node.config?.kind === 'mcp') {
+    return createMcpProvider(node.config as McpConfig, deps.secrets, {
+      allowInsecure: insecure,
+      // 个人凭证覆盖:节点标了 credentialDomain 且调用方在该域配了个人 token 时,注入个人 token
+      // 覆盖节点默认 authRef(见 providers/mcp.ts makeAuth 与 core/builtin/usercred)。
+      callerOwner: ctx.owner,
+      // era 判定存 StateStore(mcpera:<path>);调用结果不缓存(providers/mcp.ts)。
+      session: { store: deps.state, nodePath: node.path },
+      // auth:'oauth' 节点的托管凭证存取面(mcpoauth:*);密钥缺省 → provider 内报 unavailable。
+      ...(deps.encryptionKey !== undefined
+        ? { oauth: { store: deps.state, encryptionKey: deps.encryptionKey } }
+        : {}),
+    })
+  }
+  if (node.kind === 'http' && node.config?.kind === 'http') {
+    return createHttpProvider(node.config as HttpConfig, deps.secrets, { allowInsecure: insecure })
+  }
+  if (node.kind === 'tool' && node.config?.kind === 'tool') {
+    // SDK 进程内工具源(registerTool):按节点路径查本实例表,先于 plugin 解析。
+    const local = deps.locals?.tool?.(node.path)
+    if (local !== undefined) return local
+    // plugin 工具源:provider = 已注册 tool-provider plugin 的 id。
+    const { manifest, export: exported } = await requirePluginExport(
+      // deps 而不是 deps.state:内置 binding 插件未注册时在这里自动补齐(免手工注册)。
+      deps,
+      node.config.provider,
+      'tool',
+      'tool',
+      node.config.export,
+    )
+    const oauthAuthRef = node.config.authRef
+    return createPluginToolProvider({
+      manifest,
+      secrets: deps.secrets,
+      ctx: mountCallContext(ctx, node.path, node.config.providerConfig, exported.id),
+      // 挂载 authRef = 上游凭证引用,平台代解析经 X-TB-Upstream-Auth 注入。
+      ...(node.config.authRef !== undefined ? { upstreamAuthRef: node.config.authRef } : {}),
+      // export 声明了 oauth:注入的是平台换来并按需刷新的 access token,而不是 secret
+      // (那里存 client 凭证)。取代上面的 secret 解析。
+      ...(exported.oauth !== undefined && oauthAuthRef !== undefined
+        ? {
+            resolveUpstreamAuth: callOpts => providerAccessTokenFor({
+              authRef: oauthAuthRef,
+              config: exported.oauth!,
+              deps,
+              nodePath: node.path,
+              ...(callOpts?.force === true ? { force: true } : {}),
+            }),
+          }
+        : {}),
+      ...(deps.pluginBindings !== undefined ? { bindings: deps.pluginBindings } : {}),
+    })
+  }
+  throw TBError.unimplemented(`kind '${node.kind}' has no tool provider`)
+}
+
+/** 注册变更后主动 materialize 动态工具表；失败时保留 dirty marker，由后续 fresh list 修复。 */
+export async function refreshDynamicSearchNode(
+  node: TreeNode,
+  ctx: CallContext,
+  deps: TbAppDeps,
+): Promise<boolean> {
+  if ((node.kind !== 'mcp' && node.kind !== 'tool') || deviceToolMarker(node) !== null) return false
+  try {
+    const provider = await providerFor(node, ctx, deps)
+    await upstreamTools(node, provider, deps, true, new Date().toISOString())
+    return true
+  } catch {
+    // Canonical registry mutation remains successful; marker keeps derived search repairable.
+    return false
+  }
+}
+
+export async function refreshDynamicToolCache(
+  node: TreeNode,
+  ctx: CallContext,
+  deps: TbAppDeps,
+): Promise<void> {
+  if ((node.kind !== 'mcp' && node.kind !== 'tool') || deviceToolMarker(node) !== null) return
+  const provider = await providerFor(node, ctx, deps)
+  await getTools(deps.state, node.path, () => provider.list(), {
+    refresh: true,
+    ttl: deps.toolCacheTtlSec ?? TOOL_CACHE_TTL_DEFAULT,
+    now: new Date().toISOString(),
+  })
+}
+
+/**
+ * 工具级 `~help`(两级披露的细节级):path 非注册节点时,最长前缀 resolve 命中
+ * mcp/http 节点且 rest 恰为一段(工具虚拟名)→ 单工具全量 HelpModel。工具集取自与节点级
+ * 相同的缓存(getTools),不额外打上游。不匹配/工具不存在 → null(调用方 404)。
+ * 可见性与列表面一致(read+call;deny==not_found 不泄露存在性)。
+ */
+export async function toolHelpModelFor(
+  c: AppContext,
+  ctx: CallContext,
+  registry: NodeRegistryStore,
+  path: TreePath,
+  deps: TbAppDeps,
+): Promise<HelpModel | null> {
+  let resolved: { node: TreeNode, rest: string }
+  try {
+    resolved = await registry.resolve(path)
+  } catch {
+    return null
+  }
+  const { node, rest } = resolved
+  if (
+    (node.kind !== 'mcp' && node.kind !== 'http' && node.kind !== 'tool')
+    || node.config === undefined
+  ) {
+    return null
+  }
+  if (rest === '' || rest.includes('/')) return null
+  if (!check(ctx, node.path, 'read').allow || !check(ctx, node.path, 'call').allow) return null
+  // device 自定义 tool 节点:工具表来自注册时缓存的 providerConfig.cmds,不打设备。
+  const marker = deviceToolMarker(node)
+  if (marker !== null) {
+    const cached = (marker.cmds ?? []).find(t => t.name === rest)
+    if (cached === undefined) return null
+    return toolHelpModel(node.path, { kind: node.kind, description: node.description }, cached)
+  }
+  const provider = await providerFor(node, ctx, deps)
+  const refresh = c.req.query('refresh') === '1'
+  const raw = await upstreamTools(node, provider, deps, refresh, new Date().toISOString())
+  const { exposed } = virtualizeTools(node.virtualize, raw)
+  const tool = exposed.find(t => t.name === rest)
+  if (tool === undefined) return null
+  return toolHelpModel(node.path, { kind: node.kind, description: node.description }, tool)
+}
+/**
+ * 核验探针工具的形状:必须存在、只读、且无必填入参。
+ *
+ * 这三条是 `credentialProbe` 的语义前提(见 core 契约里的注释),但契约层只校验了"是个
+ * 字符串" —— 声明与实际不符时,后果分别是:不存在 → 调用被拒却报成凭证问题;
+ * 非只读 → 每次挂载都产生业务副作用;有必填入参 → 被 Zod 拒且错误说"稍后重试"。
+ *
+ * 违规一律 `invalid_argument`:这是**插件的声明错误**,不是这次挂载的凭证有问题,
+ * 消息要指向 plugin 作者而非运维。
+ */
+function assertProbeShape(tools: readonly ToolSpec[], probe: string, exportId: string): void {
+  const spec = tools.find(tool => tool.name === probe)
+  if (spec === undefined) {
+    throw new TBError(
+      'invalid_argument',
+      `plugin export '${exportId}' 声明的 credentialProbe '${probe}' 不在其工具表里`,
+    )
+  }
+  if (spec.effect !== 'read') {
+    throw new TBError(
+      'invalid_argument',
+      `credentialProbe '${probe}' 的 effect 是 '${spec.effect ?? '未声明'}';`
+      + '探针必须是 read —— 平台会在每次挂载时真实调用它',
+    )
+  }
+  const required = (spec.inputSchema as { required?: unknown } | undefined)?.required
+  if (Array.isArray(required) && required.length > 0) {
+    throw new TBError(
+      'invalid_argument',
+      `credentialProbe '${probe}' 有必填入参(${required.join('、')});`
+      + '探针会被空参调用,必须无必填字段',
+    )
+  }
+}
+
+/**
+ * 用挂载配置的 authRef 真实调一次探针工具,验证凭证可用。
+ *
+ * 为什么值得在挂载时多跑一次调用:平台的凭证是 `tb secret set` 存进 SecretStore、挂载只写
+ * authRef,插件要到**第一次业务调用**才拿得到它 —— 配错的 key 不会在存入或挂载时报错,
+ * 而是等某个 agent 真去用的时候才 401。上游 open-connector 每个 provider 都带
+ * `credentialValidators` 正是为此。
+ *
+ * 错误分账很重要:凭证类错误(401/403)→ invalid_argument,是**这次挂载**的错,当场拒;
+ * 其余(上游临时故障、网络)→ unavailable + retryable,不该因为上游抖动就永久拒绝挂载。
+ */
+async function probePluginCredential(opts: {
+  authRef: string
+  ctx: CallContext
+  deps: TbAppDeps
+  export: PluginExport
+  manifest: PluginManifest
+  mountPath: TreePath
+  providerConfig: Record<string, unknown> | undefined
+}): Promise<void> {
+  const probe = opts.export.credentialProbe
+  if (probe === undefined) return
+  const provider = createPluginToolProvider({
+    manifest: opts.manifest,
+    secrets: opts.deps.secrets,
+    ctx: mountCallContext(opts.ctx, opts.mountPath, opts.providerConfig, opts.export.id),
+    // OAuth 挂载:authRef 指向的 secret 存的是 **client 凭证**,不是上游凭证。直接把它当
+    // upstreamAuthRef 传下去,插件就会收到 clientSecret 明文 —— 那是凭证泄漏,不是探测。
+    // OAuth 的凭证可用性由授权流程本身证明(拿不到 token 就走不完),不需要也不能在这里探。
+    ...(opts.export.oauth === undefined ? { upstreamAuthRef: opts.authRef } : {}),
+    ...(opts.deps.pluginBindings !== undefined ? { bindings: opts.deps.pluginBindings } : {}),
+  })
+  // 先从 List 核验探针的两个前提。契约只校验了"是个字符串",而挂载会**真调它** ——
+  // 声明成 `send_message` / `delete_index` 就是每次挂载都产生业务副作用;带必填入参则会被
+  // Zod 拒,而下面的 catch 把非 permission 类一律归成 retryable,于是"永久拒绝挂载"却说
+  // "稍后重试"。114 个产物靠迁移期人工评审还看得住,1000 个看不住 —— 平台反正要 List。
+  let tools: ToolSpec[]
+  try {
+    tools = await provider.list()
+  } catch (err) {
+    const detail = isTBError(err) ? err.message : String(err)
+    throw new TBError('unavailable', `凭证探测未能列出工具:${detail}`, { retryable: true })
+  }
+  assertProbeShape(tools, probe, opts.export.id)
+
+  try {
+    await provider.call(probe, {})
+  } catch (err) {
+    if (isTBError(err) && (err.code === 'permission_denied' || err.httpStatus === 401)) {
+      throw new TBError(
+        'invalid_argument',
+        `凭证探测失败:secret '${opts.authRef}' 对 plugin '${opts.manifest.id}' 不可用(${err.message})`,
+      )
+    }
+    const detail = isTBError(err) ? err.message : String(err)
+    throw new TBError('unavailable', `凭证探测未能完成:${detail}`, { retryable: true })
+  }
+}
+
+/**
+ * 注册/更新 kind:'tool' 节点时的配置校验(注册时即拒):
+ * provider 必须是已注册且启用的 tool-provider plugin(SDK 保留 id '@local' 由
+ * SDK 内部注册通道落库,不经注册面)。
+ *
+ * export 声明了 `credentialProbe` 且挂载配了 `authRef` 时,额外用该凭证真实调一次探针工具
+ * (见 credentialProbe 的语义)。这是 context 侧 s3 浅 list 连通探测在 tool 侧的对应物。
+ */
+export async function assertToolConfig(
+  config: unknown,
+  deps: TbAppDeps,
+  ctx?: CallContext,
+  mountPath?: TreePath,
+): Promise<void> {
+  if (config === null || typeof config !== 'object') return
+  if ((config as { kind?: unknown }).kind !== 'tool') return
+  assertNoDeviceMarker(config)
+  const provider = (config as { provider?: unknown }).provider
+  if (typeof provider !== 'string' || provider === '') {
+    throw new TBError('invalid_argument', 'kind:\'tool\' 节点需要 config.provider(plugin id)')
+  }
+  const exportId = (config as { export?: unknown }).export
+  const { manifest, export: exported } = await requirePluginExport(
+    deps,
+    provider,
+    'tool',
+    'tool',
+    typeof exportId === 'string' ? exportId : undefined,
+  )
+
+  const authRef = (config as { authRef?: unknown }).authRef
+  await assertPluginMountContract(
+    exported,
+    config as { authRef?: unknown, providerConfig?: Record<string, unknown> },
+    deps,
+  )
+
+  if (
+    exported.credentialProbe === undefined
+    || typeof authRef !== 'string'
+    || ctx === undefined
+    || mountPath === undefined
+    // OAuth 挂载不探针:那个 secret 存的是 client 凭证而非上游凭证,拿它去调用既证明不了
+    // 什么、又会把 clientSecret 送进插件。凭证可用性由 `~authorize` 流程本身证明。
+    || exported.oauth !== undefined
+  ) {
+    return
+  }
+  await probePluginCredential({
+    authRef,
+    ctx,
+    deps,
+    export: exported,
+    manifest,
+    // 用**目标挂载路径**而非空串:节点此刻还没落库,但探针在语义上就属于这次挂载,
+    // 插件侧据此区分挂载来源(ctx.mountPath);空串还会被 CallContext 的非空校验拒掉。
+    mountPath,
+    providerConfig: (config as { providerConfig?: Record<string, unknown> }).providerConfig,
+  })
+}

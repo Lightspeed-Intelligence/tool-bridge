@@ -54,48 +54,10 @@ declare const crypto: {
 declare const TextEncoder: { new (): { encode(input: string): Uint8Array } }
 declare const TextDecoder: { new (): { decode(input: ArrayBuffer | Uint8Array): string } }
 
-// ---------- base64url 编解码(手写:不依赖 Buffer / btoa / atob) ----------
+// ---------- base64url 编解码(统一实现见 encoding/base64url,经 index 重导出保持公开面) ----------
 
-const B64URL_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'
-
-/** 字节序列 → base64url(无填充)。 */
-export function base64urlEncode(bytes: Uint8Array): string {
-  let out = ''
-  for (let i = 0; i < bytes.length; i += 3) {
-    const b0 = bytes[i] ?? 0
-    const hasB1 = i + 1 < bytes.length
-    const hasB2 = i + 2 < bytes.length
-    const b1 = bytes[i + 1] ?? 0
-    const b2 = bytes[i + 2] ?? 0
-    out += B64URL_ALPHABET.charAt(b0 >> 2)
-    out += B64URL_ALPHABET.charAt(((b0 & 0x03) << 4) | (b1 >> 4))
-    if (!hasB1) break
-    out += B64URL_ALPHABET.charAt(((b1 & 0x0f) << 2) | (b2 >> 6))
-    if (!hasB2) break
-    out += B64URL_ALPHABET.charAt(b2 & 0x3f)
-  }
-  return out
-}
-
-/** base64url → 字节序列;遇非法字符抛错(供主密钥格式校验)。 */
-export function base64urlDecode(input: string): Uint8Array {
-  const bytes: number[] = []
-  let buffer = 0
-  let bits = 0
-  for (const ch of input) {
-    const val = B64URL_ALPHABET.indexOf(ch)
-    if (val === -1) {
-      throw new Error(`base64urlDecode: invalid character ${JSON.stringify(ch)}`)
-    }
-    buffer = (buffer << 6) | val
-    bits += 6
-    if (bits >= 8) {
-      bits -= 8
-      bytes.push((buffer >> bits) & 0xff)
-    }
-  }
-  return new Uint8Array(bytes)
-}
+export { base64urlDecode, base64urlEncode } from '../encoding/base64url'
+import { base64urlDecode, base64urlEncode } from '../encoding/base64url'
 
 // ---------- 存储记录形状 ----------
 
@@ -245,8 +207,10 @@ export class SecretStoreImpl {
    *
    * **仅供网关内部 Provider 解析引用名(authRef/skRef/secretRef);不暴露为节点 cmd**
    * (节点面只有 Set/List/Delete,resolve 不是 cmd)。
-   * unavailable 态 → 返回 undefined:主密钥缺失时无从解密,与"引用名不存在"同样处理为不可解析,
-   * 由 Provider 侧降级(避免在数据面抛 unavailable)。
+   * unavailable 态(主密钥缺失)同样返回 undefined——本层不区分"无从解密"与"引用名不存在"。
+   * **消费侧契约:配置声明了引用却拿到 undefined 必须 fail closed**(抛 unavailable),
+   * 不得降级为无凭证/匿名出站——上游可能据此当匿名放行或返回误导性结果。
+   * 各 Provider(remote/mcp/http/pluginClient)均按此实现。
    */
   async resolve(name: string): Promise<string | undefined> {
     if (this.keyBytes === undefined) {

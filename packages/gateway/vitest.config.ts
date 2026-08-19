@@ -1,18 +1,21 @@
 import { cloudflareTest } from '@cloudflare/vitest-pool-workers'
 import { execSync } from 'node:child_process'
 import { defineConfig } from 'vitest/config'
-import { existsSync } from 'node:fs'
 import { TEST_ADMIN_SK, TEST_ENCRYPTION_KEY } from './test/fixtures'
 
-// wrangler.jsonc 的 assets.directory 指向 dashboard 构建产物;目录缺失时 miniflare
-// 无法起 assets worker——冷启动(fresh clone / dist 被清)时就地构建一次。
-if (!existsSync('../dashboard/dist/index.html')) {
-  execSync('pnpm --filter @tool-bridge/dashboard build', { stdio: 'inherit' })
-}
+// wrangler.jsonc 的 assets.directory 指向 dashboard 构建产物。每次测试都从当前
+// tracked source 重建，避免工作树里的 stale dist 让 UI 接线断言假绿。
+execSync('pnpm --filter @tool-bridge/dashboard build', { stdio: 'inherit' })
 
 // 集成测试跑在真实 workerd 里。vitest-pool-workers 0.18(vitest 4)已改为
 // Vite 插件形态:cloudflareTest(...) 取代旧的 test.poolOptions.workers。
 // 从 wrangler.jsonc 读取 main 与 KV/R2 绑定,由 miniflare 起本地实例,SELF.fetch 打进 Worker。
+//
+// **这套只覆盖 CF 宿主适配那一层**:DeviceSession DO 与 WS hibernation、真实 D1、
+// R2/KV binding、Static Assets,以及靠 env binding 开关的 opt-in 路径。HTBP 树本身
+// 的行为(路由/权限/内容协商/plugin/OAuth/搜索联动)在 `packages/app` 的 Node 套件里,
+// 直打 createTbApp 不经宿主适配器——那批用例过去在这里跑,workerd 并没给它们买到
+// 任何保真度,只买到了启动开销。
 //
 // 测试用 vars 经 miniflare.bindings 注入(不依赖 .dev.vars,保证测试确定性):
 // - TB_SECRET_ENCRYPTION_KEY:32 字节 base64url,secret 能力可用;

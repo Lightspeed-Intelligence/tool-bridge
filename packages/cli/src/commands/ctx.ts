@@ -9,8 +9,8 @@ import {
   withGlobalOpts,
   withPageOpts,
 } from '../args'
+import { deleteNode, parseConfigSpecs, registerNode } from '../registry'
 import { asArray, guard, printJson, printLine, table } from '../output'
-import { deleteNode, registerNode } from '../registry'
 import { callTool, CliError } from '../http'
 
 /**
@@ -356,20 +356,33 @@ export function ctxMountCommand(): Command {
     .requiredOption('--provider <provider>', 'Provider: r2 | s3 | <context-provider plugin id>')
     .option('--description <desc>', 'One-line node description (default: auto-generated)')
     .option('--auth-ref <ref>', 'SecretStore credential ref ([s3] required; [plugin] optional)')
+    .option(
+      '--export <id>',
+      '[plugin] plugin export to mount (required when the plugin declares more than one)',
+    )
     .option('--read-only', 'Reject write verbs (Write/Update/Delete)')
     .option('--ttl <seconds>', 'Node TTL in seconds (expired node is reclaimed)')
     .option('--prefix <prefix>', '[r2/s3] key prefix inside the bucket')
     .option('--endpoint <url>', '[s3] S3-compatible endpoint URL')
     .option('--bucket <bucket>', '[s3] bucket name')
     .option('--region <region>', '[s3] region')
+    .option(
+      '--config <key=value>',
+      '[plugin] non-secret provider config, e.g. baseUrl/workspace (repeatable; '
+      + 'secrets belong in --auth-ref)',
+      collect,
+      [],
+    )
     .action(
       async (
         pathArg: string,
         opts: GlobalOpts & {
           authRef?: string
           bucket?: string
+          config: string[]
           description?: string
           endpoint?: string
+          export?: string
           prefix?: string
           provider: string
           readOnly?: boolean
@@ -391,6 +404,9 @@ export function ctxMountCommand(): Command {
             if (opts.endpoint || opts.bucket || opts.region || authRef) {
               throw new CliError('--endpoint/--bucket/--region/--auth-ref only apply to s3')
             }
+            if (opts.config.length > 0) {
+              throw new CliError('--config only applies to plugin providers')
+            }
             if (prefix) providerConfig = { prefix }
           } else if (provider === 's3') {
             const endpoint = String(opts.endpoint ?? '').trim()
@@ -398,6 +414,9 @@ export function ctxMountCommand(): Command {
             const bucket = String(opts.bucket ?? '').trim()
             if (!bucket) throw new CliError('--bucket is required for --provider s3')
             if (!authRef) throw new CliError('--auth-ref is required for --provider s3')
+            if (opts.config.length > 0) {
+              throw new CliError('--config only applies to plugin providers')
+            }
             providerConfig = {
               endpoint,
               bucket,
@@ -410,11 +429,18 @@ export function ctxMountCommand(): Command {
                 '--endpoint/--bucket/--region/--prefix are not supported for plugin providers',
               )
             }
+            // plugin context 的非密钥挂载配置(baseUrl / workspace 之类)。
+            providerConfig = parseConfigSpecs(opts.config)
           }
 
+          const exportId = String(opts.export ?? '').trim()
+          if (exportId && (provider === 'r2' || provider === 's3')) {
+            throw new CliError('--export only applies to plugin providers')
+          }
           const config: NodeConfig = {
             kind: 'context',
             provider,
+            ...(exportId ? { export: exportId } : {}),
             ...(providerConfig ? { providerConfig } : {}),
             ...(authRef ? { authRef } : {}),
             ...(opts.readOnly ? { readOnly: true } : {}),

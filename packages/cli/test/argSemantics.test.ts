@@ -278,13 +278,13 @@ describe('条件参数与挂载语义', () => {
     })
   })
 
-  it('server add 旧 --base-url 远端写法会给出可执行迁移提示', async () => {
+  it('server add 缺 --remote-url 时给出当前参数说明', async () => {
     const fn = jsonFetch({})
     await runCli(['server', 'add', 'fed/team', '--base-url', 'https://old-remote', '--json'])
     expect(fn).not.toHaveBeenCalled()
     expect(JSON.parse(stdoutText())).toMatchObject({
       ok: false,
-      error: expect.stringContaining('--base-url now selects the gateway'),
+      error: expect.stringContaining('--base-url selects the gateway'),
     })
     expect(JSON.parse(stdoutText()).error).toContain('--remote-url')
     expect(process.exitCode).toBe(1)
@@ -411,5 +411,65 @@ describe('条件参数与挂载语义', () => {
     await runCli(['status', '--base-url', 'https://gw', '--timeout', '0.001', '--json'])
     expect(fn).toHaveBeenCalledOnce()
     expect(process.exitCode).toBe(0)
+  })
+})
+
+// Plugin v2 多 export:挂载须能指定 export,否则多 export plugin 只能走 `tb call` 旁路
+// (= 管理旁路,违反三入口对等)。
+describe('plugin export 挂载参数(v2)', () => {
+  const gw = ['--base-url', 'https://gw', '--sk', 'admin', '--json']
+
+  /** 取最后一次请求的 JSON body(挂载走 ~register)。 */
+  function lastBody(fn: ReturnType<typeof vi.fn>): Record<string, unknown> {
+    const call = fn.mock.calls.at(-1)
+    const init = call?.[1] as RequestInit | undefined
+    return JSON.parse(String(init?.body)) as Record<string, unknown>
+  }
+
+  it('tool mount --export 进 config.export', async () => {
+    const fn = jsonFetch({ ok: true })
+    await runCli([
+      'tool', 'mount', 'feishu',
+      '--kind', 'tool',
+      '--provider', 'feishu',
+      '--export', 'actions',
+      '--description', 'feishu actions',
+      ...gw,
+    ])
+    const config = lastBody(fn).config as { export?: string, provider?: string }
+    expect(config.provider).toBe('feishu')
+    expect(config.export).toBe('actions')
+  })
+
+  it('ctx mount --export 进 config.export', async () => {
+    const fn = jsonFetch({ ok: true })
+    await runCli([
+      'ctx', 'mount', 'docs',
+      '--provider', 'feishu',
+      '--export', 'documents',
+      '--description', 'feishu docs',
+      ...gw,
+    ])
+    const config = lastBody(fn).config as { export?: string }
+    expect(config.export).toBe('documents')
+  })
+
+  it('--export 对 r2/s3 无意义 → 本地拒绝,不发请求', async () => {
+    const fn = jsonFetch({ ok: true })
+    await runCli([
+      'ctx', 'mount', 'docs', '--provider', 'r2', '--export', 'x', '--description', 'd', ...gw,
+    ])
+    expect(fn).not.toHaveBeenCalled()
+    expect(process.exitCode).toBe(1)
+  })
+
+  it('--export 不适用于 mcp 工具源 → 本地拒绝,不发请求', async () => {
+    const fn = jsonFetch({ ok: true })
+    await runCli([
+      'tool', 'mount', 'up', '--kind', 'mcp', '--url', 'https://x.test/mcp',
+      '--export', 'x', '--description', 'd', ...gw,
+    ])
+    expect(fn).not.toHaveBeenCalled()
+    expect(process.exitCode).toBe(1)
   })
 })

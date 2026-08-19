@@ -8,14 +8,14 @@
  */
 
 import type * as http from 'node:http'
-import { createTbApp, type TbAppDeps } from '@tool-bridge/gateway/tbApp'
-import { runBootstrap } from '@tool-bridge/gateway/bootstrap'
+import { createTbApp, runBootstrap, type TbAppDeps } from '@tool-bridge/app'
 import { serve, type ServerType } from '@hono/node-server'
 import { SecretStoreImpl } from '@tool-bridge/core'
 import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import type { ServerConfig } from './config'
 import pkg from '../package.json' with { type: 'json' }
+import { SqliteSearchIndex } from './sqliteSearchIndex'
 import { SqliteStateStore } from './sqliteStateStore'
 import { createDataObjectStore } from './objects'
 import { resolveUiAssets } from './assets'
@@ -25,6 +25,7 @@ export interface TbServer {
   app: ReturnType<typeof createTbApp>
   close(): Promise<void>
   deviceHub: DeviceHub
+  search: SqliteSearchIndex
   /** 引导(幂等)+ 孤儿设备回收排程 + 监听;返回实际端口(config.port=0 时由系统分配)。 */
   start(): Promise<{ port: number }>
   state: SqliteStateStore
@@ -32,21 +33,38 @@ export interface TbServer {
 
 export function createTbServer(config: ServerConfig): TbServer {
   mkdirSync(config.dataDir, { recursive: true })
-  const state = new SqliteStateStore(join(config.dataDir, 'state.sqlite3'))
+  const dbPath = join(config.dataDir, 'state.sqlite3')
+  const state = new SqliteStateStore(dbPath)
+  let search: SqliteSearchIndex
+  try {
+    search = new SqliteSearchIndex(dbPath)
+  } catch (error) {
+    state.close()
+    throw error
+  }
   const secrets = new SecretStoreImpl(state, config.encryptionKey)
   const objects = createDataObjectStore(config.dataDir)
-  const hub = new DeviceHub({ store: state, reclaimSec: config.deviceReclaimSec })
+  const hub = new DeviceHub({
+    store: state,
+    search,
+    reclaimSec: config.deviceReclaimSec,
+  })
 
   const deps: TbAppDeps = {
     state,
     secrets,
     version: pkg.version,
     remote: config.remote,
+    search,
     allowInsecureHttp: config.allowInsecureHttp,
     objects: () => objects,
     device: hub,
   }
   if (config.encryptionKey !== undefined) deps.encryptionKey = config.encryptionKey
+  if (config.pluginBindings !== undefined) deps.pluginBindings = config.pluginBindings
+  if (config.pluginCatalog !== undefined) deps.pluginCatalog = config.pluginCatalog
+  // 规范 origin(与 Workers app.ts 对等):给出即钉死 OAuth redirect_uri。
+  if (config.canonicalOrigin !== undefined) deps.canonicalOrigin = config.canonicalOrigin
   const assets = resolveUiAssets(config.uiDir)
   if (assets !== undefined) deps.assets = assets
   if (config.toolCacheTtlSec !== undefined) deps.toolCacheTtlSec = config.toolCacheTtlSec
@@ -58,10 +76,16 @@ export function createTbServer(config: ServerConfig): TbServer {
   let server: ServerType | undefined
   return {
     app,
+    search,
     state,
     deviceHub: hub,
     async start(): Promise<{ port: number }> {
-      await runBootstrap(state, config.adminSk !== undefined ? { adminSk: config.adminSk } : {})
+      // fail closed:缺 TB_BOOTSTRAP_ADMIN_SK 时默认拒绝启动(不随机生成 Admin SK 写 stdout);
+      // 仅 TB_ALLOW_INSECURE_BOOTSTRAP=true 的本地/一次性开发保留旧的随机生成+打印一次路径。
+      await runBootstrap(state, {
+        ...(config.adminSk !== undefined ? { adminSk: config.adminSk } : {}),
+        requireAdminSk: !config.allowInsecureBootstrap,
+      })
       await hub.sweepOrphans()
       return await new Promise((resolve) => {
         server = serve({ fetch: app.fetch, port: config.port, hostname: config.host }, (info) => {
@@ -78,6 +102,7 @@ export function createTbServer(config: ServerConfig): TbServer {
         })
         server = undefined
       }
+      search.close()
       state.close()
     },
   }

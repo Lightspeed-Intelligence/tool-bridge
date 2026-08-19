@@ -5,7 +5,7 @@
  * 回收窗口内重连不误删。
  */
 
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -233,6 +233,76 @@ describe('DeviceHub 全链路', () => {
     expect(res.error?.code).toBe('unavailable')
   })
 
+  it('invoke 认证 await 期间同 deviceId 被新连接顶替 → 不向旧连接下发', async () => {
+    const { server, wsBase } = await startServer(tmpDataDir())
+    cleanups.push(() => server.close())
+    const deviceId = 'replaced-during-identify'
+    const oldWs = await connectDevice(wsBase, deviceId, { autoReply: false })
+
+    let staleCalls = 0
+    oldWs.on('message', (data) => {
+      const frame = JSON.parse(data.toString()) as { id?: string, type: string }
+      if (frame.type !== 'call' || frame.id === undefined) return
+      staleCalls++
+      oldWs.send(
+        JSON.stringify({ type: 'result', id: frame.id, ok: true, value: { source: 'stale' } }),
+      )
+    })
+
+    // 暂不让旧 server-side socket 真正关闭:这样删掉 invoke 的 post-await generation guard
+    // 时,旧 session 仍会收到 call 并响应,测试能确定性失败而非被 dispose() 偶然兜底。
+    const internals = server.deviceHub as unknown as {
+      activeByDevice: Map<string, { ws: WebSocket }>
+    }
+    const oldConn = internals.activeByDevice.get(deviceId)
+    expect(oldConn).toBeDefined()
+    const closeSpy = vi.spyOn(oldConn?.ws as WebSocket, 'close').mockImplementation(() => {})
+
+    const originalGet = server.state.get.bind(server.state)
+    let releaseIdentify: () => void = () => {}
+    const identifyReleased = new Promise<void>((resolve) => {
+      releaseIdentify = resolve
+    })
+    let identifyEntered: () => void = () => {}
+    const identifyBlocked = new Promise<void>((resolve) => {
+      identifyEntered = resolve
+    })
+    let blockNextSkRead = true
+    const getSpy = vi.spyOn(server.state, 'get').mockImplementation(async (key) => {
+      if (blockNextSkRead && key.startsWith('sk:h:')) {
+        blockNextSkRead = false
+        identifyEntered()
+        await identifyReleased
+      }
+      return originalGet(key)
+    })
+
+    const invoke = server.deviceHub.invoke(deviceId, {
+      id: 'replace-race',
+      path: 'shell',
+      tool: 'exec',
+      arguments: { command: 'echo should-not-reach-stale' },
+    }) as Promise<{ error?: { code: string }, ok: boolean }>
+    await identifyBlocked
+
+    const replacement = await connectDevice(wsBase, deviceId, { autoReply: false })
+    let replacementCalls = 0
+    replacement.on('message', (data) => {
+      const frame = JSON.parse(data.toString()) as { type: string }
+      if (frame.type === 'call') replacementCalls++
+    })
+    expect(closeSpy).toHaveBeenCalledWith(1000, 'replaced')
+
+    releaseIdentify()
+    const result = await invoke
+    expect(result).toMatchObject({ ok: false, error: { code: 'unavailable' } })
+    expect(staleCalls).toBe(0)
+    expect(replacementCalls).toBe(0)
+
+    getSpy.mockRestore()
+    closeSpy.mockRestore()
+  })
+
   it('设备 SK 被禁用后,下一次调用重新认证并关闭现有连接', async () => {
     const { server, baseUrl, wsBase } = await startServer(tmpDataDir())
     cleanups.push(() => server.close())
@@ -260,6 +330,94 @@ describe('DeviceHub 全链路', () => {
     })
     expect(invoke.status).toBe(503)
     expect(await rejected).toMatchObject({ type: 'error', error: { code: 'permission_denied' } })
+  })
+
+  it('设备 SK scope 事后收紧(移除 mountPath 的 register)后,调用被拒不下发', async () => {
+    const { server, baseUrl, wsBase } = await startServer(tmpDataDir())
+    cleanups.push(() => server.close())
+    // 初始 SK 能在 device/** 注册;连上后把 scope 改窄到与 mountPath 无关的前缀。
+    const issuedRes = await postJson(baseUrl, 'system/sk', {
+      tool: 'write',
+      arguments: {
+        owner: 'device:narrowed-node',
+        scopes: [{ pattern: 'device/**', actions: ['read', 'register', 'call'] }],
+      },
+    })
+    expect(issuedRes.status).toBe(200)
+    const issued = (await issuedRes.json()) as { key: { id: string }, secret: string }
+    const ws = await connectDevice(wsBase, 'narrowed-node', { sk: issued.secret })
+
+    // SK 仍有效、keyId 不变,但收紧后不再对 device/narrowed-node 持 register。
+    const narrowed = await postJson(baseUrl, 'system/sk', {
+      tool: 'update',
+      arguments: {
+        id: issued.key.id,
+        patch: { scopes: [{ pattern: 'other/**', actions: ['read', 'register', 'call'] }] },
+      },
+    })
+    expect(narrowed.status).toBe(200)
+
+    const rejected = nextFrame(ws)
+    const invoke = await postJson(baseUrl, 'device/narrowed-node/shell', {
+      tool: 'exec',
+      arguments: { command: 'echo should-not-run' },
+    })
+    expect(invoke.status).toBe(503)
+    expect(await rejected).toMatchObject({ type: 'error', error: { code: 'permission_denied' } })
+  })
+
+  it('设备 hello 经 expose.nodes 绑定他人 Secret 引用 → 拒绝挂载(第三条写入口的授权门)', async () => {
+    const { server, baseUrl, wsBase } = await startServer(tmpDataDir())
+    cleanups.push(() => server.close())
+
+    // 平台已有一条 admin 写入的上游凭证。
+    const setSecret = await postJson(baseUrl, 'system/secret', {
+      tool: 'set',
+      arguments: { name: 'victim-s3', value: '{"accessKeyId":"AK","secretAccessKey":"SK"}' },
+    })
+    expect(setSecret.status).toBe(200)
+
+    // 设备 SK:能在 device/** 注册,但没有 system/secret admin。
+    const issuedRes = await postJson(baseUrl, 'system/sk', {
+      tool: 'write',
+      arguments: {
+        owner: 'device:thief',
+        scopes: [{ pattern: 'device/**', actions: ['read', 'register', 'call'] }],
+      },
+    })
+    expect(issuedRes.status).toBe(200)
+    const issued = (await issuedRes.json()) as { secret: string }
+
+    const ws = await wsConnect(wsBase, 'thief', issued.secret)
+    const replied = nextFrame(ws)
+    // expose.nodes 的 config 由设备端提供且帧 schema 是 passthrough:试图挂一个
+    // provider:'s3' + 他人 authRef 的 context 节点,调用时平台会代解析该凭证。
+    ws.send(
+      JSON.stringify({
+        type: 'hello',
+        deviceId: 'thief',
+        expose: {
+          nodes: [
+            {
+              path: 'stolen',
+              kind: 'context',
+              description: 'confused deputy via device hello',
+              config: {
+                kind: 'context',
+                provider: 's3',
+                authRef: 'victim-s3',
+                providerConfig: { endpoint: 'https://s3.example.com', bucket: 'victim' },
+              },
+            },
+          ],
+        },
+      }),
+    )
+    expect(await replied).toMatchObject({ type: 'error', error: { code: 'permission_denied' } })
+
+    // 树上不得留下该节点(挂载被整体拒绝)。
+    const node = await registryGet(baseUrl, 'device/thief/stolen')
+    expect(node.status).toBe(404)
   })
 })
 

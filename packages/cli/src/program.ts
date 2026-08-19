@@ -1,13 +1,16 @@
 import { Command } from 'commander'
+import { integrationCommand } from './commands/integration'
 import { federationCommand } from './commands/federation'
 import pkg from '../package.json' with { type: 'json' }
 import { feedbackCommand } from './commands/feedback'
 import { connectCommand } from './commands/connect'
 import { skillCommand } from './commands/skillhub'
+import { daemonCommand } from './commands/daemon'
 import { deviceCommand } from './commands/device'
 import { pluginCommand } from './commands/plugin'
 import { secretCommand } from './commands/secret'
 import { serverCommand } from './commands/server'
+import { searchCommand } from './commands/search'
 import { statusCommand } from './commands/status'
 import { whoamiCommand } from './commands/whoami'
 import { loginCommand } from './commands/login'
@@ -17,6 +20,7 @@ import { helpCommand } from './commands/help'
 import { noteCommand } from './commands/note'
 import { toolCommand } from './commands/tool'
 import { treeCommand } from './commands/tree'
+import { initCommand } from './commands/init'
 import { configureGlobalOpts } from './args'
 import { ctxCommand } from './commands/ctx'
 import { useCommand } from './commands/use'
@@ -36,16 +40,17 @@ function showGlobalOptionsInHelp(command: Command): void {
 }
 
 /**
- * `tb` —— tool-bridge CLI(纯 API 客户端)。命令族:
+ * `tb` —— tool-bridge CLI(公开 API 客户端；init 是本地部署编排例外)。命令族:
+ * - init cloudflare:从源码 checkout 完成 Cloudflare provision/deploy/bootstrap。
  * - status:部署健康摘要。
- * - login/whoami/use/sk/secret/ls/tree/help:档案、SK、密钥与工具树浏览/管理。
+ * - login/whoami/use/sk/secret/ls/tree/help/search:档案、SK、密钥与工具树浏览/管理。
  * - federation ls/add/rm:remote 联邦 host 白名单(运行时叠加 env 基线)。
  * - note ls/get/set/rm:Path 补充说明(展示在 ~help;set/rm 需 admin)。
  * - feedback ls/get/submit/vote/rm:Agent 使用反馈(头部条目进 ~help)。
  * - tool mount/rm、server add/ls/rm、call:挂载工具源与数据面调用。
  * - ctx ls/cat/put/patch/rm/search/mount/unmount:Context Layer。
  * - skill ls/get/search/publish/rm/mount/unmount:skillhub(Agent Skill 仓库)。
- * - connect、device ls、mount fs:设备反向注册。
+ * - connect、daemon、device ls、mount fs:设备反向注册与本机守护。
  * - plugin register/list/get/update/health/rm:插件注册表。
  *
  * commander 严格解析:未知 flag / 多余 positional / 缺 required 一律报错退出,
@@ -68,6 +73,7 @@ Agent feedback — every path carries experience from other agents:
   hit a pitfall:         tb feedback submit <path> --title "<short summary>" --detail "<how to avoid>"
   rate what helped you:  tb feedback vote <path> <id> up|down`,
   )
+  program.addCommand(initCommand())
   program.addCommand(statusCommand())
   program.addCommand(loginCommand())
   program.addCommand(whoamiCommand())
@@ -77,6 +83,7 @@ Agent feedback — every path carries experience from other agents:
   program.addCommand(federationCommand())
   program.addCommand(noteCommand())
   program.addCommand(feedbackCommand())
+  program.addCommand(searchCommand())
   program.addCommand(lsCommand())
   program.addCommand(treeCommand())
   program.addCommand(helpCommand())
@@ -86,9 +93,11 @@ Agent feedback — every path carries experience from other agents:
   program.addCommand(ctxCommand())
   program.addCommand(skillCommand())
   program.addCommand(connectCommand())
+  program.addCommand(daemonCommand())
   program.addCommand(deviceCommand())
   program.addCommand(mountCommand())
   program.addCommand(pluginCommand())
+  program.addCommand(integrationCommand())
   showGlobalOptionsInHelp(program)
   return program
 }

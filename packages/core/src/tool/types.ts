@@ -19,6 +19,14 @@ export interface ToolSpec {
   inputSchema?: unknown
   /** 工具名(虚拟化前为上游原名,虚拟化后为对外虚拟名)。 */
   name: string
+  /**
+   * 返回值的 JSON Schema(可选)。与 `inputSchema` 对称,同为裸 JSON Schema。
+   *
+   * 来源:MCP 上游的 `Tool.outputSchema`、plugin 作者在 `OperationSpec.outputSchema` 里的声明。
+   * 去处:工具级全量 `~help`(JSON 的 `outputSchema` / DSL 的 `result` 行)与 MCP consumer 端点。
+   * 索引形态的 `~help` 不含它(同 inputSchema,两级披露)。
+   */
+  outputSchema?: unknown
 }
 
 /**
@@ -29,19 +37,18 @@ export interface ToolSpec {
 export interface ToolResult {
   /** markdown 文本或结构化 JSON(按内容协商输出)。 */
   content: string | unknown
+  /** MCP 等上游的原生多模态 content blocks;HTBP 渲染仍使用归一后的 content。 */
+  contentBlocks?: unknown[]
   isError?: boolean
+  /** MCP 上游返回的结构化结果;consumer endpoint 转发时保留。 */
+  structuredContent?: Record<string, unknown>
 }
 
-/**
- * 工具源契约(List/Get/Call 三动词——工具源天然只读 + 可调用)。
- * mcp/http 内置 Provider 实现它,把上游归一到 `ToolSpec`;`List` 返回全量数组
- * (工具源天然小,豁免分页)。此接口是逻辑契约,I/O 实现(gateway)可返回 Promise。
+/*
+ * 这里曾有一个 `ToolProvider` 接口(List/Get/Call 三动词)。它已删除:
+ * - 平台从不发 `Get`(gateway pluginTool 只发 List/Call,`~help` 的数据源是 List 的产物),
+ *   它是纯样板,却被写成**强制**方法;
+ * - 网关侧真正被实现的是异步的 `UpstreamProvider`(gateway providers/types.ts),
+ *   core 的这份同步声明没有任何实现者与消费者,只剩下"看起来是契约"的误导。
+ * 作者面现在是 `OperationRegistry`(Zod 驱动,operation/registry.ts)。
  */
-export interface ToolProvider {
-  /** 调用。 */
-  Call(name: string, args: Record<string, unknown>): ToolResult
-  /** 单个工具的完整 schema/描述 —— `~help` 的数据源。 */
-  Get(name: string): ToolSpec
-  /** 枚举该源的全部工具(虚拟化前的原始名;网关做映射)。 */
-  List(): ToolSpec[]
-}

@@ -47,6 +47,7 @@ describe('未知 flag 必须报错(事故回归)', () => {
 
   it('每个叶子命令的未知 flag 都报错', async () => {
     const cases: string[][] = [
+      ['init', 'cloudflare', '--bogus'],
       ['status', '--bogus'],
       ['login', '--bogus'],
       ['whoami', '--bogus'],
@@ -69,6 +70,7 @@ describe('未知 flag 必须报错(事故回归)', () => {
       ['feedback', 'submit', 'p', '--title', 't', '--detail', 'd', '--bogus'],
       ['feedback', 'vote', 'p', 'fb_x', 'up', '--bogus'],
       ['feedback', 'rm', 'p', 'fb_x', '--bogus'],
+      ['search', 'query', '--bogus'],
       ['ls', '--bogus'],
       ['tree', '--bogus'],
       ['help', '--bogus'],
@@ -95,6 +97,12 @@ describe('未知 flag 必须报错(事故回归)', () => {
       ['skill', 'mount', 'hub', '--bogus'],
       ['skill', 'unmount', 'hub', '--bogus'],
       ['connect', '--bogus'],
+      ['daemon', 'install', '--bogus'],
+      ['daemon', 'status', '--bogus'],
+      ['daemon', 'logs', '--bogus'],
+      ['daemon', 'restart', '--bogus'],
+      ['daemon', 'uninstall', '--bogus'],
+      ['daemon', '_run', '--config', '/tmp/device.json', '--bogus'],
       ['device', 'ls', '--bogus'],
       ['mount', 'fs', '/tmp', '--bogus'],
       ['plugin', 'register', '--file', 'f', '--bogus'],
@@ -103,6 +111,11 @@ describe('未知 flag 必须报错(事故回归)', () => {
       ['plugin', 'update', 'id', '--file', 'f', '--bogus'],
       ['plugin', 'health', 'id', '--bogus'],
       ['plugin', 'rm', 'id', '--bogus'],
+      ['integration', 'catalog', '--bogus'],
+      ['integration', 'add', 'p', '--provider', 'x', '--bogus'],
+      ['integration', 'auth', 'p', '--bogus'],
+      ['integration', 'ls', '--bogus'],
+      ['integration', 'rm', 'p', '--bogus'],
       ['sk', 'get', 'id1', '--bogus'],
       ['sk', 'update', 'id1', '--disable', '--bogus'],
       ['sk', 'disable', 'id1', '--bogus'],
@@ -154,6 +167,7 @@ describe('缺 required option / positional 必须报错', () => {
     [['skill', 'unmount'], 'commander.missingArgument'],
     [['mount', 'fs'], 'commander.missingArgument'],
     [['plugin', 'get'], 'commander.missingArgument'],
+    [['daemon', '_run'], 'commander.missingMandatoryOptionValue'],
   ])('%j → %s', async (argv, code) => {
     expect(await parseError(argv as string[])).toBe(code)
   })

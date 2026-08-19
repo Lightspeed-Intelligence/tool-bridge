@@ -1,27 +1,30 @@
-# Guide:从零到线上验证(deploy-and-verify)
+# Cloudflare 初始化、部署与验收
 
-> 用途:一条龙走完"本地验证 → 部署 → 线上验证"的完整流程,每步带预期输出与排错。适用:每轮改动落地后、或新环境首次部署。前置:`.env` 已配置(见 [../must/current-state.md](../must/current-state.md) 凭据状态表)、wrangler 已 OAuth 登录。
+Cloudflare 是一种宿主，不是业务真源。仓库中的 `packages/gateway/wrangler.jsonc` 必须保持账户中立：不提交 account ID、域名、KV/D1/R2 ID 或环境凭据。
 
-## 流程
+## 推荐入口
 
-### 1. 本地验证:`pnpm verify`
+从源码 checkout 运行：
 
-typecheck + eslint + 单测(core/cli/sdk)+ 集成测试(gateway 真实 workerd + server 纯 Node + plugin-feishu / plugin-meego / plugin-bytebase 真实 workerd)一把过。
-
-2026-07-29 快照:core `699 passed`、cli `233 passed`、sdk `12 passed | 1 skipped`、gateway `145 passed | 6 skipped`、server `24 passed`、plugin-feishu `8 passed`、plugin-meego `20 passed`、plugin-bytebase `14 passed`,合计 **1155 passed / 7 skipped**。数字随开发增长,以全 pass 和退出码 0 为准;任一段红即停,先修再继续。
-
-### 2. 先确认部署状态,再决定是否手工部署
-
-当前项目在仓库外配置了 Cloudflare Git 集成,推送 `main` 后可能已经自动生成并部署新 Worker version;仓库 `.github/workflows/` **没有** deploy workflow。先读平台状态:
-
-```sh
-pnpm --filter @tool-bridge/gateway exec wrangler deployments list --json
-pnpm --filter @tool-bridge/gateway exec wrangler versions list --json
+```bash
+tb init cloudflare --repo .
 ```
 
-核对最新 deployment 是否已经把目标 version 以 100% 流量上线;若本轮含 Dashboard,还要按第 4 步比对生产 `/ui` 产物。目标状态已经存在时停止,不要为了获得一份手工命令输出重复部署。
+向导负责生成 Admin SK、配置 secrets、创建资源、部署并做基础验证。非交互环境可显式传入 `--account-id`、`--domain` 与 `--yes`；完整选项以 `tb init cloudflare --help` 为准。
 
-只有目标 version/产物尚未上线时才运行:
+手工流程只用于调试：
+
+```bash
+pnpm provision
+pnpm verify
+pnpm turbo run build
+pnpm --filter @tool-bridge/dashboard build
+pnpm --filter @tool-bridge/gateway run deploy
+```
+
+### Lightspeed fork 手工部署细节
+
+fork 侧的一键手工部署入口是 `pnpm deploy:all`:
 
 ```sh
 pnpm deploy:all
@@ -46,7 +49,14 @@ Current Version ID: …
 
 **首次建 KV 时**:provision 会提示把新 id 回填 `packages/gateway/wrangler.jsonc` 的 `TB_KV.id`(当前 id 已回填,日常无需动)。
 
-### 3. 手工探活:curl
+**先确认部署状态,再决定是否手工部署**:fork 项目在仓库外配置了 Cloudflare Git 集成,推送 `main` 后可能已经自动生成并部署新 Worker version;仓库 `.github/workflows/` 没有 deploy workflow。先读平台状态:
+
+```sh
+pnpm --filter @tool-bridge/gateway exec wrangler deployments list --json
+pnpm --filter @tool-bridge/gateway exec wrangler versions list --json
+```
+
+### 手工探活:curl
 
 ```sh
 curl -s https://tool-bridge.fantacy.live/healthz
@@ -58,7 +68,7 @@ curl -s -H "Authorization: Bearer $TB_SK" -H 'Accept: text/plain' \
 
 `/healthz.version` 是 **Gateway 运行时版本**,不能用来判断 Dashboard npm 包或 `/ui` Static Assets 的版本。
 
-### 4. Dashboard 静态产物验收(本轮含前端时)
+### Dashboard 静态产物验收(本轮含前端时)
 
 静态前端以产物身份为准:比较同一提交本地构建与生产入口 HTML 的 SHA-256,再检查入口引用的 hash chunk 和 SPA 深链接回退。macOS 示例:
 
@@ -72,26 +82,38 @@ rg -o 'assets/[A-Za-z0-9._-]+\.(js|css)' packages/dashboard/dist/index.html | so
 
 前两个线上 HTML hash 应与本地入口一致;随后逐个请求列出的 `/ui/assets/<hash-name>` 并确认 200。Dashboard npm 发布与生产 `/ui` 上线是两个独立发布面:前者查 Actions + npm dist-tag,后者查 Worker deployment/version + 本步骤的产物证据。详见 [npm-publish.md](npm-publish.md)。
 
-### 5. 冒烟脚本:`TB_BASE_URL=… pnpm smoke`
+`provision` 从环境读取账户与命名前缀，幂等创建 KV、R2、D1，并把本地 checkout 的部署目标写入 wrangler 配置。该写回含环境标识，不应作为通用模板提交。
+
+## 必需安全配置
+
+- 首次引导必须预置 `TB_BOOTSTRAP_ADMIN_SK`，并保存在密码管理器；不得从日志回收最高权限凭据。
+- SecretStore 的加密密钥必须通过 Wrangler secret 注入，不进入 `vars` 或仓库文件。
+- 上游默认只允许 HTTPS；`TB_ALLOW_INSECURE_HTTP=true` 仅供本地验证。
+- 自定义域名、canonical origin 与 OAuth redirect 必须一致；未配置域名时使用 workers.dev/preview 入口。
+
+## 验收层次
+
+1. 本地：`pnpm verify`，以及发布/打包相关改动的全仓 build。
+2. 部署产物：确认 Worker 与 Dashboard 实际加载的是本轮构建，而非旧 `dist`。
+3. 基础 smoke：健康检查、Admin SK 鉴权、受限 SK 的 allow/deny/404 语义。
+4. 按需真实验证：MCP、search、device、plugin 等脚本必须显式提供 URL 与 SK。
+
+真实云资源和上游会产生费用或副作用；每轮最多执行一次，需获得用户授权并把证据留在 PR/CI，而不是写入 `current-state.md`。
+
+上游主线视角:项目当前没有正式生产环境。共享开发部署可重置，不承担旧预览状态兼容责任。
+
+## Lightspeed fork smoke 与 CLI 验证
+
+<!-- TODO(sync): fork 已在 fantacy.live 运行生产入口,与上游"无正式生产环境"口径不同;下列 smoke/CLI 步骤为 fork 实际验收流程,人工复核生产口径。 -->
+
+### smoke:线上冒烟
 
 ```sh
 TB_BASE_URL=https://tool-bridge.fantacy.live pnpm smoke
+# → smoke passed against https://tool-bridge.fantacy.live
 ```
 
-**注意:smoke 不读 `.env`**,必须显式传 `TB_BASE_URL`(或 `tsx scripts/smoke.ts <baseUrl>`)。脚本只做只读探测(healthz + `~help`)。
-
-预期:
-
-```
-ok  GET /healthz → 200 healthy version=<gateway-version>
-ok  GET /~help (no SK) → 401 TBError permission_denied
-ok  GET /~help (with SK) → 200 text/markdown (default representation)
-ok  GET /~help (Accept: text/plain) → 200 first line "htbp 0.1"
-
-smoke passed against https://tool-bridge.fantacy.live
-```
-
-### 6. CLI 验证:`tb status --json`
+### CLI 验证:`tb status --json`
 
 ```sh
 pnpm --filter @tool-bridge/cli build   # 首次或改动 CLI 后
@@ -104,6 +126,6 @@ node packages/cli/dist/index.js status --json
 
 - **wrangler 报多账户歧义**(`More than one account available`):wrangler OAuth 下有 DJJ 与 Lightspeed 两账户,必须显式指定——`wrangler.jsonc` 已写死 `account_id`,脚本走 `CLOUDFLARE_ACCOUNT_ID`;若单独手敲 wrangler 命令,补 `CLOUDFLARE_ACCOUNT_ID=… npx wrangler …`。
 - **custom domain 刚部署后 curl 404/522**:custom domain 首次绑定或 DNS 变更有分钟级生效延迟,等 1-2 分钟重试;也可先用 wrangler deploy 输出里的 workers.dev 地址确认 Worker 本身健康,再等域名。
-- **smoke 报 `missing base URL`**:忘了传 `TB_BASE_URL`(它不读 .env),见第 5 步。
+- **smoke 报 `missing base URL`**:忘了传 `TB_BASE_URL`(它不读 .env),见上方 smoke 步骤。
 - **verify 里集成测试起不来 workerd**:确认 `pnpm install` 后再跑;`@cloudflare/vitest-pool-workers` 用 miniflare 本地实例,不需要真实 KV id。
 - **`SSL_ERROR_SYSCALL` / `Network connection lost` 等瞬时网络错误**:只对原来的只读查询或幂等 push 重试,随后重新读取远端 refs、Actions、npm dist-tag、Cloudflare deployment/version 与产物 hash;不要未经证据改认证、重打 tag 或重复 deploy。

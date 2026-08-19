@@ -1,0 +1,695 @@
+import { encodeCredentialValues, MemoryStateStore, SecretStoreImpl } from '@tool-bridge/core'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { TEST_ADMIN_SK, TEST_ENCRYPTION_KEY } from './fixtures'
+import { createTbApp, runBootstrap } from '../src/index'
+
+/**
+ * provider 型 OAuth2 的托管流程,端到端。
+ *
+ * 要证的是这套东西真能把一个 oauth2 provider 挂起来用:发起 → 回调兑换 → 调用时注入
+ * access token → 过期自动刷新。以及几条边界:令牌不出网关、未授权时给的是"去授权"
+ * 而不是笼统的失败、刷新响应不带新 refresh token 时保留旧的。
+ */
+
+const AUTHORIZE_URL = 'https://accounts.example.com/authorize'
+const TOKEN_URL = 'https://api.example.com/token'
+let upstreamCalls: Request[]
+let tokenResponses: Array<{ body: unknown, status?: number }>
+/** 插件侧看到的 X-TB-Upstream-Auth 明文(证明注入的是 access token)。 */
+let seenUpstreamAuth: string | undefined
+
+/** 一个声明了 oauth 的最小 binding(不经 plugin-sdk:app 是宿主中立层)。 */
+function oauthBinding(): (request: Request) => Promise<Response> {
+  const json = (value: unknown): Response => new Response(JSON.stringify(value), {
+    status: 200,
+    headers: { 'content-type': 'application/json' },
+  })
+  return async (request: Request) => {
+    const url = new URL(request.url)
+    if (url.pathname === '/healthz') return json({ healthy: true })
+    if (url.pathname === '/~describe') {
+      return json({
+        protocolVersion: 'plugin/v2',
+        exports: [{
+          id: 'actions',
+          profile: 'tools/v1',
+          description: 'OAuth provider',
+          oauth: {
+            authorizationUrl: AUTHORIZE_URL,
+            tokenUrl: TOKEN_URL,
+            scopes: ['read'],
+          },
+        }],
+      })
+    }
+    // 记下平台注入的凭证明文,再原样回一个成功结果。
+    const raw = request.headers.get('x-tb-upstream-auth')
+    if (raw !== null) {
+      const b64 = raw.replaceAll('-', '+').replaceAll('_', '/')
+      seenUpstreamAuth = new TextDecoder().decode(
+        Uint8Array.from(atob(b64.padEnd(b64.length + ((4 - (b64.length % 4)) % 4), '=')), c => c.charCodeAt(0)),
+      )
+    }
+    const body = (await request.json()) as { tool: string }
+    if (body.tool === 'List') return json([{ name: 'whoami', description: 'who am i' }])
+    return json({ content: { ok: true } })
+  }
+}
+
+async function buildApp(): Promise<ReturnType<typeof createTbApp>> {
+  const state = new MemoryStateStore()
+  await runBootstrap(state, { adminSk: TEST_ADMIN_SK, requireAdminSk: true })
+  return createTbApp({
+    allowInsecureHttp: false,
+    canonicalOrigin: 'https://tb.test',
+    encryptionKey: TEST_ENCRYPTION_KEY,
+    pluginBindings: new Map([['oauthp', oauthBinding()]]),
+    remote: { allowlist: [], maxHops: 4, allowInsecure: false },
+    secrets: new SecretStoreImpl(state, TEST_ENCRYPTION_KEY),
+    state,
+    version: 'test',
+  })
+}
+
+async function postJson(
+  app: ReturnType<typeof createTbApp>,
+  path: string,
+  body: unknown,
+): Promise<Response> {
+  return await app.request(new Request(`https://tb.test/${path}`, {
+    method: 'POST',
+    headers: {
+      'authorization': `Bearer ${TEST_ADMIN_SK}`,
+      'content-type': 'application/json',
+      'accept': 'application/json',
+    },
+    body: JSON.stringify(body),
+  }))
+}
+
+/** 存 client 凭证 + 注册 plugin + 挂载,返回就绪的 app。 */
+async function mountedApp(): Promise<ReturnType<typeof createTbApp>> {
+  const app = await buildApp()
+  expect((await postJson(app, 'system/secret', {
+    tool: 'set',
+    arguments: {
+      name: 'oauth-client',
+      value: encodeCredentialValues({ clientId: 'cid', clientSecret: 'csecret' }),
+    },
+  })).status).toBe(200)
+
+  const registered = await postJson(app, 'system/plugin', {
+    tool: 'write',
+    arguments: {
+      id: 'oauthp',
+      protocolVersion: 'plugin/v2',
+      endpoint: 'binding:oauthp',
+      auth: { kind: 'platform-token' },
+      healthPath: '/healthz',
+      enabled: true,
+    },
+  })
+  expect(registered.status).toBe(200)
+
+  expect((await postJson(app, 'system/registry', {
+    tool: 'write',
+    arguments: {
+      path: 'svc/oauthp',
+      kind: 'tool',
+      description: 'oauth provider',
+      config: { kind: 'tool', provider: 'oauthp', export: 'actions', authRef: 'oauth-client' },
+    },
+  })).status).toBe(200)
+  return app
+}
+
+function authorize(app: ReturnType<typeof createTbApp>): Promise<Response> {
+  return postJson(app, 'svc/oauthp/~authorize', {})
+}
+
+async function callback(
+  app: ReturnType<typeof createTbApp>,
+  state: string,
+  code = 'the-code',
+): Promise<Response> {
+  return await app.request(new Request(
+    `https://tb.test/~oauth/callback?code=${code}&state=${encodeURIComponent(state)}`,
+  ))
+}
+
+beforeEach(() => {
+  upstreamCalls = []
+  seenUpstreamAuth = undefined
+  tokenResponses = []
+  vi.stubGlobal('fetch', vi.fn((input: Request | string, init?: RequestInit) => {
+    const request = input instanceof Request ? input : new Request(input, init)
+    upstreamCalls.push(request)
+    if (request.url === TOKEN_URL) {
+      const next = tokenResponses.shift() ?? { body: { access_token: 'at-1', expires_in: 3600 } }
+      return Promise.resolve(new Response(JSON.stringify(next.body), {
+        status: next.status ?? 200,
+        headers: { 'content-type': 'application/json' },
+      }))
+    }
+    return Promise.resolve(new Response('{}', { status: 200 }))
+  }) as unknown as typeof fetch)
+})
+
+afterEach(() => {
+  vi.unstubAllGlobals()
+})
+
+/** 从 ~authorize 的响应里取 state 参数。 */
+function stateOf(authorizationUrl: string): string {
+  const at = authorizationUrl.indexOf('?')
+  const params = new URLSearchParams(authorizationUrl.slice(at + 1))
+  return params.get('state')!
+}
+
+describe('发起授权', () => {
+  it('产出跳转 URL,带 PKCE 与正确的 redirect_uri', async () => {
+    const app = await mountedApp()
+    const res = await authorize(app)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { authorizationUrl: string, status: string }
+    expect(body.status).toBe('redirect')
+
+    const url = new URL(body.authorizationUrl)
+    expect(url.origin + url.pathname).toBe(AUTHORIZE_URL)
+    expect(url.searchParams.get('client_id')).toBe('cid')
+    expect(url.searchParams.get('redirect_uri')).toBe('https://tb.test/~oauth/callback')
+    expect(url.searchParams.get('scope')).toBe('read')
+    expect(url.searchParams.get('code_challenge_method')).toBe('S256')
+    expect(url.searchParams.get('code_challenge')).toBeTruthy()
+    // state 是密封的,不该能读出里面的 verifier。
+    expect(url.searchParams.get('state')).not.toContain('code_verifier')
+  })
+
+  it('没配 authRef → 拒绝并说清要配什么', async () => {
+    const app = await buildApp()
+    await postJson(app, 'system/plugin', {
+      tool: 'write',
+      arguments: {
+        id: 'oauthp',
+        protocolVersion: 'plugin/v2',
+        endpoint: 'binding:oauthp',
+        auth: { kind: 'platform-token' },
+        healthPath: '/healthz',
+        enabled: true,
+      },
+    })
+    const mounted = await postJson(app, 'system/registry', {
+      tool: 'write',
+      arguments: {
+        path: 'svc/noauth',
+        kind: 'tool',
+        description: 'x',
+        config: { kind: 'tool', provider: 'oauthp', export: 'actions' },
+      },
+    })
+    expect(mounted.status).toBe(400)
+    expect(((await mounted.json()) as { message: string }).message).toContain('authRef')
+  })
+})
+
+describe('回调兑换', () => {
+  it('兑换成功后页面提示已授权,且请求带齐 PKCE verifier 与 client 凭证', async () => {
+    const app = await mountedApp()
+    const started = (await (await authorize(app)).json()) as { authorizationUrl: string }
+    const res = await callback(app, stateOf(started.authorizationUrl))
+    expect(res.status).toBe(200)
+    expect(await res.text()).toContain('已完成授权')
+
+    const tokenRequest = upstreamCalls.find(r => r.url === TOKEN_URL)!
+    const form = new URLSearchParams(await tokenRequest.text())
+    expect(form.get('grant_type')).toBe('authorization_code')
+    expect(form.get('code')).toBe('the-code')
+    expect(form.get('redirect_uri')).toBe('https://tb.test/~oauth/callback')
+    expect(form.get('code_verifier')).toBeTruthy()
+    expect(form.get('client_id')).toBe('cid')
+    expect(form.get('client_secret')).toBe('csecret')
+  })
+
+  it('state 被篡改 → 失败页,不兑换', async () => {
+    const app = await mountedApp()
+    const res = await callback(app, 'tampered-state')
+    expect(await res.text()).toContain('state is invalid')
+    expect(upstreamCalls.some(r => r.url === TOKEN_URL)).toBe(false)
+  })
+
+  it('令牌端点拒绝 → 失败页带出上游消息', async () => {
+    const app = await mountedApp()
+    const started = (await (await authorize(app)).json()) as { authorizationUrl: string }
+    tokenResponses = [{ status: 400, body: { error_description: 'code already used' } }]
+    const res = await callback(app, stateOf(started.authorizationUrl))
+    expect(await res.text()).toContain('code already used')
+  })
+})
+
+describe('调用时的令牌注入', () => {
+  it('**注入的是 access token,不是 secret 里的 client 凭证**', async () => {
+    const app = await mountedApp()
+    const started = (await (await authorize(app)).json()) as { authorizationUrl: string }
+    await callback(app, stateOf(started.authorizationUrl))
+
+    const res = await postJson(app, 'svc/oauthp', { tool: 'whoami', arguments: {} })
+    expect(res.status).toBe(200)
+    expect(seenUpstreamAuth).toBe('at-1')
+    expect(seenUpstreamAuth).not.toContain('csecret')
+  })
+
+  it('**未授权就调用 → permission_denied 并指引去授权**(不是笼统的 unavailable)', async () => {
+    const app = await mountedApp()
+    const res = await postJson(app, 'svc/oauthp', { tool: 'whoami', arguments: {} })
+    expect(res.status).toBe(403)
+    const body = (await res.json()) as { code: string, message: string }
+    expect(body.code).toBe('permission_denied')
+    expect(body.message).toContain('tb tool auth')
+  })
+
+  it('令牌快过期 → 调用前自动刷新,用新 token', async () => {
+    const app = await mountedApp()
+    const started = (await (await authorize(app)).json()) as { authorizationUrl: string }
+    // 首次兑换给一个 10 秒就过期的 token(< 60s 余量 → 下次调用必刷新)。
+    tokenResponses = [{ body: { access_token: 'at-old', expires_in: 10, refresh_token: 'rt-1' } }]
+    await callback(app, stateOf(started.authorizationUrl))
+
+    tokenResponses = [{ body: { access_token: 'at-new', expires_in: 3600 } }]
+    await postJson(app, 'svc/oauthp', { tool: 'whoami', arguments: {} })
+    expect(seenUpstreamAuth).toBe('at-new')
+
+    const refresh = upstreamCalls.filter(r => r.url === TOKEN_URL).at(-1)!
+    const form = new URLSearchParams(await refresh.text())
+    expect(form.get('grant_type')).toBe('refresh_token')
+    expect(form.get('refresh_token')).toBe('rt-1')
+  })
+
+  it('**刷新响应不带新 refresh token 时保留旧的**(否则下次就没得刷)', async () => {
+    const app = await mountedApp()
+    const started = (await (await authorize(app)).json()) as { authorizationUrl: string }
+    // 兑换给一个短过期的 token + refresh token;之后每次调用都会触发刷新。
+    tokenResponses = [{ body: { access_token: 'at-old', expires_in: 10, refresh_token: 'rt-keep' } }]
+    await callback(app, stateOf(started.authorizationUrl))
+
+    // 两次刷新,上游都只回 access_token 不回 refresh_token(未启用轮换的 provider)。
+    tokenResponses = [
+      { body: { access_token: 'at-2', expires_in: 10 } },
+      { body: { access_token: 'at-3', expires_in: 10 } },
+    ]
+    expect((await postJson(app, 'svc/oauthp', { tool: 'whoami', arguments: {} })).status).toBe(200)
+    const second = await postJson(app, 'svc/oauthp', { tool: 'whoami', arguments: {} })
+    expect(second.status, '第二次刷新失败,说明旧 refresh token 没被保留').toBe(200)
+
+    // 每一次刷新都必须带着最初那个 refresh token —— 丢了就再也刷不动。
+    const refreshes = upstreamCalls.filter(r => r.url === TOKEN_URL).slice(1)
+    expect(refreshes.length).toBeGreaterThanOrEqual(2)
+    for (const request of refreshes) {
+      const form = new URLSearchParams(await request.text())
+      expect(form.get('grant_type')).toBe('refresh_token')
+      expect(form.get('refresh_token')).toBe('rt-keep')
+    }
+  })
+
+  it('刷新失败 → 指引重新授权', async () => {
+    const app = await mountedApp()
+    const started = (await (await authorize(app)).json()) as { authorizationUrl: string }
+    tokenResponses = [{ body: { access_token: 'at', expires_in: 10, refresh_token: 'rt' } }]
+    await callback(app, stateOf(started.authorizationUrl))
+
+    tokenResponses = [{ status: 400, body: { error: 'invalid_grant' } }]
+    const res = await postJson(app, 'svc/oauthp', { tool: 'whoami', arguments: {} })
+    expect(res.status).toBe(403)
+    expect(((await res.json()) as { message: string }).message).toContain('tb tool auth')
+  })
+})
+
+describe('免交互复用', () => {
+  it('已有可用令牌时 ~authorize 直接回 authorized,不再弹浏览器', async () => {
+    const app = await mountedApp()
+    const started = (await (await authorize(app)).json()) as { authorizationUrl: string }
+    await callback(app, stateOf(started.authorizationUrl))
+
+    const again = await authorize(app)
+    expect(((await again.json()) as { status: string }).status).toBe('authorized')
+  })
+})
+
+describe('OAuth 与 credentialProbe 叠加', () => {
+  /**
+   * 这个组合的历史:最初它能挂载成功,而挂载期的探针把 `authRef` 指向的 **client 凭证**
+   * (clientId/clientSecret)当上游凭证发给了插件 —— 凭证泄漏。
+   *
+   * 第一版修法是"OAuth 挂载不跑探针",堵住了泄漏但**留下了矛盾的声明**:作者会以为挂载时
+   * 验了凭证,实际什么都没发生。最终修法是在契约层当场拒这个组合(与"oauth + credentialFields"
+   * 同一个理由),所以现在连注册都过不去 —— 下面两条分别钉住这两层。
+   */
+  function probeBinding(seen: { auth?: string }): (request: Request) => Promise<Response> {
+    const json = (value: unknown): Response => new Response(JSON.stringify(value), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })
+    return async (request: Request) => {
+      const url = new URL(request.url)
+      if (url.pathname === '/healthz') return json({ healthy: true })
+      if (url.pathname === '/~describe') {
+        return json({
+          protocolVersion: 'plugin/v2',
+          exports: [{
+            id: 'actions',
+            profile: 'tools/v1',
+            // 两个能力同时声明:这正是出问题的组合。
+            credentialProbe: 'ping',
+            oauth: { authorizationUrl: AUTHORIZE_URL, tokenUrl: TOKEN_URL },
+          }],
+        })
+      }
+      const raw = request.headers.get('x-tb-upstream-auth')
+      if (raw !== null) {
+        const b64 = raw.replaceAll('-', '+').replaceAll('_', '/')
+        seen.auth = new TextDecoder().decode(Uint8Array.from(
+          atob(b64.padEnd(b64.length + ((4 - (b64.length % 4)) % 4), '=')),
+          c => c.charCodeAt(0),
+        ))
+      }
+      const body = (await request.json()) as { tool: string }
+      return json(body.tool === 'List' ? [{ name: 'ping' }] : { content: {} })
+    }
+  }
+
+  it('**契约层拒绝这个组合**(注册就失败,不留矛盾的声明)', async () => {
+    const seen: { auth?: string } = {}
+    const state = new MemoryStateStore()
+    await runBootstrap(state, { adminSk: TEST_ADMIN_SK, requireAdminSk: true })
+    const app = createTbApp({
+      allowInsecureHttp: false,
+      canonicalOrigin: 'https://tb.test',
+      encryptionKey: TEST_ENCRYPTION_KEY,
+      pluginBindings: new Map([['probep', probeBinding(seen)]]),
+      remote: { allowlist: [], maxHops: 4, allowInsecure: false },
+      secrets: new SecretStoreImpl(state, TEST_ENCRYPTION_KEY),
+      state,
+      version: 'test',
+    })
+    const res = await postJson(app, 'system/plugin', {
+      tool: 'write',
+      arguments: {
+        id: 'probep',
+        protocolVersion: 'plugin/v2',
+        endpoint: 'binding:probep',
+        auth: { kind: 'platform-token' },
+        healthPath: '/healthz',
+        enabled: true,
+      },
+    })
+    expect(res.status).toBe(400)
+    const body = (await res.json()) as { message: string }
+    expect(body.message).toContain('credentialProbe')
+    // 注册就没过,插件自然也没机会收到任何凭证。
+    expect(seen.auth).toBeUndefined()
+  })
+
+  it('**即便注册通过,挂载也不把 client secret 发给插件**(纵深防线)', async () => {
+    const seen: { auth?: string } = {}
+    const state = new MemoryStateStore()
+    await runBootstrap(state, { adminSk: TEST_ADMIN_SK, requireAdminSk: true })
+    const app = createTbApp({
+      allowInsecureHttp: false,
+      canonicalOrigin: 'https://tb.test',
+      encryptionKey: TEST_ENCRYPTION_KEY,
+      // 只声明 oauth(不带 credentialProbe):这样注册能过,才测得到挂载期的行为。
+      pluginBindings: new Map([['probep', oauthBinding()]]),
+      remote: { allowlist: [], maxHops: 4, allowInsecure: false },
+      secrets: new SecretStoreImpl(state, TEST_ENCRYPTION_KEY),
+      state,
+      version: 'test',
+    })
+
+    await postJson(app, 'system/secret', {
+      tool: 'set',
+      arguments: {
+        name: 'cli-cred',
+        value: encodeCredentialValues({ clientId: 'cid', clientSecret: 'MUST_NOT_LEAK' }),
+      },
+    })
+    await postJson(app, 'system/plugin', {
+      tool: 'write',
+      arguments: {
+        id: 'probep',
+        protocolVersion: 'plugin/v2',
+        endpoint: 'binding:probep',
+        auth: { kind: 'platform-token' },
+        healthPath: '/healthz',
+        enabled: true,
+      },
+    })
+    const mounted = await postJson(app, 'system/registry', {
+      tool: 'write',
+      arguments: {
+        path: 'svc/probep',
+        kind: 'tool',
+        description: 'oauth + probe',
+        config: { kind: 'tool', provider: 'probep', export: 'actions', authRef: 'cli-cred' },
+      },
+    })
+    expect(mounted.status).toBe(200)
+    // 探针根本不该跑;即便跑了也绝不能把 client 凭证送出去。
+    expect(seen.auth ?? '').not.toContain('MUST_NOT_LEAK')
+    expect(seen.auth).toBeUndefined()
+  })
+})
+
+describe('令牌生命周期', () => {
+  /**
+   * 回归:节点卸载/重写时必须清掉该路径的 OAuth 令牌。不清不只是垃圾残留 ——
+   * 同一路径**重新挂载另一个 provider** 时会继承旧令牌,那是跨挂载的凭证串用。
+   */
+  it('**卸载后重新挂载不继承旧令牌**', async () => {
+    const app = await mountedApp()
+    const started = (await (await authorize(app)).json()) as { authorizationUrl: string }
+    await callback(app, stateOf(started.authorizationUrl))
+    // 授权过了:此刻 ~authorize 应当免交互。
+    expect(((await (await authorize(app)).json()) as { status: string }).status).toBe('authorized')
+
+    // 卸载,再用同一路径重挂。
+    expect((await postJson(app, 'system/registry', {
+      tool: 'delete',
+      arguments: { path: 'svc/oauthp' },
+    })).status).toBe(200)
+    expect((await postJson(app, 'system/registry', {
+      tool: 'write',
+      arguments: {
+        path: 'svc/oauthp',
+        kind: 'tool',
+        description: 'remounted',
+        config: { kind: 'tool', provider: 'oauthp', export: 'actions', authRef: 'oauth-client' },
+      },
+    })).status).toBe(200)
+
+    // 新挂载不该继承上一次的授权 —— 否则换 provider 重挂就等于白拿别人的令牌。
+    const after = await authorize(app)
+    expect(((await after.json()) as { status: string }).status).toBe('redirect')
+  })
+})
+
+describe('401 触发的自愈(不返回 expires_in 的 provider)', () => {
+  /**
+   * `shouldRefresh` 对没有 `expiresAt` 的令牌不主动刷新,注释写的是"靠 401 触发" ——
+   * 但那个机制一度**不存在**:`pluginClient` 的重试只在 `err.retryable` 时发生,而 401 归一成
+   * `permission_denied`(不可重试)。于是令牌响应不带 `expires_in` 的 provider(规范里它是
+   * RECOMMENDED 而非 REQUIRED)一旦令牌失效就永久 403,refresh token 明明在库里却永不使用。
+   *
+   * 同一句注释在 mcp 那条路上是成立的(MCP SDK 的 auth() 内部会刷新),搬到 provider 这条
+   * 就成了空头承诺。
+   */
+  it('**令牌失效后自动刷新并重试,调用方无感**', async () => {
+    let valid = true
+    let tokenCalls = 0
+    let seen: string | undefined
+
+    const json = (value: unknown, status = 200): Response => new Response(JSON.stringify(value), {
+      status,
+      headers: { 'content-type': 'application/json' },
+    })
+    const binding = async (request: Request): Promise<Response> => {
+      const url = new URL(request.url)
+      if (url.pathname === '/healthz') return json({ healthy: true })
+      if (url.pathname === '/~describe') {
+        return json({
+          protocolVersion: 'plugin/v2',
+          exports: [{
+            id: 'actions',
+            profile: 'tools/v1',
+            oauth: { authorizationUrl: AUTHORIZE_URL, tokenUrl: TOKEN_URL },
+          }],
+        })
+      }
+      const raw = request.headers.get('x-tb-upstream-auth')
+      if (raw !== null) {
+        const b64 = raw.replaceAll('-', '+').replaceAll('_', '/')
+        seen = new TextDecoder().decode(Uint8Array.from(
+          atob(b64.padEnd(b64.length + ((4 - (b64.length % 4)) % 4), '=')),
+          c => c.charCodeAt(0),
+        ))
+      }
+      const body = (await request.json()) as { tool: string }
+      if (body.tool === 'List') return json([{ name: 'ping', effect: 'read' }])
+      // 真实上游:只拒那个已失效的 token,刷新拿到的新 token 有效。
+      if (!valid && seen === 'at-1') {
+        return json({ code: 'permission_denied', message: 'token expired' }, 401)
+      }
+      return json({ content: { ok: true } })
+    }
+
+    vi.stubGlobal('fetch', vi.fn((input: Request | string, init?: RequestInit) => {
+      const request = input instanceof Request ? input : new Request(input, init)
+      if (request.url === TOKEN_URL) {
+        tokenCalls += 1
+        // **不返回 expires_in** —— 这正是触发这个 bug 的形状。
+        return Promise.resolve(json({ access_token: `at-${tokenCalls}`, refresh_token: 'rt-1' }))
+      }
+      return Promise.resolve(json({}))
+    }) as unknown as typeof fetch)
+
+    const state = new MemoryStateStore()
+    await runBootstrap(state, { adminSk: TEST_ADMIN_SK, requireAdminSk: true })
+    const app = createTbApp({
+      allowInsecureHttp: false,
+      canonicalOrigin: 'https://tb.test',
+      encryptionKey: TEST_ENCRYPTION_KEY,
+      pluginBindings: new Map([['selfheal', binding]]),
+      remote: { allowlist: [], maxHops: 4, allowInsecure: false },
+      secrets: new SecretStoreImpl(state, TEST_ENCRYPTION_KEY),
+      state,
+      version: 'test',
+    })
+
+    await postJson(app, 'system/secret', {
+      tool: 'set',
+      arguments: {
+        name: 'cli',
+        value: encodeCredentialValues({ clientId: 'cid', clientSecret: 'cs' }),
+      },
+    })
+    await postJson(app, 'system/plugin', {
+      tool: 'write',
+      arguments: {
+        id: 'selfheal',
+        protocolVersion: 'plugin/v2',
+        endpoint: 'binding:selfheal',
+        auth: { kind: 'platform-token' },
+        healthPath: '/healthz',
+        enabled: true,
+      },
+    })
+    await postJson(app, 'system/registry', {
+      tool: 'write',
+      arguments: {
+        path: 'svc/selfheal',
+        kind: 'tool',
+        description: 'x',
+        config: { kind: 'tool', provider: 'selfheal', export: 'actions', authRef: 'cli' },
+      },
+    })
+
+    const started = (await (await postJson(app, 'svc/selfheal/~authorize', {})).json()) as {
+      authorizationUrl: string
+    }
+    await callback(app, stateOf(started.authorizationUrl))
+
+    // 正常调用一次。
+    expect((await postJson(app, 'svc/selfheal', { tool: 'ping', arguments: {} })).status).toBe(200)
+    expect(seen).toBe('at-1')
+    const callsBefore = tokenCalls
+
+    // 上游作废了这个令牌(密钥轮换 / 自然过期,而我们没有 expiresAt 所以无从预知)。
+    valid = false
+    const res = await postJson(app, 'svc/selfheal', { tool: 'ping', arguments: {} })
+    expect(res.status, '401 之后没有用 refresh token 自愈').toBe(200)
+    expect(tokenCalls, '没有触发刷新').toBe(callsBefore + 1)
+    expect(seen, '重试时没换成新令牌').toBe('at-2')
+  })
+
+  it('刷新也失败时抛原始的 permission_denied(那确实需要人重新授权)', async () => {
+    let tokenCalls = 0
+    const json = (value: unknown, status = 200): Response => new Response(JSON.stringify(value), {
+      status,
+      headers: { 'content-type': 'application/json' },
+    })
+    // 上游对**任何**令牌都回 401(等价于 refresh token 也已作废)。
+    const binding = async (request: Request): Promise<Response> => {
+      const url = new URL(request.url)
+      if (url.pathname === '/healthz') return json({ healthy: true })
+      if (url.pathname === '/~describe') {
+        return json({
+          protocolVersion: 'plugin/v2',
+          exports: [{
+            id: 'actions',
+            profile: 'tools/v1',
+            oauth: { authorizationUrl: AUTHORIZE_URL, tokenUrl: TOKEN_URL },
+          }],
+        })
+      }
+      const body = (await request.json()) as { tool: string }
+      if (body.tool === 'List') return json([{ name: 'ping', effect: 'read' }])
+      return json({ code: 'permission_denied', message: 'token rejected' }, 401)
+    }
+
+    vi.stubGlobal('fetch', vi.fn((input: Request | string, init?: RequestInit) => {
+      const request = input instanceof Request ? input : new Request(input, init)
+      if (request.url === TOKEN_URL) {
+        tokenCalls += 1
+        // 首次兑换成功;之后的刷新一律被拒。
+        return Promise.resolve(tokenCalls === 1
+          ? json({ access_token: 'at-1', refresh_token: 'rt-1' })
+          : json({ error: 'invalid_grant' }, 400))
+      }
+      return Promise.resolve(json({}))
+    }) as unknown as typeof fetch)
+
+    const state = new MemoryStateStore()
+    await runBootstrap(state, { adminSk: TEST_ADMIN_SK, requireAdminSk: true })
+    const app = createTbApp({
+      allowInsecureHttp: false,
+      canonicalOrigin: 'https://tb.test',
+      encryptionKey: TEST_ENCRYPTION_KEY,
+      pluginBindings: new Map([['deadend', binding]]),
+      remote: { allowlist: [], maxHops: 4, allowInsecure: false },
+      secrets: new SecretStoreImpl(state, TEST_ENCRYPTION_KEY),
+      state,
+      version: 'test',
+    })
+    await postJson(app, 'system/secret', {
+      tool: 'set',
+      arguments: { name: 'cli', value: encodeCredentialValues({ clientId: 'c', clientSecret: 's' }) },
+    })
+    await postJson(app, 'system/plugin', {
+      tool: 'write',
+      arguments: {
+        id: 'deadend',
+        protocolVersion: 'plugin/v2',
+        endpoint: 'binding:deadend',
+        auth: { kind: 'platform-token' },
+        healthPath: '/healthz',
+        enabled: true,
+      },
+    })
+    await postJson(app, 'system/registry', {
+      tool: 'write',
+      arguments: {
+        path: 'svc/deadend',
+        kind: 'tool',
+        description: 'x',
+        config: { kind: 'tool', provider: 'deadend', export: 'actions', authRef: 'cli' },
+      },
+    })
+    const started = (await (await postJson(app, 'svc/deadend/~authorize', {})).json()) as {
+      authorizationUrl: string
+    }
+    await callback(app, stateOf(started.authorizationUrl))
+
+    const res = await postJson(app, 'svc/deadend', { tool: 'ping', arguments: {} })
+    expect(res.status, '刷新失败后应抛原始的 permission_denied').toBe(403)
+    // 试过刷新(不是直接放弃),但没成功。
+    expect(tokenCalls).toBeGreaterThan(1)
+  })
+})

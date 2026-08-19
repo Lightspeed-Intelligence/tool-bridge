@@ -1,6 +1,6 @@
 {
   "name": "@tool-bridge/server",
-  "version": "0.1.0",
+  "version": "0.5.0",
   "description": "tool-bridge self-hosted server: run the HTBP gateway on Node with SQLite persistence, filesystem object storage and WebSocket device channel — single container via docker run",
   "type": "module",
   "license": "MIT",
@@ -43,24 +43,24 @@
     "start": "tsx src/main.ts"
   },
   "dependencies": {
-    "@cfworker/json-schema": "^4.1.1",
-    "@hono/node-server": "^1.19.7",
-    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@cfworker/json-schema": "catalog:",
+    "@hono/node-server": "catalog:",
     "@tool-bridge/dashboard": "workspace:*",
-    "aws4fetch": "^1.0.20",
+    "aws4fetch": "catalog:",
     "better-sqlite3": "^12.6.0",
-    "hono": "^4.12.28",
-    "ws": "8.21.0"
+    "hono": "catalog:",
+    "ws": "catalog:"
   },
   "devDependencies": {
+    "@tool-bridge/app": "workspace:*",
     "@tool-bridge/core": "workspace:*",
-    "@tool-bridge/gateway": "workspace:*",
+    "@tool-bridge/plugins": "workspace:*",
     "@types/better-sqlite3": "^7.6.13",
-    "@types/node": "^26.1.0",
-    "@types/ws": "8.18.1",
-    "tsup": "^8.5.1",
-    "tsx": "^4.23.0",
-    "vitest": "^4.1.10"
+    "@types/node": "catalog:",
+    "@types/ws": "catalog:",
+    "tsup": "catalog:",
+    "tsx": "catalog:",
+    "vitest": "catalog:"
   },
   "repository": {
     "type": "git",

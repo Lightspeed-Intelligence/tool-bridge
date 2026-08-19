@@ -1,13 +1,12 @@
 import { describe, expect, it } from 'vitest'
-import { parsePluginManifest, PLUGIN_KINDS } from '../../src/plugin/manifest'
+import { parsePluginManifest } from '../../src/plugin/manifest'
 import { TBError } from '../../src/errors'
 import { omit } from '../../src/omit'
 
 /** 注册样例(feishu-docs)。 */
 const FEISHU = {
   id: 'feishu-docs',
-  kind: 'context-provider',
-  interfaceVersion: 'context-provider/v1',
+  protocolVersion: 'plugin/v2',
   endpoint: 'https://feishu-docs-provider.example.workers.dev',
   auth: { kind: 'platform-token' },
   healthPath: '/healthz',
@@ -30,63 +29,27 @@ describe('合法 manifest', () => {
     expect(parsePluginManifest(FEISHU)).toEqual(FEISHU)
   })
 
-  it('tool-provider + bearer + binding endpoint 通过', () => {
+  it('tool-provider + bearer 通过', () => {
     const m = {
       ...FEISHU,
       id: 'orders',
-      kind: 'tool-provider',
-      interfaceVersion: 'tool-provider/v1',
-      endpoint: 'binding:ORDERS_PROVIDER',
+      endpoint: 'https://orders.example.com',
       auth: { kind: 'bearer', secretRef: 'orders-token' },
     }
     expect(parsePluginManifest(m)).toEqual(m)
   })
 
-  it('未知字段剥离(向前兼容:忽略未知字段)', () => {
-    const parsed = parsePluginManifest({ ...FEISHU, futureField: 42 })
-    expect(parsed).toEqual(FEISHU)
-    expect('futureField' in parsed).toBe(false)
+  it('宿主显式装配的 binding endpoint 通过', () => {
+    const manifest = { ...FEISHU, endpoint: 'binding:ORDERS_PROVIDER' }
+    expect(parsePluginManifest(manifest)).toEqual(manifest)
   })
 
-  it('PLUGIN_KINDS 词表 = 两种 Provider', () => {
-    expect(PLUGIN_KINDS).toEqual(['tool-provider', 'context-provider'])
-  })
-})
-
-describe('kind ↔ interfaceVersion 一致性', () => {
-  it('kind=tool-provider 配 context-provider/v1 → 拒', () => {
-    const err = expectInvalid({
-      ...FEISHU,
-      kind: 'tool-provider',
-      interfaceVersion: 'context-provider/v1',
-    })
-    expect(err.message).toContain('interfaceVersion')
-  })
-
-  it('kind=context-provider 配 tool-provider/v1 → 拒', () => {
-    expectInvalid({ ...FEISHU, interfaceVersion: 'tool-provider/v1' })
-  })
-
-  it.each([
-    'context-provider',
-    'context-provider/1',
-    'context-provider/v',
-    'context-provider/v1.2',
-  ])('形状不合 <kind>/v<major> 的 interfaceVersion 拒:%s', (bad) => {
-    expectInvalid({ ...FEISHU, interfaceVersion: bad })
-  })
-
-  it('同 kind 的更高 major 合法(v2)', () => {
-    const m = { ...FEISHU, interfaceVersion: 'context-provider/v2' }
-    expect(parsePluginManifest(m).interfaceVersion).toBe('context-provider/v2')
-  })
-
-  it('未知 kind → 拒', () => {
-    expectInvalid({ ...FEISHU, kind: 'widget-provider', interfaceVersion: 'widget-provider/v1' })
+  it('未知字段拒绝，避免旧 manifest 被静默接受', () => {
+    expectInvalid({ ...FEISHU, futureField: 42 })
   })
 })
 
-describe('endpoint 形状(https:// 或 binding:<name>)', () => {
+describe('endpoint 形状(HTTP(S) 或宿主 binding)', () => {
   it('裸 http 缺省拒,并提示 TB_ALLOW_INSECURE_HTTP', () => {
     const err = expectInvalid({ ...FEISHU, endpoint: 'http://127.0.0.1:8787' })
     expect(err.message).toContain('TB_ALLOW_INSECURE_HTTP')
@@ -107,7 +70,7 @@ describe('endpoint 形状(https:// 或 binding:<name>)', () => {
     expectInvalid({ ...FEISHU, endpoint: bad })
   })
 
-  it('allowInsecureHttp 不放行 https/binding 之外的其他 scheme', () => {
+  it('allowInsecureHttp 不放行 HTTP(S)/binding 之外的 scheme', () => {
     expectInvalid({ ...FEISHU, endpoint: 'ws://x.example' }, { allowInsecureHttp: true })
   })
 })

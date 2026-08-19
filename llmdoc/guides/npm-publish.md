@@ -1,42 +1,40 @@
-# Guide:npm 发布(cli / sdk / gateway / dashboard / server)
+# npm 版本与发布
 
-> 用途:发布 public npm 包的新版本,以及新增可发布包的首发流程。适用:发 cli/sdk/gateway/dashboard/server 新版本、新增可发布包、排查 CI 发布失败。现状:npm registry latest 为 cli 0.7.0 / sdk 0.4.0 / gateway 0.4.0 / dashboard 0.6.0,Trusted Publisher 均已配置;cli manifest 0.8.0 已完成本地发布准备但尚未打 tag/发布;server 0.1.0 **待手动首发 + 配 Trusted Publisher**。快照见 [../must/current-state.md](../must/current-state.md)。
+公开包共有七个：`app`、`cli`、`dashboard`、`gateway`、`plugin-sdk`、`sdk`、`server`。`core` 与 `plugins` 是 private，其代码由公开产物消费或打包。
 
-## 包形态(发布模式)
+## 是否 bump
 
-- **core 是 private workspace 包,不发布**(被 cli/sdk/gateway/server bundle)。可发布包共五个:cli / sdk / gateway / dashboard / server。
-- cli/sdk/gateway/server 用 tsup `noExternal` 把 workspace 依赖 bundle 成**单文件 ESM**(workspace 包放 devDependencies,运行时 dependencies 只留真正的外部包)。配置见 `packages/sdk/tsup.config.ts`、`packages/cli/package.json`。
-- **gateway 是 Worker library 包**(默认导出 app + `DeviceSession`,另 export `createApp` 与 `type Env`):tsup entry `src/index.ts`,`external: ['cloudflare:workers']`,target es2022 / platform neutral,core 被 bundle(从 dependencies 移到 devDependencies)。发布形态见下条 publishConfig 覆盖模式。
-- **dashboard 是纯静态产物包**:只发 `files: ["dist"]`(Vite 全量打包产物),全部依赖在 devDependencies——消费者不装 react,拷 `node_modules/@tool-bridge/dashboard/dist` 即用。
-- **server 是 Node 宿主服务包**(bin `tool-bridge-server`):tsup bundle core+gateway,better-sqlite3/ws/hono/@hono/node-server 等留 external;**dashboard 是它的 regular dependency**(`workspace:*`,`pnpm pack` 时改写为版本号)——所以 **npm 安装形态要求 dashboard 先发布/先存在对应版本**;dts 坑:`dts.resolve` 须收窄为数组(仅 core/gateway),`resolve: true` 会把 `node:http` 类型降级 undefined。同一 tag 还触发 Docker 镜像发布(见 [docker-host.md](docker-host.md))。
-- **publishConfig 字段覆盖模式**(适用于"包在 workspace 内被按名消费"的场景,如 sdk import `@tool-bridge/gateway/tbApp`):开发态 `main`/`exports` 保持指 `src/*.ts`,发布形态用 `publishConfig` 覆盖 `main`/`types`/`exports` 指 dist。陷阱:**`npm publish` 不应用字段覆盖,`pnpm pack` 才应用**——所以 CI 发布步骤必须是 `pnpm pack` + `npm publish <tarball>`(与 Trusted Publishing OIDC 兼容,见 `.github/workflows/publish-gateway.yml`)。
-- **dts 用 tsconfig.build.json 的 paths 把 workspace 包类型内联进 `dist/index.d.ts`**——core 不随发布走,不内联则发布包的类型入口悬空。陷阱:tsup 的 `noExternal` 只影响 JS bundle 不影响 dts;`dts.resolve`(true 或数组)对 exports 指向 .ts 源的 workspace 包(如 core 的 `"." → "./src/index.ts"`)**均不生效**。唯一生效修法:专用 `tsconfig.build.json` 用 `compilerOptions.paths` 把 `@tool-bridge/core` 等映射到对方 `src/*.ts`,tsup 设 `tsconfig: 'tsconfig.build.json'` + `dts: { resolve: true }`。
-- **验证类型自包含要用隔离 tsc,grep 不够**:在仓库外的隔离目录写一个只 import dist 类型的 check.ts,用仓库 `node_modules/.bin/tsc`(不开 skipLibCheck)编译通过才算数——"可独立消费性"不在常规 `pnpm verify` 覆盖内。Workers 目标包(如 gateway)额外注意:隔离 tsconfig 的 `lib` 必须只含 `["ES2022"]` 不带 DOM(`@cloudflare/workers-types` 与 lib.dom 类型冲突),`types` 要加 `@cloudflare/workers-types`;软链依赖要指向**包自己的 node_modules**(pnpm 不提升,仓库根下没有)。
-- `files: ["dist"]` + `publishConfig.access: "public"`(scoped 包默认 restricted,必须显式 public)。
+按 public artifact ownership 判断：只提升消费者能感知到契约、依赖约束或发布内容变化的公开包。private 源码变化不会机械地沿依赖图提升所有包；但被 bundle 后改变公开运行时行为，仍属于对应公开包的变化。
 
-## 发新版本标准流程(Trusted Publisher 已配置的包)
+仓库处于 `0.x`：破坏性变化和新增能力升 minor，纯修复升 patch。隐藏 flag 删除、既有配置从接受改为拒绝、默认安全行为收紧，都属于消费者可感知变化。
 
-版本范围先按 **public artifact ownership** 判定:只有自身外部契约、依赖约束或发布内容变化的 public 包才 bump。private 且被 bundle 的 workspace 包不因内部实现变化自动单独 bump,也不能沿源码依赖图传递式提升所有 public 包。
+## 发布顺序
 
-1. 改 `packages/<pkg>/package.json` 的 `version`,提交。
-   发布物验证必须从本轮重建开始,并让 build → 实际入口版本 → dry-run pack **fail fast**。例如在 `packages/cli` 下执行:
+1. 修改 `packages/<pkg>/package.json` 的 version，并同步 lockfile。
+2. 重建该包，直接检查生成入口确实包含新版本；已有 `dist` 不是证据。
+3. 执行 `pnpm verify` 和 `pnpm turbo run build`。
+4. 用 `scripts/pack-and-verify-package.mjs` 生成并验收最终将发布的确切 tarball。
+5. PR 合入 `main` 后才创建 `<pkg>-v<version>` tag。
+6. 一次只推一个 tag，等待对应 workflow；不要批量 push tags。
+7. 用 `npm view <pkg> version` 或 `npm view <pkg> time.created` 确认 registry 元数据，再下载 registry 中的精确版本 tarball，重复干净安装与烟测。元数据存在不能代替 tarball 可安装性验证。
 
-   ```sh
-   ./node_modules/.bin/tsup && \
-     node dist/index.js --version && \
-     npm pack --dry-run --json
-   ```
+tag 前缀与目录同名，包括 `plugin-sdk-`。Dashboard 若嵌入 server/gateway 产物，应先发布它依赖的包，再发布承载最终产物的包。
 
-   只读 manifest 或看到 dist 已存在都不算版本证据;多条命令不用 `&&`(或等价严格错误处理)连接时,后序 pack 成功可能掩盖前序 build 失败并把旧 dist 当成新版本。
-2. 打 tag 并推送(tag 前缀区分包):
+## 打包检查
 
-   ```sh
-   git tag sdk-v<版本> && git push origin sdk-v<版本>             # sdk
-   git tag cli-v<版本> && git push origin cli-v<版本>             # cli
-   git tag gateway-v<版本> && git push origin gateway-v<版本>     # gateway
-   git tag dashboard-v<版本> && git push origin dashboard-v<版本> # dashboard
-   git tag server-v<版本> && git push origin server-v<版本>       # server(同时触发 npm + GHCR 镜像双 workflow)
-   ```
+- 所有公开包统一用 `node scripts/pack-and-verify-package.mjs packages/<pkg> --output-dir <dir>` 打包和验证；CLI 额外传 `--bin tb`。
+- 默认模式通过 `pnpm pack` 生成确切 tarball、扫描 packed manifest，并在仓库外创建干净 npm 消费者安装；CLI 还执行 `tb --version` 与 `tb --help`。
+- `files`、exports、bin、types 与 `publishConfig` 必须指向构建后真实存在的文件。
+- 解包最终 packed tarball，检查其中 `package.json` 的 `dependencies`、`optionalDependencies` 与 `peerDependencies`；不得残留 `catalog:`、`workspace:` 或其他 npm 不支持的工作区协议。
+- CI 在全仓 build 后复用同一脚本并传 `--skip-install`，只保留 packed manifest 协议闸门；合入前的 workspace 依赖版本可能尚未发布到 registry，不能把这类不可安装误判为 tarball 协议错误。publish workflow 不得跳过干净安装。
+- publish workflow 必须捕获脚本返回的 tarball 路径，并将同一个文件交给 `npm publish`；校验后重新打包会留下产物漂移窗口。
+- 声明文件可能跨包引用私有源码，不能只依赖 monorepo typecheck。
+- 版本字符串若编译进产物，必须在 bump 后重建并搜索实际入口。
+- 发布失败时修复后重建、重验；不要复用已经推送且不可回收的 npm 版本。
+
+不要在 llmdoc 记录某次发布的 latest、digest 或传播耗时;这些属于 registry、tag 与 CI 证据。
+
+## Lightspeed fork 发布操作(实测)
 
    **多包同发必须逐个 push tag**:`git push origin tag1 tag2 tag3` 一次推多个 tag 时 GitHub **不触发任何 tag workflow**(2026-07-08 实测:四 tag 同推零触发;删除远端 tag 后逐个重推,四个 workflow 全部正常触发)。tag 已推但没触发时的恢复手法:`git push origin :refs/tags/<tag>` 删远端 → 单独重推。
 

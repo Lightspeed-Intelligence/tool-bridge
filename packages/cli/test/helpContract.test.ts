@@ -46,6 +46,21 @@ describe('CLI help 参数契约', () => {
     expect(help).toContain('requires at least one --fs')
   })
 
+  it('daemon install 复用 connect 安全参数，内部 run 入口不出现在 help', () => {
+    const install = fullHelpAt('daemon', 'install')
+    expect(install).toContain('persistent systemd user service')
+    expect(install).toContain('mutually exclusive with --no-shell')
+    expect(install).toContain('requires at least one --fs')
+    expect(install).toContain('private 0600 daemon config')
+    expect(install).toContain('--yes')
+    expect(install).toContain('trusted machines only')
+
+    const group = commandAt('daemon').helpInformation()
+    expect(group).toContain('install')
+    expect(group).toContain('status')
+    expect(group).not.toContain('_run')
+  })
+
   it('tool/ctx mount 标明认证依赖、provider 边界与自动描述', () => {
     const toolHelp = commandAt('tool', 'mount').helpInformation()
     expect(toolHelp.match(/requires --auth-ref/g)).toHaveLength(2)
@@ -59,7 +74,6 @@ describe('CLI help 参数契约', () => {
     const serverHelp = fullHelpAt('server', 'add')
     expect(serverHelp).toContain('Required remote HTBP server URL')
     expect(serverHelp).toContain('One-line node description (default: derived from remote URL)')
-    expect(serverHelp).toContain('Migration: remote URL uses --remote-url')
 
     const serverLsHelp = fullHelpAt('server', 'ls')
     expect(serverLsHelp).toContain(

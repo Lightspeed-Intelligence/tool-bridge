@@ -19,8 +19,10 @@ export default [
     '**/.output/',
     '**/node_modules/',
     '.llmdoc-tmp/',
+    // 未完成的迁移半成品(schema 已生成并过等价校验,api.ts/测试待补)。
+    // 不参与 lint/typecheck —— 它们还没进内置目录,补完时会随产物一起过全部闸门。
+    'packages/plugins/.pending-migration/',
     'output/',
-    'archive/',
     'packages/dashboard/public/',
     'packages/dashboard/src/index.css',
   ]),
@@ -53,7 +55,9 @@ export default [
       '@stylistic/curly-newline': ['error', { consistent: true }],
       '@stylistic/jsx-self-closing-comp': 'error',
       '@stylistic/object-curly-newline': ['error', { consistent: true }],
-      '@typescript-eslint/no-explicit-any': 'warn',
+      // 当前全仓零 `any`;提到 error 是为了守住这个状态——warn 会被顺手忽略,
+      // 真要用 `any` 时写一行 eslint-disable 并说明理由,比默默混进来强。
+      '@typescript-eslint/no-explicit-any': 'error',
       '@typescript-eslint/no-extraneous-class': 'off',
       '@typescript-eslint/no-use-before-define': 'error',
       '@typescript-eslint/unified-signatures': 'off',
@@ -84,6 +88,24 @@ export default [
     rules: {
       'react-hooks/exhaustive-deps': 'warn',
       'react-hooks/rules-of-hooks': 'error',
+    },
+  }),
+  // 内置 plugin 与网关同进程同权:业务源码不得绕过逐跳出站校验。
+  ...defineConfig({
+    files: ['packages/plugins/src/**/*.ts'],
+    ignores: ['packages/plugins/src/_runtime/guardedFetch.ts'],
+    rules: {
+      'no-restricted-syntax': [
+        'error',
+        {
+          message: 'plugin 出站请求必须使用 guardedFetch/createGuardedFetch',
+          selector: 'CallExpression[callee.type="Identifier"][callee.name="fetch"]',
+        },
+        {
+          message: 'plugin 出站请求必须使用 guardedFetch/createGuardedFetch',
+          selector: 'CallExpression[callee.object.name="globalThis"][callee.property.name="fetch"]',
+        },
+      ],
     },
   }),
   // 脚本/配置文件：放开 console
