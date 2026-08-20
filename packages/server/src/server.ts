@@ -61,6 +61,15 @@ export function createTbServer(config: ServerConfig): TbServer {
     device: hub,
   }
   if (config.encryptionKey !== undefined) deps.encryptionKey = config.encryptionKey
+  if (config.feishuLoginSecretRef !== undefined) {
+    deps.feishuLoginSecretRef = config.feishuLoginSecretRef
+  }
+  if (config.feishuLoginKeyTtlSec !== undefined) {
+    deps.feishuLoginKeyTtlSec = config.feishuLoginKeyTtlSec
+  }
+  if (config.oauthDelegationClients !== undefined) {
+    deps.oauthDelegationClients = config.oauthDelegationClients
+  }
   if (config.pluginBindings !== undefined) deps.pluginBindings = config.pluginBindings
   if (config.pluginCatalog !== undefined) deps.pluginCatalog = config.pluginCatalog
   // 规范 origin(与 Workers app.ts 对等):给出即钉死 OAuth redirect_uri。

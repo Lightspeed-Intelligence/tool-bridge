@@ -118,3 +118,41 @@ describe('Node canonical origin 对等', () => {
     )
   })
 })
+
+describe('Node OAuth delegation configuration', () => {
+  const client = {
+    clientId: 'tcode',
+    clientSecret: 'tcode-oauth-client-secret-000000000000',
+    redirectUris: ['https://tcode.example.com/api/v1/integrations/tool-bridge/callback'],
+    grants: [
+      {
+        name: 'database_production_read',
+        description: 'Production database diagnostics',
+        scopes: [{ pattern: 'plugins/bytebase/**', actions: ['read', 'call'] }],
+      },
+    ],
+  }
+
+  it('loads confidential clients and the Feishu identity provider reference together', () => {
+    const config = configFromEnv({
+      TB_FEISHU_LOGIN_SECRET_REF: 'feishu-app',
+      TB_OAUTH_DELEGATION_CLIENTS: JSON.stringify([client]),
+    })
+    expect(config.feishuLoginSecretRef).toBe('feishu-app')
+    expect(config.oauthDelegationClients).toMatchObject([
+      {
+        clientId: 'tcode',
+        accessTokenTtlSeconds: 900,
+        refreshTokenTtlSeconds: 30 * 24 * 3_600,
+      },
+    ])
+  })
+
+  it('rejects broad delegated system scopes at the environment boundary', () => {
+    const unsafe = structuredClone(client)
+    unsafe.grants[0]!.scopes = [{ pattern: 'system/**', actions: ['read', 'call'] }]
+    expect(() =>
+      configFromEnv({ TB_OAUTH_DELEGATION_CLIENTS: JSON.stringify([unsafe]) }),
+    ).toThrow(/delegated scopes cannot target/)
+  })
+})

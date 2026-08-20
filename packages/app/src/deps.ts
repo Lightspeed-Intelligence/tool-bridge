@@ -16,6 +16,7 @@ import type {
   TreePath,
 } from '@tool-bridge/core'
 import type { Context, Hono } from 'hono'
+import type { OAuthDelegationClient } from './oauthDelegation'
 import type { PluginBindings } from './providers/pluginClient'
 import type { UpstreamProvider } from './providers/types'
 import type { RemoteSettings } from './providers/remote'
@@ -83,6 +84,11 @@ export interface TbAppDeps {
    *   该 app 须有通讯录读权限;open_id 归属登录 app,须同 app 转 union_id)。
    */
   meegoBind?: { loginSecretRef?: string, nodePath: string, secretRef: string }
+  /**
+   * Confidential automation clients allowed to obtain user-delegated, short-lived SKs. Redirect
+   * URIs and named scope bundles are exact allowlists; undefined disables the flow.
+   */
+  oauthDelegationClients?: OAuthDelegationClient[]
   /** context 平台对象存储('r2' provider 的落点);缺省 → 该 provider unavailable。 */
   objects?: () => Promise<ObjectStore> | ObjectStore
   /**

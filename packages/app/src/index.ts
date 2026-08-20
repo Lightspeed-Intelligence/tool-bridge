@@ -81,9 +81,20 @@ export {
   type StartAuthorizationResult,
   startMcpAuthorization,
 } from './oauth'
+// --- OAuth delegation for confidential automation clients ---
+export {
+  OAUTH_DELEGATION_AUTHORIZE_PATH,
+  OAUTH_DELEGATION_REVOKE_PATH,
+  OAUTH_DELEGATION_TOKEN_PATH,
+  type OAuthDelegationClient,
+  type OAuthDelegationGrant,
+  parseOAuthDelegationClients,
+  parseOAuthDelegationClientsJson,
+} from './oauthDelegation'
 // --- Provider 接线零件(自建宿主按需装配)---
 export { createHttpProvider, type HttpConfig } from './providers/http'
 export { createMcpProvider, invalidateMcpEra, type McpConfig } from './providers/mcp'
+
 // --- Plugin 传输(平台 → Plugin 的信封通道;binding: 为进程内直调)---
 export {
   callPlugin,
@@ -93,16 +104,15 @@ export {
   probePlugin,
   resolvePluginEndpoint,
 } from './providers/pluginClient'
-
 export type { PluginBindings } from './providers/pluginClient'
 export { createPluginContextProvider, type PluginContextOptions } from './providers/pluginContext'
-export { createPluginToolProvider } from './providers/pluginTool'
 
+export { createPluginToolProvider } from './providers/pluginTool'
 export { assertRemoteAllowed, passthroughRemote, type RemoteConfig } from './providers/remote'
+
 export type { RemoteSettings } from './providers/remote'
 
 export { createS3ObjectStore, type S3StoreConfig } from './providers/s3Object'
-
 // --- 大对象 $ref:预签名与网关中转 token ---
 export { encodeObjectKey, presignS3Url } from './providers/s3Sign'
 export {
@@ -122,4 +132,5 @@ export {
   type SearchDirtyMarker,
   SearchSynchronizer,
 } from './search/synchronizer'
+
 export { createTbApp } from './tbApp'

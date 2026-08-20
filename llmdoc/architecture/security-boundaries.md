@@ -11,6 +11,8 @@
 - 上游密钥只进入 SecretStore；节点记录只含 `authRef`。
 - `providerConfig` 是可回显配置，不得存密钥。
 - OAuth client credential、access/refresh token 分槽处理；挂载、授权和调用各自验证所需状态。
+- 自动化客户端的用户委托同时要求预注册 redirect URI、机密客户端认证与 PKCE；命名 grant
+  在部署配置中映射为固定 scope，禁止委托 system/device/admin/register 能力。
 - 首次 bootstrap 默认要求部署者提供 Admin SK。Workers 和 SDK fail closed；Node 仅保留显式 `TB_ALLOW_INSECURE_BOOTSTRAP=true` 的本地开发逃生口。
 
 ## 出站

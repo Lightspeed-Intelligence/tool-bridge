@@ -73,9 +73,21 @@ export function defaultLoginScopes(): Scope[] {
 
 // ---------- state(AES-256-GCM,零存储;域前缀区隔 mcp-oauth 的 state 密钥)----------
 
-/** state 载荷:n = CSRF nonce,exp = 过期时刻;d=true 表示回调交给 Dashboard。 */
+export interface DelegationLoginState {
+  clientId: string
+  clientState: string
+  codeChallenge: string
+  grantNames: string[]
+  redirectUri: string
+}
+
+/**
+ * state 载荷:n = CSRF nonce,exp = 过期时刻;d=true 表示回调交给 Dashboard；delegation
+ * 是 OAuth 委托请求，完整内容只存在于 AES-GCM 密文内。
+ */
 export interface LoginStatePayload {
   d?: true
+  delegation?: DelegationLoginState
   exp: number
   n: string
 }
@@ -101,6 +113,20 @@ export async function sealLoginState(payload: LoginStatePayload, secret: string)
   return `${base64urlEncode(iv)}.${base64urlEncode(new Uint8Array(ciphertext))}`
 }
 
+function isDelegationLoginState(value: unknown): value is DelegationLoginState | undefined {
+  if (value === undefined) return true
+  if (typeof value !== 'object' || value === null) return false
+  const candidate = value as Partial<DelegationLoginState>
+  return (
+    typeof candidate.clientId === 'string'
+    && typeof candidate.clientState === 'string'
+    && typeof candidate.codeChallenge === 'string'
+    && typeof candidate.redirectUri === 'string'
+    && Array.isArray(candidate.grantNames)
+    && candidate.grantNames.every(name => typeof name === 'string')
+  )
+}
+
 /** 解密 state;任何失败(格式/解密/形状)→ null。过期判定留给调用方(便于测钟)。 */
 export async function openLoginState(
   state: string,
@@ -122,6 +148,8 @@ export async function openLoginState(
       typeof payload.n !== 'string'
       || typeof payload.exp !== 'number'
       || (payload.d !== undefined && payload.d !== true)
+      || !isDelegationLoginState(payload.delegation)
+      || (payload.d === true && payload.delegation !== undefined)
     ) return null
     return payload
   } catch {
@@ -141,6 +169,23 @@ export async function newLoginState(
       n: nonce,
       exp: Math.floor(nowMs / 1000) + STATE_TTL_SEC,
       ...(opts?.dashboard === true ? { d: true as const } : {}),
+    },
+    secret,
+  )
+}
+
+/** OAuth 委托复用同一飞书身份认证回调，但不签发 Dashboard/CLI 登录 SK。 */
+export async function newDelegationLoginState(
+  secret: string,
+  nowMs: number,
+  delegation: DelegationLoginState,
+): Promise<string> {
+  const nonce = base64urlEncode(crypto.getRandomValues(new Uint8Array(16)))
+  return await sealLoginState(
+    {
+      n: nonce,
+      exp: Math.floor(nowMs / 1000) + STATE_TTL_SEC,
+      delegation,
     },
     secret,
   )
