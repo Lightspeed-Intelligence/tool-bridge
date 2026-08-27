@@ -52,7 +52,14 @@
     // ⚠️ 必须留在此文件:wrangler deploy 的 vars 以本文件为准、不合并线上已有值——
     // 2026-08-08 的部署曾因此把这两项抹掉,导致此后登录全部静默跳过绑定。
     "TB_MEEGO_BIND_NODE": "plugins/meego",
-    "TB_MEEGO_SECRET_REF": "meego-app"
+    "TB_MEEGO_SECRET_REF": "meego-app",
+    // 本实例在 X-TB-Via 链里的标识,用于联邦递归的环路检测(链中已含自己 → 判环拒绝)。
+    // 显式配置它是 `search:federated` 能力的三个前提之一(另两个是 StateStore 原子 CAS
+    // 与 SearchIndex.revision(),D1 已满足);缺省会从入站 host 派生,但派生值不稳定,
+    // 联邦 cursor 与 revision 绑定都依赖它,故必须钉死。
+    // 约束:全联邦网络内唯一、且**不含逗号**(Via 是逗号分隔链);一旦对外提供联邦
+    // 就不应再改 —— 改了等于换了身份,在途的联邦分页会 fail closed。
+    "TB_INSTANCE_ID": "tool-bridge.fantacy.live"
   },
   // D1:**一个库,两个 binding**(id 由 scripts/provision.mjs 幂等创建后回填;本地
   // wrangler dev / vitest-pool-workers 用 miniflare 本地实例,不校验 id)。
