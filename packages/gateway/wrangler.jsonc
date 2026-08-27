@@ -70,12 +70,12 @@
     {
       "binding": "TB_STATE",
       "database_name": "tb-db",
-      "database_id": "00000000-0000-0000-0000-000000000000"
+      "database_id": "6e656585-1cee-431a-a8d7-db199c85bd9c"
     },
     {
       "binding": "TB_SEARCH",
       "database_name": "tb-db",
-      "database_id": "00000000-0000-0000-0000-000000000000"
+      "database_id": "6e656585-1cee-431a-a8d7-db199c85bd9c"
     }
   ],
   // R2:部署级 default Store、context r2 provider 与大对象 $ref。

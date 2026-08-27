@@ -116,9 +116,34 @@ if (DRY) {
 // ---------- 3. 建表 + 批量 upsert ----------
 console.log('\n[3/4] 写入 D1(建表 + 分批 upsert)...')
 const sqlFile = join(tmpdir(), `kv2d1-${Date.now()}.sql`)
+/**
+ * 按**累计字节**切批,而不是按条数。
+ *
+ * 2026-08-26 实测:固定条数分批会把 `toolcache:mcp/yunxiao`(166 KB)、
+ * `toolcache:mcp/tipsy`(44 KB)这类大值和小条目打进同一个 SQL 文件,整批执行失败,
+ * 连同批内的 `sys:bootstrapped` / `sk:i:*` 一起迁不过去。按字节切批后大值自成一批。
+ */
+const MAX_BATCH_BYTES = 400_000
+function* batches(all) {
+  let cur = []
+  let bytes = 0
+  for (const pair of all) {
+    const size = pair[0].length + pair[1].length + 64
+    // 单条即超阈值 → 自己一批;否则累计到阈值就切。
+    if (cur.length > 0 && (bytes + size > MAX_BATCH_BYTES || cur.length >= BATCH)) {
+      yield cur
+      cur = []
+      bytes = 0
+    }
+    cur.push(pair)
+    bytes += size
+  }
+  if (cur.length > 0) yield cur
+}
+
 try {
-  for (let off = 0; off < pairs.length; off += BATCH) {
-    const chunk = pairs.slice(off, off + BATCH)
+  let done = 0
+  for (const chunk of batches(pairs)) {
     const stmts = [
       'CREATE TABLE IF NOT EXISTS tb_state_kv (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;',
       ...chunk.map(([k, v]) =>
@@ -127,7 +152,8 @@ try {
     ]
     writeFileSync(sqlFile, stmts.join('\n'), 'utf8')
     wrangler(['d1', 'execute', DB, '--remote', '--file', sqlFile, '--yes'], { quiet: true })
-    console.log(`  ${Math.min(off + BATCH, pairs.length)}/${pairs.length}`)
+    done += chunk.length
+    console.log(`  ${done}/${pairs.length}`)
   }
 } finally {
   try {
