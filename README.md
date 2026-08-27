@@ -78,7 +78,7 @@ npm install -g @tool-bridge/cli
 tb login --base-url http://127.0.0.1:8787   # 按提示输入刚才保存的 Admin SK
 tb tree --depth 2                           # 浏览当前身份可见的树
 tb help system/status                      # 阅读节点的实时契约
-tb call system/status --tool get           # 调用节点上的 get
+tb call system/status/get                  # 调用节点上的 get 命令
 ```
 
 部署包含 Dashboard，可直接打开 [http://127.0.0.1:8787/ui](http://127.0.0.1:8787/ui)。Dashboard 使用同一套公开 API，SK 只保存在浏览器本地。
@@ -92,8 +92,8 @@ curl -H "Authorization: Bearer $TB_ADMIN_SK" \
 curl -X POST \
   -H "Authorization: Bearer $TB_ADMIN_SK" \
   -H "Content-Type: application/json" \
-  -d '{"tool":"get","arguments":{}}' \
-  http://127.0.0.1:8787/system/status
+  -d '{}' \
+  http://127.0.0.1:8787/system/status/get
 ```
 
 `~help` 默认返回 Markdown；使用 `Accept: text/plain` 可获得紧凑 Help DSL，使用 `Accept: application/json` 可获得包含 JSON Schema 的结构化描述。
@@ -125,11 +125,30 @@ Skill 会先验证目标，再搜索或逐级浏览、读取工具级 schema 与
 | 使用方式 | 当前入口 | 典型用途 |
 |---|---|---|
 | 接入已有工具 | MCP、声明式 HTTP、内置集成、外部 Plugin | 给 Agent 提供统一发现与调用入口 |
+| 存储设备产物和附件 | 部署自带的 default Store、SDK、CLI、Dashboard | 上传照片/视频/录音，获得稳定 URI，并按需短期分享 |
 | 管理上下文与技能 | R2、S3、Node 文件对象存储、Plugin Context、Skillhub | 统一读写、搜索文档与对象，发布和获取 Agent Skill |
 | 接入本地机器 | `tb daemon install`、`tb connect`、SDK `connect()` | 从内网主动连接，按白名单暴露 shell、文件或本地函数 |
 | 共享使用经验 | 每个路径的 `~feedback`、CLI、Dashboard | 让后续 Agent 在调用前看到已验证的坑和建议 |
 | 联邦多个团队 | remote 节点、`system/federation` | 把另一棵 HTBP 树挂成子树，不共享本地调用者凭据 |
 | 兼容 MCP 客户端 | `/<base>/~mcp` | 将当前身份可见的工具投影为 MCP server |
+
+### 上传设备产物与普通附件
+
+每个标准部署都自带一个与 Context 独立的 default Store。Node/Docker 默认写入 `/data` 卷，
+Cloudflare 默认写入部署时创建的 R2 bucket；设备拍照、视频和录音不需要先挂载 Context：
+
+```sh
+tb store upload ./capture.jpg --json
+tb store ls
+tb store stat store://default/<objectId>
+tb store get store://default/<objectId> --out ./capture.jpg
+tb store share store://default/<objectId> --ttl 3600 --json
+tb store revoke-share <shareId>
+```
+
+`store://default/...` 是稳定标识，本身不授予读取权限。`share` 返回的 `$ref` 是短期 bearer，
+只会在这次成功命令的 stdout/JSON 中出现；不要写入日志。Context upload 仍用于“把二进制写到某个
+语义 Context 的命名 entry”，与 Store 的匿名设备产物用途不同。
 
 ### 接入工具与上下文
 
@@ -144,7 +163,7 @@ tb tool mount tools/docs \
   --url https://mcp.example.com/mcp
 
 tb help tools/docs
-tb call tools/docs --tool search --args '{"query":"tool-bridge"}'
+tb call tools/docs/search --args '{"query":"tool-bridge"}'
 ```
 
 S3 兼容对象存储可以挂成 Context namespace。凭证只写入 SecretStore，节点记录只保存引用名：
@@ -160,7 +179,17 @@ tb ctx mount ctx/docs \
 
 tb ctx ls ctx/docs
 tb ctx cat ctx/docs notes/readme.md
+tb ctx upload ctx/docs photos/shot.jpg --file ./shot.jpg
+# 只有确认需要替换已有对象时才加 --force
+# tb ctx upload ctx/docs photos/shot.jpg --file ./shot.jpg --force
 ```
+
+`ctx upload` 先向 namespace 的 `create_upload` 申请定路径、限时的 presigned PUT，再把
+文件二进制直接发送到对象存储；网关只看到 `{path, contentType, overwrite?}`。缺省上传会用
+条件 PUT 拒绝覆盖同名对象，只有 CLI `--force` 或 Dashboard 二次确认才允许替换。
+命令输出的是可长期保存的 `node://...` URI，不会打印临时上传
+URL。Cloudflare R2 宿主需额外配置 presign 凭证；从 Dashboard 直传时还要为 Dashboard
+origin 配置 bucket CORS。
 
 完整参数以 `tb <command> --help` 和 [`packages/cli/README.md`](packages/cli/README.md) 为准。
 
@@ -184,6 +213,12 @@ Shell 默认拒绝所有命令，只有显式 allowlist 中的命令可以执行
 调试时仍可运行同参数的 `tb connect`。远端调用者随后可以通过同一棵树发现
 `device/build-01`。长驻容器和 Kubernetes sidecar 示例见
 [`packages/cli/CONTAINER.md`](packages/cli/CONTAINER.md)。
+
+只读诊断不必经过 arbitrary shell。`--command-profile <file>` 可以把固定 executable、无隐式 shell
+的 argv 模板、输入 schema 和显式 `effect/confirm` 暴露为结构化设备命令；配合 `--no-shell` 可完全
+移除 shell 节点。格式与安全边界见
+[`packages/cli/examples/structured-command-profile.json`](packages/cli/examples/structured-command-profile.json)
+和 [`packages/cli/README.md`](packages/cli/README.md)。
 
 ## 让 Agent 共享真实使用反馈
 
@@ -226,11 +261,15 @@ tb help teams/team-b/tools/search
 
 ## 部署与嵌入
 
-| 形态 | 状态与对象 | 适合场景 |
-|---|---|---|
-| **Node / Docker** | SQLite + 本地文件系统；单容器和 `/data` 卷 | 自托管、内网、快速本地验证 |
-| **Cloudflare Workers** | KV + R2 + D1 + Durable Objects | 边缘部署、低运维、设备长连接 |
-| **嵌入式 SDK** | 由调用方注入 store/provider | 在自己的 Node/Workers 应用里注册本地函数 |
+| 形态 | 状态 / 对象 / 设备 | 副本 | 适合场景 |
+|---|---|---|---|
+| **Docker 单容器** | SQLite + 本地文件系统 + 进程内 WebSocket | 1 | 自托管、内网、快速验证 |
+| **Docker Compose** | PostgreSQL(+ 可选 S3/R2、Redis) | 1–2(单机) | 单机生产、含 HA 参考栈,见 [`deploy/compose/`](deploy/compose/docker-compose.yml) |
+| **Kubernetes(Helm)** | PostgreSQL + S3/R2 + Redis → 无状态多副本;或 SQLite + PVC 单副本 | 1–N | 多副本生产、滚动更新,见 [`deploy/helm/tool-bridge/`](deploy/helm/tool-bridge) |
+| **Cloudflare Workers** | D1 + R2 + Durable Objects | serverless | 边缘部署、低运维、设备长连接 |
+| **嵌入式 SDK** | 由调用方注入 store/provider | — | 在自己的 Node/Workers 应用里注册本地函数 |
+
+Node 宿主的横向扩容公式:**PG(`TB_DATABASE_URL`)+ S3/R2(`TB_OBJECT_STORE_*`)+ Redis(`TB_REDIS_URL`)三件配齐即无状态多副本**;只配前两件是"容器可随意重建、但别扩副本"的单副本无状态形态。Helm chart 会在渲染期直接拒绝危险组合(如 `replicas>1 + SQLite`)。健康探针:`/livez`(liveness)、`/readyz`(readiness,探后端连通 + 优雅关停时提前摘流量)、`/healthz`(版本与 catalog 对拍)。
 
 ### Cloudflare Workers
 
@@ -247,7 +286,9 @@ npm install -g @tool-bridge/cli
 tb init cloudflare --repo .
 ```
 
-向导负责登录/选择账户、生成 trust roots、创建 KV/R2/D1、构建部署、验证 `~help` 并保存本机 profile。非交互环境使用 `--account-id <id> --yes`，自定义域使用 `--domain tb.example.com`。
+向导负责登录/选择账户、生成 trust roots、创建 R2/D1、构建部署、验证 `~help` 并保存本机 profile。非交互环境使用 `--account-id <id> --yes`，自定义域使用 `--domain tb.example.com`。
+
+部署完成后还要在 Cloudflare Dashboard 的 `D1 → <数据库> → Settings` 打开 **Read Replication**。gateway 已按请求使用 D1 Sessions（State/Search 首读 primary，后续读可使用满足 bookmark 的副本）并默认启用 Smart Placement；若数据库未开复制，行为仍正确但查询仍由 primary 服务。响应里的 `Server-Timing` 与 Workers Logs 的 `tool_bridge_slow_request` 可区分 D1 网络等待、SQL 时间和应用/上游耗时。
 
 ### 嵌入自己的应用
 
@@ -256,16 +297,18 @@ npm install @tool-bridge/sdk
 ```
 
 ```ts
-import { createToolBridge, MemoryStateStore } from '@tool-bridge/sdk'
+import { createToolBridge, MemoryObjectStore, MemoryStateStore } from '@tool-bridge/sdk'
 
 const tb = createToolBridge({
   state: new MemoryStateStore(),
+  // Store 是必备部署能力；内存 driver 仅适合示例/测试，生产请注入持久 FS、R2 或 S3。
+  objects: new MemoryObjectStore(),
   adminSk: process.env.TB_BOOTSTRAP_ADMIN_SK!,
 })
 
 tb.registerTool('tools/echo', {
-  List: () => [{ name: 'echo', description: 'Return the input text' }],
-  Call: (_name, args) => ({ content: { echoed: args.text } }),
+  list: () => [{ name: 'echo', description: 'Return the input text' }],
+  call: (_name, args) => ({ content: { echoed: args.text } }),
 })
 
 export default { fetch: tb.fetch }
@@ -279,7 +322,7 @@ Node HTTP server、反向连接和自定义 store 说明见 [`packages/sdk/READM
 - 不可见路径在 `~help`、`~tree` 和调用中返回 404，避免泄露节点是否存在。
 - 上游密钥进入只写 SecretStore；节点配置、日志和只读管理响应不返回密钥值。
 - 内置 Plugin 与网关同进程同权，并使用受控出站；外部 Plugin 在注册时校验 descriptor 和健康状态。
-- Workers KV 的吊销和注册读取存在最终一致窗口；需要强一致状态时优先使用 Node/SQLite 宿主。
+- 三宿主的权威状态均为强一致后端(Workers=D1、Node=SQLite/PG),SK 吊销即时生效。
 
 签发最小权限 SK 的示例：
 
@@ -297,7 +340,7 @@ tb sk create \
 | `packages/core` | 树、授权、协议、store、builtin 等纯逻辑 |
 | `packages/app` | 宿主中立的 Hono 应用与 provider 编排 |
 | `packages/server` | Node/SQLite/文件/WebSocket 宿主 |
-| `packages/gateway` | Cloudflare KV/R2/D1/DO/Assets 宿主 |
+| `packages/gateway` | Cloudflare D1/R2/DO/Assets 宿主 |
 | `packages/cli` | `tb` CLI、设备连接与 Cloudflare 初始化 |
 | `packages/dashboard` | 使用公开 API 的 Web 管理面 |
 | `packages/sdk` | 嵌入式实例、本地 provider 与反向连接 |

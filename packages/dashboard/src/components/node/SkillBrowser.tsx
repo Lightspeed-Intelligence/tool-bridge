@@ -11,7 +11,6 @@ import {
   Trash2,
   X,
 } from 'lucide-react'
-import { useQueryClient } from '@tanstack/react-query'
 import { useEffect, useState } from 'react'
 import Markdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -25,7 +24,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import { useInvoke, useSkill, useSkillFile, useSkills } from '@/lib/queries'
+import { useInvalidate, useInvoke, useSkill, useSkillFile, useSkills } from '@/lib/queries'
 import { ConfirmAction } from '@/components/ConfirmAction'
 import { CopyButton } from '@/components/CopyButton'
 import { EmptyState } from '@/components/EmptyState'
@@ -533,8 +532,7 @@ function SkillPublishDialog({
     }
     try {
       const r = await invoke.mutateAsync({
-        path,
-        tool: 'Publish',
+        commandPath: `${path}/publish`,
         args: { ...(id.trim() ? { id: id.trim() } : {}), files },
       })
       const published = (r.json as { id?: string })?.id ?? id.trim()
@@ -656,9 +654,9 @@ function SkillPublishDialog({
  * 与 `tb skill ls|cat|publish|rm` 走同一数据面,无管理旁路。
  */
 export function SkillBrowser({ path, cmds }: { cmds: HelpCmd[], path: string }) {
-  const canPublish = cmds.some(c => c.name === 'Publish')
-  const canRemove = cmds.some(c => c.name === 'Remove')
-  const canSearch = cmds.some(c => c.name === 'Search')
+  const canPublish = cmds.some(c => c.name === 'publish')
+  const canRemove = cmds.some(c => c.name === 'remove')
+  const canSearch = cmds.some(c => c.name === 'search')
 
   const [queryInput, setQueryInput] = useState('')
   const query = useDebounced(queryInput)
@@ -666,18 +664,18 @@ export function SkillBrowser({ path, cmds }: { cmds: HelpCmd[], path: string }) 
 
   const skills = useSkills(path, effectiveQuery)
   const invoke = useInvoke()
-  const qc = useQueryClient()
+  const invalidate = useInvalidate()
   const desktop = useDesktopLayout()
 
   const [selected, setSelected] = useState<string | null>(null)
   const [mobileViewing, setMobileViewing] = useState<string | null>(null)
   const [publishing, setPublishing] = useState(false)
 
-  const refresh = () => qc.invalidateQueries({ queryKey: ['tb'] })
+  const refresh = () => invalidate()
 
   const remove = async (id: string) => {
     try {
-      await invoke.mutateAsync({ path, tool: 'Remove', args: { id } })
+      await invoke.mutateAsync({ commandPath: `${path}/remove`, args: { id } })
       toast.success(`已删除 ${id}`)
       setSelected(current => (current === id ? null : current))
       setMobileViewing(current => (current === id ? null : current))

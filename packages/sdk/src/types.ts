@@ -16,13 +16,13 @@ import { type BuiltinCatalog,
 export type Awaitable<T> = T | Promise<T>
 
 /**
- * SDK 使用者手写的工具源:**只有 List 与 Call 两个动词**。
- * 此前还强制 `Get`,但平台从不发 Get(`~help` 的数据源是 List 产出的 ToolSpec[]),
+ * SDK 使用者手写的工具源:**只有 list 与 call 两个动词**(全小写,cmd 名 = 方法名)。
+ * 此前还强制 `get`,但平台从不发 get(`~help` 的数据源是 list 产出的 ToolSpec[]),
  * 那是纯样板 —— 已随 core 的 `ToolProvider` 一并删除。方法可同步可异步。
  */
 export interface ToolProviderLike {
-  Call(name: string, args: Record<string, unknown>): Awaitable<ToolResult>
-  List(): Awaitable<ToolSpec[]>
+  call(name: string, args: Record<string, unknown>): Awaitable<ToolResult>
+  list(): Awaitable<ToolSpec[]>
 }
 
 /**
@@ -31,6 +31,17 @@ export interface ToolProviderLike {
  * 与 plugin 作者面(`@tool-bridge/plugin-sdk`)同一套内核。
  */
 export type ToolSource = OperationRegistry | ToolProviderLike
+
+/** SDK 宿主对联邦搜索施加的部署级硬上限；缺省字段由 app 使用安全默认值。 */
+export interface FederatedSearchConfig {
+  maxConcurrency?: number
+  maxResponseBodyBytes?: number
+  maxSources?: number
+  minChildWorkMs?: number
+  perHopReturnReserveMs?: number
+  sessionTtlMs?: number
+  totalDeadlineMs?: number
+}
 
 /** createToolBridge 配置(标准签名 + SDK 引导扩展,后者见各字段注释)。 */
 export interface ToolBridgeConfig {
@@ -43,6 +54,8 @@ export interface ToolBridgeConfig {
   allowInsecureHttp?: boolean
   /** secrets 缺省实现的主密钥(base64url 32B);缺省取 env TB_SECRET_ENCRYPTION_KEY。 */
   encryptionKey?: string
+  /** 联邦搜索并发、deadline、响应体与 continuation session 的部署级硬上限。 */
+  federatedSearch?: FederatedSearchConfig
   /** Existing interactive-login SK lifetime in seconds. */
   feishuLoginKeyTtlSec?: number
   /** SecretStore reference for the Feishu app used to authenticate delegated users. */
@@ -53,8 +66,11 @@ export interface ToolBridgeConfig {
   maxHops?: number
   /** Exact confidential-client redirect and scope allowlists for OAuth delegation. */
   oauthDelegationClients?: OAuthDelegationClient[]
-  /** context 对象('r2' 平台 provider 的落点);缺省 → 该 provider unavailable。 */
-  objects?: ObjectStore
+  /**
+   * default Store 与对象型 Context 的共享字节 driver。Store 是部署必备能力，
+   * 嵌入宿主必须显式注入；测试/明确易失开发可使用 MemoryObjectStore。
+   */
+  objects: ObjectStore
   /** 进程内插件装配表(binding 名 → fetch handler);`binding:<name>` 插件经此直调。 */
   pluginBindings?: PluginBindings
   /**
@@ -66,6 +82,11 @@ export interface ToolBridgeConfig {
    * 按同形状给自己那份。
    */
   pluginCatalog?: BuiltinCatalog
+  /**
+   * Provider OAuth 令牌端点的出站通道。SDK 不会回退到全局 fetch；嵌入方启用
+   * Provider OAuth 时必须显式注入，并负责逐跳出站策略与跨源 body 重定向保护。
+   */
+  providerOAuthFetch?: typeof fetch
 
   // ---- 以下为 SDK 引导扩展(标准签名未列) ----
 
@@ -81,6 +102,8 @@ export interface ToolBridgeConfig {
   secrets?: SecretStoreImpl
   /** 树配置 / SK / manifest 的存取(宿主注入;内存宿主可用 MemoryStateStore)。 */
   state: StateStore
+  /** create_upload 写入 grant 有效期秒；缺省 900，最大 604800。 */
+  uploadGrantTtlSec?: number
 }
 
 /** Connection(state 词表与 core DeviceClientState 逐字一致)。 */

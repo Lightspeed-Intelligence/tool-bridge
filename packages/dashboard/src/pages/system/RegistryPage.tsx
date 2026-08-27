@@ -10,11 +10,17 @@ import {
   Search,
   Trash2,
 } from 'lucide-react'
-import { useQueryClient } from '@tanstack/react-query'
 import { useMemo, useState } from 'react'
 import { Link } from 'react-router'
 import { toast } from 'sonner'
 import type { RegistryNode } from '@/lib/types'
+import {
+  useIntegrationCatalog,
+  useInvalidate,
+  useInvoke,
+  useOAuthAuthorize,
+  useRegistryList,
+} from '@/lib/queries'
 import {
   Dialog,
   DialogContent,
@@ -30,26 +36,22 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import {
-  useIntegrationCatalog,
-  useInvoke,
-  useOAuthAuthorize,
-  useRegistryList,
-} from '@/lib/queries'
+import { AddToolWizard } from '@/components/add-tool/AddToolWizard'
 import { PaginationFooter } from '@/components/PaginationFooter'
+import { PresenceBadge } from '@/components/PresenceBadge'
 import { ConfirmAction } from '@/components/ConfirmAction'
 import { CopyButton } from '@/components/CopyButton'
 import { EmptyState } from '@/components/EmptyState'
 import { PageHeader } from '@/components/PageHeader'
 import { Skeleton } from '@/components/ui/skeleton'
 import { KindBadge } from '@/components/KindBadge'
+import { derivePresence } from '@/lib/presence'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
 import { encodeTreePath } from '@/lib/path'
 import { cn } from '@/lib/utils'
 import { showsAuthorizeAction } from './forms/registryConfig'
-import { IntegrationDialog } from './forms/IntegrationDialog'
 import { MountDialog } from './forms/MountDialog'
 
 const KIND_FILTERS = [
@@ -171,14 +173,15 @@ function ConfigFact({ label, value }: { label: string, value: string }) {
 
 /**
  * 节点注册管理(对等 `tb tool mount|rm` / `tb server add|ls|rm` / `tb ctx mount|unmount`;
- * E2E-6 ④ 的 Dashboard 写路径)。底层同一接口:POST /system/registry {tool: list|write|delete}。
+ * E2E-6 ④ 的 Dashboard 写路径)。底层走完整命令路径
+ * `POST /system/registry/<list|write|delete>`，body 是裸 arguments 对象。
  */
 export function RegistryPage() {
   const list = useRegistryList()
   const catalog = useIntegrationCatalog()
   const invoke = useInvoke()
   const oauth = useOAuthAuthorize()
-  const qc = useQueryClient()
+  const invalidate = useInvalidate()
   const [kindFilter, setKindFilter] = useState<KindFilter>('all')
   const [search, setSearch] = useState('')
   const [inspecting, setInspecting] = useState<RegistryNode | null>(null)
@@ -192,9 +195,9 @@ export function RegistryPage() {
 
   const unmount = async (path: string) => {
     try {
-      await invoke.mutateAsync({ path: 'system/registry', tool: 'delete', args: { path } })
+      await invoke.mutateAsync({ commandPath: 'system/registry/delete', args: { path } })
       toast.success(`已卸载 ${path}`)
-      await qc.invalidateQueries({ queryKey: ['tb'] })
+      await invalidate()
     } catch (error) {
       toast.error(error instanceof Error ? error.message : '卸载节点失败')
       throw error
@@ -256,8 +259,8 @@ export function RegistryPage() {
       <PageHeader
         actions={(
           <div className="flex flex-wrap gap-2">
-            {/* 常见路径在前:挂一个现成集成。通用挂载器降为次要按钮。 */}
-            <IntegrationDialog />
+            {/* 统一入口:选来源 → 配置 → 挂载并预检。旧的分散 dialog 收敛进向导。 */}
+            <AddToolWizard />
             <MountDialog
               existingNodes={mounted}
               existingPaths={mounted.map(node => node.path)}
@@ -265,7 +268,7 @@ export function RegistryPage() {
               trigger={(
                 <Button size="sm" variant="outline">
                   <Plus />
-                  挂载节点
+                  通用挂载器
                 </Button>
               )}
             />
@@ -432,27 +435,29 @@ export function RegistryPage() {
                                 </p>
                               )}
                             </TableCell>
+                            {/*
+                              数据源是 system/registry(存储态):device 节点带裸 online +
+                              lastSeenAt,非 device 节点两者都缺 → 'registered'。三态在客户端
+                              派生,避免把丢了拆除事件的 online 报成在线。
+                            */}
                             <TableCell>
-                              <Badge
-                                className={cn(
-                                  'font-mono text-[10px]',
-                                  node.online === true && 'border-ok/35 bg-ok/[0.045] text-ok',
-                                  node.online === false && 'text-muted-foreground',
-                                )}
-                                variant="outline"
-                              >
-                                <span
-                                  className={cn(
-                                    'size-1.5 rounded-full bg-muted-foreground',
-                                    node.online === true && 'bg-ok',
+                              {node.online === undefined
+                                ? (
+                                    <Badge className="font-mono text-[10px]" variant="outline">
+                                      <span className="size-1.5 rounded-full bg-muted-foreground" />
+                                      registered
+                                    </Badge>
+                                  )
+                                : (
+                                    <PresenceBadge
+                                      state={derivePresence({
+                                        online: node.online,
+                                        ...(node.lastSeenAt !== undefined
+                                          ? { lastSeenAt: node.lastSeenAt }
+                                          : {}),
+                                      }).state}
+                                    />
                                   )}
-                                />
-                                {node.online === undefined
-                                  ? 'registered'
-                                  : node.online
-                                    ? 'online'
-                                    : 'offline'}
-                              </Badge>
                             </TableCell>
                             <TableCell>
                               <div className="flex justify-end gap-1">
@@ -524,6 +529,20 @@ export function RegistryPage() {
             <div className="flex flex-wrap items-center gap-2 pr-8">
               <DialogTitle className="font-mono text-base">{inspecting?.path}</DialogTitle>
               {inspecting && <KindBadge kind={inspecting.kind} />}
+              {inspecting && (
+                <Button
+                  aria-label={`打开 ${inspecting.path} 工具详情`}
+                  asChild
+                  className="ml-auto"
+                  size="icon-sm"
+                  title="打开工具详情"
+                  variant="ghost"
+                >
+                  <Link to={`/nodes/${encodeTreePath(inspecting.path)}`}>
+                    <ExternalLink />
+                  </Link>
+                </Button>
+              )}
             </div>
             <DialogDescription>
               内置集成的凭证由平台管理；这里不展示密钥或内部引用。

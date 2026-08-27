@@ -2,6 +2,8 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { CatalogListItem } from '@/lib/types'
 
+const { toastMessages } = vi.hoisted(() => ({ toastMessages: [] as string[] }))
+
 /**
  * `IntegrationDialog` 的**组件级**行为。
  *
@@ -58,12 +60,13 @@ const SENTRY: CatalogListItem = {
 }
 
 /** 记录 invoke 调用顺序(测试的核心观测点)。 */
-const calls: Array<{ args: Record<string, unknown>, path: string, tool: string }> = []
+const calls: Array<{ args: Record<string, unknown>, commandPath: string }> = []
 const oauthCalls: string[] = []
 let failMount = false
 let secretNames = ['shared-key']
 
 vi.mock('@/lib/queries', () => ({
+  useInvalidate: () => () => {},
   useIntegrationCatalog: () => ({
     data: [JIRA, SENTRY, TAVILY],
     isPending: false,
@@ -77,13 +80,13 @@ vi.mock('@/lib/queries', () => ({
   }),
   useInvoke: () => ({
     isPending: false,
-    mutateAsync: async (input: { args: Record<string, unknown>, path: string, tool: string }) => {
+    mutateAsync: async (input: { args: Record<string, unknown>, commandPath: string }) => {
       calls.push(input)
-      if (failMount && input.path === 'system/registry') throw new Error('mount rejected')
+      if (failMount && input.commandPath === 'system/registry/write') throw new Error('mount rejected')
       return { json: {} }
     },
     mutate: (
-      input: { args: Record<string, unknown>, path: string, tool: string },
+      input: { args: Record<string, unknown>, commandPath: string },
       opts?: { onSuccess?: (r: unknown) => void },
     ) => {
       calls.push(input)
@@ -102,8 +105,16 @@ vi.mock('@tanstack/react-query', () => ({
   useQueryClient: () => ({ invalidateQueries: () => {} }),
 }))
 
-vi.mock('sonner', () => ({ toast: { success: () => {}, info: () => {}, error: () => {} } }))
+vi.mock('sonner', () => ({
+  toast: {
+    error: (message: unknown) => toastMessages.push(String(message)),
+    info: (message: unknown) => toastMessages.push(String(message)),
+    success: (message: unknown) => toastMessages.push(String(message)),
+  },
+}))
 
+// 验证真实 RJSF 交互，但不把 Vite/RJSF 的冷转换时延计入 RTL 的断言超时。
+await import('@/components/SchemaFormRenderer')
 const { IntegrationDialog } = await import('@/pages/system/forms/IntegrationDialog')
 
 afterEach(() => {
@@ -115,7 +126,9 @@ afterEach(() => {
   oauthCalls.length = 0
   failMount = false
   secretNames = ['shared-key']
+  toastMessages.length = 0
   vi.restoreAllMocks()
+  vi.unstubAllGlobals()
 })
 
 /** 打开对话框并选中一个集成。 */
@@ -136,6 +149,7 @@ describe('按 descriptor 生成表单', () => {
     // `secret` 只管遮蔽:baseUrl 明文可见,PAT 遮蔽 —— 但两者都进同一个加密 secret。
     expect(baseUrl.type).toBe('text')
     expect(pat.type).toBe('password')
+    expect(baseUrl.compareDocumentPosition(pat) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0)
   })
 
   it('单值集成:只显示业务凭证，不暴露内部引用名', async () => {
@@ -167,8 +181,8 @@ describe('提交顺序', () => {
     fireEvent.click(screen.getByRole('button', { name: /添加 tavily/ }))
 
     await waitFor(() => expect(calls.length).toBe(2))
-    expect(calls[0]).toMatchObject({ path: 'system/secret', tool: 'set' })
-    expect(calls[1]).toMatchObject({ path: 'system/registry', tool: 'write' })
+    expect(calls[0]).toMatchObject({ commandPath: 'system/secret/set' })
+    expect(calls[1]).toMatchObject({ commandPath: 'system/registry/write' })
     // 挂载配置里的 authRef 与刚写的 secret 名对得上(不靠用户手打)。
     expect((calls[0]!.args as { name: string }).name).toBe('integration-tools%2Ftavily')
     expect(
@@ -193,7 +207,7 @@ describe('提交顺序', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /添加 tavily/ }))
     await waitFor(() => expect(calls.length).toBe(1))
-    expect(calls[0]).toMatchObject({ path: 'system/registry', tool: 'write' })
+    expect(calls[0]).toMatchObject({ commandPath: 'system/registry/write' })
     expect(
       ((calls[0]!.args as { config: { authRef: string } }).config).authRef,
     ).toBe('shared-key')
@@ -218,10 +232,10 @@ describe('提交顺序', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /添加 tavily/ }))
     await waitFor(() => expect(calls.length).toBe(3))
-    expect(calls.map(call => `${call.path}:${call.tool}`)).toEqual([
-      'system/secret:set',
-      'system/registry:write',
-      'system/secret:delete',
+    expect(calls.map(call => call.commandPath)).toEqual([
+      'system/secret/set',
+      'system/registry/write',
+      'system/secret/delete',
     ])
     expect(calls[2]?.args).toEqual({ name: 'integration-tools%2Ftavily' })
   })
@@ -235,9 +249,9 @@ describe('提交顺序', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /添加 tavily/ }))
     await waitFor(() => expect(screen.getByRole('alert')).toBeDefined())
-    expect(calls.map(call => `${call.path}:${call.tool}`)).toEqual([
-      'system/secret:set',
-      'system/registry:write',
+    expect(calls.map(call => call.commandPath)).toEqual([
+      'system/secret/set',
+      'system/registry/write',
     ])
   })
 
@@ -252,5 +266,22 @@ describe('提交顺序', () => {
     await waitFor(() => expect(screen.getByRole('alert')).toBeDefined())
     expect(screen.getByRole('alert').textContent).toContain('personalAccessToken')
     expect(calls).toEqual([])
+  })
+
+  it('凭证明文不进入 URL、toast 或 localStorage', async () => {
+    const secret = 'tvly-super-secret-value'
+    const setItem = vi.fn()
+    vi.stubGlobal('localStorage', {
+      clear: vi.fn(), getItem: vi.fn(), key: vi.fn(), length: 0, removeItem: vi.fn(), setItem,
+    })
+    await openAndPick('tavily')
+    fireEvent.change(screen.getByLabelText('挂载路径 *'), { target: { value: 'tools/private' } })
+    fireEvent.change(screen.getByLabelText('API key'), { target: { value: secret } })
+    fireEvent.click(screen.getByRole('button', { name: /添加 tavily/ }))
+
+    await waitFor(() => expect(calls.length).toBe(2))
+    expect(window.location.href).not.toContain(secret)
+    expect(toastMessages.join('\n')).not.toContain(secret)
+    expect(setItem.mock.calls.flat().join('\n')).not.toContain(secret)
   })
 })

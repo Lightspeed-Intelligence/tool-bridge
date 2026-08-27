@@ -7,8 +7,9 @@
  */
 
 import { z } from 'zod'
-import { type DeviceExpose, NODE_KINDS, type TreePath } from '../types'
-import { TB_ERROR_CODES, TBError, type TBErrorBody } from '../errors'
+import { type DeviceExpose, NODE_KINDS, type OwnerRef, type Timestamp, type TreePath } from '../types'
+import { tbErrorBodySchema } from '../protocol/errorWire'
+import { TBError, type TBErrorBody } from '../errors'
 
 // ---------- 帧类型(TS 定义为真源) ----------
 
@@ -32,12 +33,47 @@ export interface ErrorFrame {
   type: 'error'
 }
 
-/** 网关 → 设备:调用转发;path 相对 mountPath(如 "shell")。 */
+/**
+ * 网关鉴权后为本次 call 生成的调用方来源与权威期限。
+ * 全部由网关签发,不接受来自调用 arguments;设备只消费不自造,且不做授权裁决
+ * (scope 判定在网关侧已完成)。故意不含 scopes / SK / 敏感参数。
+ */
+export interface DeviceCallContext {
+  caller: {
+    displayName?: string
+    /** 本次调用使用的 SK id(非明文,审计用)。 */
+    keyId: string
+    owner: OwnerRef
+  }
+  /** 网关签发时刻(网关时钟,非设备本地时钟)。 */
+  createdAt: Timestamp
+  /** 本次调用的权威失效时刻;设备复检一律以此比对,不信任设备本地时钟。 */
+  expiresAt: Timestamp
+  /** 全链路观测,与 call id 同源。 */
+  traceId: string
+  /**
+   * 本次 call 独享的 Store 上传能力。token 是短期 bearer，只由 SDK 消费并放入
+   * capability-only 请求 header，设备 handler 不应把它写入结果或日志。
+   */
+  upload?: {
+    expiresAt: Timestamp
+    maxBytes: number
+    maxObjects: number
+    token: string
+  }
+}
+
+/**
+ * 网关 → 设备:调用转发。`path` 相对 mountPath 且**含命令叶子段**(如 "shell/exec"、
+ * "fs/get"、"<mountRelative>/<tool>")—— 与直连调用形态一致,命令是路径的最后一段,
+ * 不再单列 `tool` 字段。
+ */
 export interface CallFrame {
   arguments: Record<string, unknown>
+  /** 网关鉴权后的调用方来源与权威期限;老网关不带,新设备须显式降级。 */
+  context?: DeviceCallContext
   id: string
   path: string
-  tool: string
   type: 'call'
 }
 
@@ -72,12 +108,6 @@ export type DeviceFrame
 
 // ---------- 结构校验(zod;未知字段剥离,nodes 除外) ----------
 
-const tbErrorBodySchema = z.object({
-  code: z.enum(TB_ERROR_CODES),
-  message: z.string(),
-  retryable: z.boolean(),
-})
-
 /**
  * NodeInput 只做边界校验(path/kind/description),config/virtualize 等经 passthrough
  * 原样保留——注册时由 NodeRegistry 全量校验,帧层不复刻。
@@ -88,6 +118,7 @@ const deviceNodeCmdSchema = z
     name: z.string().min(1),
     description: z.string().optional(),
     inputSchema: z.unknown().optional(),
+    outputSchema: z.unknown().optional(),
     effect: z.string().optional(),
     confirm: z.boolean().optional(),
   })
@@ -120,6 +151,34 @@ const deviceExposeSchema = z.object({
 
 const idSchema = z.string().min(1)
 
+/**
+ * call 上下文:未知字段 passthrough(向前兼容后续 A/B 扩展),已知字段严格校验。
+ * displayName 可选;keyId/owner/traceId/时间戳必填。
+ */
+const deviceCallContextSchema = z
+  .object({
+    caller: z
+      .object({
+        keyId: z.string().min(1),
+        owner: z.string().min(1),
+        displayName: z.string().optional(),
+      })
+      .passthrough(),
+    traceId: z.string().min(1),
+    createdAt: z.string().min(1),
+    expiresAt: z.string().min(1),
+    upload: z
+      .object({
+        token: z.string().min(1),
+        expiresAt: z.iso.datetime({ offset: true }),
+        maxBytes: z.number().int().positive(),
+        maxObjects: z.number().int().positive(),
+      })
+      .strict()
+      .optional(),
+  })
+  .passthrough()
+
 const schemaByType = {
   hello: z.object({
     type: z.literal('hello'),
@@ -132,9 +191,9 @@ const schemaByType = {
   call: z.object({
     type: z.literal('call'),
     id: idSchema,
-    path: z.string(),
-    tool: z.string().min(1),
+    path: z.string().min(1),
     arguments: z.record(z.string(), z.unknown()),
+    context: deviceCallContextSchema.optional(),
   }),
   result: z.discriminatedUnion('ok', [
     z.object({ type: z.literal('result'), id: idSchema, ok: z.literal(true), value: z.unknown() }),

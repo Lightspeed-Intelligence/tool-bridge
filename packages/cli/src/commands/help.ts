@@ -1,18 +1,8 @@
 import { Command } from 'commander'
-import type { HelpJson } from '../types'
 import { resolveTarget, withGlobalOpts } from '../args'
-import { guard, printJson, printLine } from '../output'
-import { apiJson, apiText, CliError } from '../http'
+import { printJson, printLine } from '../output'
+import { CliError, withClient } from '../http'
 import { printMarkdown } from '../markdown'
-import { nodePath } from '../paths'
-
-interface HelpOpts {
-  baseUrl?: string
-  dsl?: boolean
-  json?: boolean
-  md?: boolean
-  sk?: string
-}
 
 /**
  * `tb help [path]` —— GET <path>/~help(根缺省)。
@@ -20,7 +10,7 @@ interface HelpOpts {
  * --md 强制裸 markdown(TTY 下也不渲染,便于复制/落文件);
  * --json 输出等价 JSON(cmd 数组等);--dsl 输出紧凑 Help DSL(Accept: text/plain)。
  */
-export function helpCommand(): Command {
+export function helpCommand() {
   return withGlobalOpts(new Command('help'))
     .description(
       'Show a node ~help (rendered markdown by default; --md raw markdown, --json structured, --dsl compact DSL)',
@@ -28,24 +18,41 @@ export function helpCommand(): Command {
     .argument('[path]', 'Tree path (default: root)')
     .option('--md', 'Force raw markdown (skip terminal rendering)')
     .option('--dsl', 'Render as compact Help DSL (Accept: text/plain)')
-    .action(async (pathArg: string | undefined, opts: HelpOpts) => {
+    .option(
+      '--schemas',
+      'Inline every tool\'s full input schema at the node level (skips per-tool drill-down)',
+    )
+    .action(async (pathArg, opts) => {
       const asJson = Boolean(opts.json)
-      await guard(asJson, async () => {
-        if (opts.dsl && opts.md) throw new CliError('--dsl and --md are mutually exclusive')
-        if (opts.dsl && asJson) throw new CliError('--dsl and --json are mutually exclusive')
-        if (opts.md && asJson) throw new CliError('--md and --json are mutually exclusive')
-        const target = resolveTarget(opts)
-        const path = nodePath('~help', pathArg)
-        if (asJson) {
-          printJson(await apiJson<HelpJson>(target, { path }))
-        } else if (opts.dsl) {
-          printLine(await apiText(target, { path, accept: 'text' }))
-        } else {
-          const md = await apiText(target, { path, accept: 'markdown' })
-          // --md 强制裸输出;否则 TTY → ANSI 富文本、管道/Agent → 裸 markdown(markdown.ts 判定)。
-          if (opts.md) printLine(md.replace(/\n+$/, ''))
-          else printMarkdown(md)
-        }
-      })
+      if (opts.dsl && opts.md) throw new CliError('--dsl and --md are mutually exclusive')
+      if (opts.dsl && asJson) throw new CliError('--dsl and --json are mutually exclusive')
+      if (opts.md && asJson) throw new CliError('--md and --json are mutually exclusive')
+      const target = resolveTarget(opts)
+      const path = pathArg ?? ''
+      if (asJson) {
+        printJson(await withClient(
+          target,
+          async client => await client.getHelp(path, { schemas: opts.schemas }),
+        ))
+      } else if (opts.dsl) {
+        printLine(await withClient(
+          target,
+          async client => await client.getHelpText(path, {
+            schemas: opts.schemas,
+            representation: 'dsl',
+          }),
+        ))
+      } else {
+        const md = await withClient(
+          target,
+          async client => await client.getHelpText(path, {
+            schemas: opts.schemas,
+            representation: 'markdown',
+          }),
+        )
+        // --md 强制裸输出;否则 TTY → ANSI 富文本、管道/Agent → 裸 markdown(markdown.ts 判定)。
+        if (opts.md) printLine(md.replace(/\n+$/, ''))
+        else printMarkdown(md)
+      }
     })
 }

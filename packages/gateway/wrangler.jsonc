@@ -11,7 +11,8 @@
   // 部署要的是 deployEntry.ts —— 它全量装配生成的内置插件目录。
   // 两个入口分开,免得 npm 消费者被迫吞下约 6 MB 插件代码。
   "main": "src/deployEntry.ts",
-  "compatibility_date": "2025-06-01",
+  // 与仓库锁定的 workerd/miniflare 支持上限一致；升级工具链时再同步推进。
+  "compatibility_date": "2026-07-08",
   "compatibility_flags": ["nodejs_compat"],
   // 生产只允许规范自定义域;关闭 workers.dev 与版本预览 URL,避免同一状态暴露多 origin。
   "workers_dev": false,
@@ -21,8 +22,23 @@
   // 生产入口 = TB_BASE_URL(.env);zone fantacy.live 在同账户。
   "routes": [{ "pattern": "tool-bridge.fantacy.live", "custom_domain": true }],
   "observability": {
-    "enabled": true
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1
+    },
+    "traces": {
+      "enabled": true,
+      "head_sampling_rate": 0.1
+    }
   },
+  // 每个鉴权请求至少访问一次权威 D1 primary；Smart Placement 把 Worker 计算移近
+  // 主要后端，避免一条请求内的多次 D1/上游往返都跨洲。注意 /ui 目前也先过 Worker，
+  // 因此纯静态 Dashboard 的首字节可能不如 edge-first；核心 API 延迟优先。
+  "placement": { "mode": "smart" },
+  // Workers 无常驻进程：Store 的过期 session/share/call capability 与孤儿字节
+  // 必须由 Cron Trigger 收敛，不能依赖请求顺带清理。
+  "triggers": { "crons": ["*/15 * * * *"] },
   "vars": {
     // 规范 origin(钉死 OAuth redirect_uri)。生产钉死 fantacy.live;provision 也会从 TB_BASE_URL 回填。
     "TB_CANONICAL_ORIGIN": "https://tool-bridge.fantacy.live",
@@ -38,20 +54,31 @@
     "TB_MEEGO_BIND_NODE": "plugins/meego",
     "TB_MEEGO_SECRET_REF": "meego-app"
   },
-  // KV:树配置 / SK 哈希表 / manifest。id 为占位,由 scripts/provision.mjs
-  // 幂等创建后回填;本地 wrangler dev / vitest-pool-workers 用 miniflare 本地实例,不校验该 id。
-  "kv_namespaces": [
-    { "binding": "TB_KV", "id": "a1e48dcf2fe44872a828a992d6efd5e5" }
-  ],
-  // D1:FTS5/trigram 工具搜索索引。database_id 由 scripts/provision.mjs 幂等回填。
+  // D1:**一个库,两个 binding**(id 由 scripts/provision.mjs 幂等创建后回填;本地
+  // wrangler dev / vitest-pool-workers 用 miniflare 本地实例,不校验 id)。
+  // binding 表达用途、库表达存储位置——将来要拆库只动这里,不动代码:
+  // - TB_STATE:权威 StateStore(表 tb_state_kv;ADR-001 从 KV 迁入——强一致读写、
+  //   原子 putIfAbsent、撤销即时生效;树配置 / SK 哈希表 / 加密 secret / manifest 全在此)。
+  // - TB_SEARCH:纯 LIKE 工具搜索索引(表 tb_search_*;可选,不配则无 search capability)。
+  //
+  // ⚠️ 本仓存量部署迁移提醒(ADR-001 对上游是 pre-launch 零迁移,对我们不是):
+  // 生产权威数据原在 KV `TENANTS`(a1e48dcf2fe44872a828a992d6efd5e5)。切换到 D1 前
+  // 必须先跑 scripts/migrate-kv-to-d1.mjs 把 KV 全量搬进 tb_state_kv,否则用户/凭证/
+  // 节点全部读不到(数据仍在 KV,只是代码不再读它)。旧 tb-search 库(9244c856…)随之弃用
+  // (纯索引可重建,无权威数据)。
   "d1_databases": [
     {
+      "binding": "TB_STATE",
+      "database_name": "tb-db",
+      "database_id": "6e656585-1cee-431a-a8d7-db199c85bd9c"
+    },
+    {
       "binding": "TB_SEARCH",
-      "database_name": "tb-search",
-      "database_id": "9244c856-f58a-4443-bed3-dfa85ac32ded"
+      "database_name": "tb-db",
+      "database_id": "6e656585-1cee-431a-a8d7-db199c85bd9c"
     }
   ],
-  // R2:context r2 provider 与大对象 $ref。
+  // R2:部署级 default Store、context r2 provider 与大对象 $ref。
   "r2_buckets": [
     { "binding": "TB_R2", "bucket_name": "tb-r2" }
   ],

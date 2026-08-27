@@ -9,31 +9,9 @@ import {
   registerNode,
 } from '../registry'
 import { collect, resolveTarget, withGlobalOpts } from '../args'
-import { guard, printJson, printLine } from '../output'
-import { apiFetch, apiJson, CliError } from '../http'
-
-interface ToolMountOpts {
-  auth?: string
-  authHeader?: string
-  authRef?: string
-  authScheme?: string
-  baseUrl?: string
-  config: string[]
-  describe: string[]
-  description?: string
-  endpoint?: string
-  export?: string
-  header: string[]
-  hide: string[]
-  json?: boolean
-  kind: string
-  prefix?: string
-  provider?: string
-  rename: string[]
-  sk?: string
-  toolsFile?: string
-  url?: string
-}
+import { apiFetch, CliError, withClient } from '../http'
+import { printJson, printLine } from '../output'
+import { confirmDestructive } from '../confirm'
 
 /** 可重复 `--header Name=value` → headers 对象;空数组返回 undefined(不塞空对象)。 */
 function parseHeaderSpecs(specs: string[]): Record<string, string> | undefined {
@@ -53,12 +31,13 @@ function parseHeaderSpecs(specs: string[]): Record<string, string> | undefined {
 
 /**
  * `tb tool mount <path>` —— 挂载 mcp / http / plugin 工具源(NodeRegistry.Write via ~register)。
- * mcp:`--kind mcp --url <u> [--auth-ref name | --auth oauth] [--header k=v …]`(oauth 挂载后跑 `tb tool auth`)。
+ * mcp:`--kind mcp --url <u> [--auth-ref name | --auth oauth] [--header k=v …]`(oauth
+ * 挂载后跑 `tb tool auth`;不支持 DCR 的上游可加预注册 client id/secret ref)。
  * http:`--kind http --endpoint <u> --tools-file <json> [--auth-ref name]`。
  * 共用:`--auth-header/--auth-scheme`(凭证头名/前缀,空 scheme 原样注入)、`--description d`
  * 与虚拟化 `--prefix p / --rename from=to / --hide t / --describe from=text`。
  */
-export function toolMountCommand(): Command {
+export function toolMountCommand() {
   return withGlobalOpts(new Command('mount'))
     .description('Mount an mcp/http source or a tool-provider plugin')
     .argument('<path>', 'Tree path to mount at')
@@ -79,6 +58,14 @@ export function toolMountCommand(): Command {
       [],
     )
     .option('--auth <mode>', '[mcp] \'oauth\': gateway-managed OAuth (then run `tb tool auth`)')
+    .option(
+      '--oauth-client-id <id>',
+      '[mcp oauth] pre-registered public/confidential client ID (skips DCR)',
+    )
+    .option(
+      '--oauth-client-secret-ref <name>',
+      '[mcp oauth] SecretStore ref for the pre-registered confidential client secret',
+    )
     .option('--auth-ref <name>', 'SecretStore ref for upstream credential')
     .option('--auth-header <name>', '[mcp/http] auth header name; requires --auth-ref')
     .option(
@@ -108,152 +95,186 @@ Examples:
   tb tool mount docs/context7 --kind mcp --url https://mcp.context7.com/mcp
   tb tool mount jira --kind mcp --url https://mcp.example.com/mcp --auth-ref jira-token
   tb tool mount gh --kind mcp --url https://api.example.com/mcp --auth oauth   # then: tb tool auth gh
+  tb tool mount ha --kind mcp --url https://ha.example.com/api/mcp --auth oauth --oauth-client-id tool-bridge
   tb tool mount weather --kind http --endpoint https://api.weather.com --tools-file tools.json
   tb tool mount notion --kind tool --provider notion-tools --auth-ref notion-token
   tb tool mount feishu --kind tool --provider feishu --export actions
   tb tool mount notes --kind tool --provider memos --auth-ref memos-key --config baseUrl=https://memos.example.com`,
     )
-    .action(async (pathArg: string, opts: ToolMountOpts) => {
+    .action(async (pathArg, opts) => {
       const asJson = Boolean(opts.json)
-      await guard(asJson, async () => {
-        const path = String(pathArg ?? '').trim()
-        if (!path) throw new CliError('tree path is required')
-        const kind = String(opts.kind ?? '').trim()
-        const authRef = opts.authRef ? String(opts.authRef) : undefined
-        const authHeader
-          = opts.authHeader !== undefined ? String(opts.authHeader).trim() : undefined
-        const authScheme = opts.authScheme !== undefined ? String(opts.authScheme) : undefined
-        if ((authHeader !== undefined || authScheme !== undefined) && !authRef) {
-          throw new CliError('--auth-header/--auth-scheme require --auth-ref')
-        }
+      const path = String(pathArg ?? '').trim()
+      if (!path) throw new CliError('tree path is required')
+      const kind = String(opts.kind ?? '').trim()
+      const authRef = opts.authRef ? String(opts.authRef) : undefined
+      const authHeader
+        = opts.authHeader !== undefined ? String(opts.authHeader).trim() : undefined
+      const authScheme = opts.authScheme !== undefined ? String(opts.authScheme) : undefined
+      const oauthClientId = opts.oauthClientId !== undefined
+        ? String(opts.oauthClientId).trim()
+        : undefined
+      const oauthClientSecretRef = opts.oauthClientSecretRef !== undefined
+        ? String(opts.oauthClientSecretRef).trim()
+        : undefined
+      if ((authHeader !== undefined || authScheme !== undefined) && !authRef) {
+        throw new CliError('--auth-header/--auth-scheme require --auth-ref')
+      }
 
-        let config: NodeConfig
-        if (kind === 'mcp') {
-          if (
-            opts.endpoint !== undefined
-            || opts.toolsFile !== undefined
-            || opts.provider !== undefined
-            || opts.export !== undefined
-          ) {
-            throw new CliError(
-              '--endpoint/--tools-file/--provider/--export do not apply to --kind mcp',
-            )
-          }
-          if (opts.config.length > 0) {
-            throw new CliError('--config is only supported for --kind tool')
-          }
-          const url = String(opts.url ?? '').trim()
-          if (!url) throw new CliError('--url is required for --kind mcp')
-          const auth = opts.auth !== undefined ? String(opts.auth).trim() : undefined
-          if (auth !== undefined && auth !== 'oauth') {
-            throw new CliError(`invalid --auth "${auth}"; valid: oauth`)
-          }
-          if (auth === 'oauth' && authRef) {
-            throw new CliError('--auth oauth and --auth-ref are mutually exclusive')
-          }
-          config = {
-            kind: 'mcp',
-            url,
-            ...(authRef ? { authRef } : {}),
-            ...(auth === 'oauth' ? { auth: 'oauth' as const } : {}),
-            ...(authHeader ? { authHeader } : {}),
-            ...(authScheme !== undefined ? { authScheme } : {}),
-            ...(() => {
-              const headers = parseHeaderSpecs(opts.header)
-              return headers ? { headers } : {}
-            })(),
-          }
-        } else if (kind === 'http') {
-          if (
-            opts.url !== undefined
-            || opts.auth !== undefined
-            || opts.provider !== undefined
-            || opts.export !== undefined
-          ) {
-            throw new CliError('--url/--auth/--provider/--export do not apply to --kind http')
-          }
-          if (opts.header.length > 0) {
-            throw new CliError('--header is only supported for --kind mcp')
-          }
-          if (opts.config.length > 0) {
-            throw new CliError('--config is only supported for --kind tool')
-          }
-          const endpoint = String(opts.endpoint ?? '').trim()
-          if (!endpoint) throw new CliError('--endpoint is required for --kind http')
-          const toolsFile = String(opts.toolsFile ?? '').trim()
-          if (!toolsFile) throw new CliError('--tools-file is required for --kind http')
-          const tools = parseToolsFile(toolsFile)
-          config = {
-            kind: 'http',
-            endpoint,
-            tools,
-            ...(authRef ? { authRef } : {}),
-            ...(authHeader ? { authHeader } : {}),
-            ...(authScheme !== undefined ? { authScheme } : {}),
-          }
-        } else if (kind === 'tool') {
-          if (
-            opts.url !== undefined
-            || opts.endpoint !== undefined
-            || opts.toolsFile !== undefined
-            || opts.auth !== undefined
-            || opts.header.length > 0
-            || authHeader !== undefined
-            || authScheme !== undefined
-          ) {
-            throw new CliError(
-              '--url/--endpoint/--tools-file/--auth/--header/--auth-header/--auth-scheme do not apply to --kind tool',
-            )
-          }
-          const provider = String(opts.provider ?? '').trim()
-          if (!provider) throw new CliError('--provider is required for --kind tool')
-          const exportId = String(opts.export ?? '').trim()
-          const providerConfig = parseConfigSpecs(opts.config)
-          config = {
-            kind: 'tool',
-            provider,
-            ...(exportId ? { export: exportId } : {}),
-            ...(authRef ? { authRef } : {}),
-            ...(providerConfig ? { providerConfig } : {}),
-          }
-        } else {
-          throw new CliError(`invalid --kind "${kind}"; valid: mcp, http, tool`)
+      let config: NodeConfig
+      if (kind === 'mcp') {
+        if (
+          opts.endpoint !== undefined
+          || opts.toolsFile !== undefined
+          || opts.provider !== undefined
+          || opts.export !== undefined
+        ) {
+          throw new CliError(
+            '--endpoint/--tools-file/--provider/--export do not apply to --kind mcp',
+          )
         }
+        if (opts.config.length > 0) {
+          throw new CliError('--config is only supported for --kind tool')
+        }
+        const url = String(opts.url ?? '').trim()
+        if (!url) throw new CliError('--url is required for --kind mcp')
+        const auth = opts.auth !== undefined ? String(opts.auth).trim() : undefined
+        if (auth !== undefined && auth !== 'oauth') {
+          throw new CliError(`invalid --auth "${auth}"; valid: oauth`)
+        }
+        if (auth === 'oauth' && authRef) {
+          throw new CliError('--auth oauth and --auth-ref are mutually exclusive')
+        }
+        if ((oauthClientId !== undefined || oauthClientSecretRef !== undefined) && auth !== 'oauth') {
+          throw new CliError('--oauth-client-id/--oauth-client-secret-ref require --auth oauth')
+        }
+        if (oauthClientId !== undefined && oauthClientId === '') {
+          throw new CliError('--oauth-client-id must not be empty')
+        }
+        if (oauthClientSecretRef !== undefined && oauthClientSecretRef === '') {
+          throw new CliError('--oauth-client-secret-ref must not be empty')
+        }
+        if (oauthClientSecretRef !== undefined && oauthClientId === undefined) {
+          throw new CliError('--oauth-client-secret-ref requires --oauth-client-id')
+        }
+        config = {
+          kind: 'mcp',
+          url,
+          ...(authRef ? { authRef } : {}),
+          ...(auth === 'oauth' ? { auth: 'oauth' as const } : {}),
+          ...(oauthClientId !== undefined
+            ? {
+                oauthClient: {
+                  clientId: oauthClientId,
+                  ...(oauthClientSecretRef !== undefined
+                    ? { clientSecretRef: oauthClientSecretRef }
+                    : {}),
+                },
+              }
+            : {}),
+          ...(authHeader ? { authHeader } : {}),
+          ...(authScheme !== undefined ? { authScheme } : {}),
+          ...(() => {
+            const headers = parseHeaderSpecs(opts.header)
+            return headers ? { headers } : {}
+          })(),
+        }
+      } else if (kind === 'http') {
+        if (
+          opts.url !== undefined
+          || opts.auth !== undefined
+          || opts.provider !== undefined
+          || opts.export !== undefined
+          || oauthClientId !== undefined
+          || oauthClientSecretRef !== undefined
+        ) {
+          throw new CliError(
+            '--url/--auth/--provider/--export/--oauth-client-* do not apply to --kind http',
+          )
+        }
+        if (opts.header.length > 0) {
+          throw new CliError('--header is only supported for --kind mcp')
+        }
+        if (opts.config.length > 0) {
+          throw new CliError('--config is only supported for --kind tool')
+        }
+        const endpoint = String(opts.endpoint ?? '').trim()
+        if (!endpoint) throw new CliError('--endpoint is required for --kind http')
+        const toolsFile = String(opts.toolsFile ?? '').trim()
+        if (!toolsFile) throw new CliError('--tools-file is required for --kind http')
+        const tools = parseToolsFile(toolsFile)
+        config = {
+          kind: 'http',
+          endpoint,
+          tools,
+          ...(authRef ? { authRef } : {}),
+          ...(authHeader ? { authHeader } : {}),
+          ...(authScheme !== undefined ? { authScheme } : {}),
+        }
+      } else if (kind === 'tool') {
+        if (
+          opts.url !== undefined
+          || opts.endpoint !== undefined
+          || opts.toolsFile !== undefined
+          || opts.auth !== undefined
+          || opts.header.length > 0
+          || authHeader !== undefined
+          || authScheme !== undefined
+          || oauthClientId !== undefined
+          || oauthClientSecretRef !== undefined
+        ) {
+          throw new CliError(
+            '--url/--endpoint/--tools-file/--auth/--header/--auth-header/--auth-scheme/'
+            + '--oauth-client-* do not apply to --kind tool',
+          )
+        }
+        const provider = String(opts.provider ?? '').trim()
+        if (!provider) throw new CliError('--provider is required for --kind tool')
+        const exportId = String(opts.export ?? '').trim()
+        const providerConfig = parseConfigSpecs(opts.config)
+        config = {
+          kind: 'tool',
+          provider,
+          ...(exportId ? { export: exportId } : {}),
+          ...(authRef ? { authRef } : {}),
+          ...(providerConfig ? { providerConfig } : {}),
+        }
+      } else {
+        throw new CliError(`invalid --kind "${kind}"; valid: mcp, http, tool`)
+      }
 
-        const virtualize = buildVirtualize({
-          prefix: opts.prefix,
-          rename: opts.rename,
-          hide: opts.hide,
-          describe: opts.describe,
-        })
-        const sourceLabel = kind === 'tool' ? 'plugin-backed' : kind
-        const input: NodeInput = {
-          path,
-          kind,
-          description: opts.description
-            ? String(opts.description)
-            : `${sourceLabel} tool source at ${path}`,
-          config,
-          ...(virtualize ? { virtualize } : {}),
-        }
-
-        const node = await registerNode(resolveTarget(opts), input)
-        if (asJson) printJson(node)
-        else {
-          printLine(`mounted ${kind} node at ${path}`)
-          if (kind === 'mcp' && (config as { auth?: string }).auth === 'oauth') {
-            printLine(`next: run \`tb tool auth ${path}\` to authorize the upstream`)
-          } else if (kind === 'tool' && (config as { authRef?: string }).authRef !== undefined) {
-            // plugin tool 挂载:export 声明了 oauth 的话还要授权一步,而**这里判不出来**
-            // (oauth 在 plugin 的 `~describe` 里,不在挂载配置里)。不提示的话用户挂完
-            // 一个 oauth 型 provider(gmail 之类)完全没有线索知道还差一步,只会在第一次
-            // 调用时收到 permission_denied。故给条件式提示。
-            printLine(
-              `note: if this export declares oauth, run \`tb tool auth ${path}\` to authorize`,
-            )
-          }
-        }
+      const virtualize = buildVirtualize({
+        prefix: opts.prefix,
+        rename: opts.rename,
+        hide: opts.hide,
+        describe: opts.describe,
       })
+      const sourceLabel = kind === 'tool' ? 'plugin-backed' : kind
+      const input: NodeInput = {
+        path,
+        kind,
+        description: opts.description
+          ? String(opts.description)
+          : `${sourceLabel} tool source at ${path}`,
+        config,
+        ...(virtualize ? { virtualize } : {}),
+      }
+
+      const node = await registerNode(resolveTarget(opts), input)
+      if (asJson) printJson(node)
+      else {
+        printLine(`mounted ${kind} node at ${path}`)
+        if (kind === 'mcp' && (config as { auth?: string }).auth === 'oauth') {
+          printLine(`next: run \`tb tool auth ${path}\` to authorize the upstream`)
+        } else if (kind === 'tool' && (config as { authRef?: string }).authRef !== undefined) {
+          // plugin tool 挂载:export 声明了 oauth 的话还要授权一步,而**这里判不出来**
+          // (oauth 在 plugin 的 `~describe` 里,不在挂载配置里)。不提示的话用户挂完
+          // 一个 oauth 型 provider(gmail 之类)完全没有线索知道还差一步,只会在第一次
+          // 调用时收到 permission_denied。故给条件式提示。
+          printLine(
+            `note: if this export declares oauth, run \`tb tool auth ${path}\` to authorize`,
+          )
+        }
+      }
     })
 }
 
@@ -302,11 +323,10 @@ async function runLocalCallbackFlow(
   const redirectUri = `http://127.0.0.1:${addr.port}/callback`
 
   try {
-    const result = await apiJson<AuthorizeResult>(target, {
-      method: 'POST',
-      path: `${path}/~authorize`,
-      body: { redirectUri },
-    })
+    const result = await withClient(
+      target,
+      async client => await client.startOAuthAuthorization(path, { redirectUri }),
+    )
     if (result.status === 'authorized') {
       printLine(`already authorized: ${path}`)
       return
@@ -372,7 +392,7 @@ async function runLocalCallbackFlow(
  * code 由 CLI 转交网关兑换(token 仍不出网关)。**仅 mcp 那条支持** —— provider 型的
  * `~authorize` 不读 body 里的 redirectUri,授权 URL 里始终是网关回调。
  */
-export function toolAuthCommand(): Command {
+export function toolAuthCommand() {
   return withGlobalOpts(new Command('auth'))
     .description('Authorize an OAuth-backed mcp or plugin tool mount (gateway-managed flow)')
     .argument('<path>', 'Tree path of the mcp mount, or of a plugin tool mount whose export declares oauth')
@@ -380,69 +400,67 @@ export function toolAuthCommand(): Command {
     .option('--local', 'Use a localhost callback (for upstreams that only allow loopback URIs)')
     .action(
       async (
-        pathArg: string,
-        opts: { baseUrl?: string, json?: boolean, local?: boolean, open?: boolean, sk?: string },
+        pathArg,
+        opts,
       ) => {
         const asJson = Boolean(opts.json)
-        await guard(asJson, async () => {
-          const path = String(pathArg ?? '').trim()
-          if (!path) throw new CliError('tree path is required')
-          const target = resolveTarget(opts)
-          if (opts.local) {
-            if (asJson) throw new CliError('--local is interactive; --json is not supported')
-            await runLocalCallbackFlow(target, path, opts.open !== false)
-            return
+        const path = String(pathArg ?? '').trim()
+        if (!path) throw new CliError('tree path is required')
+        const target = resolveTarget(opts)
+        if (opts.local) {
+          if (asJson) throw new CliError('--local is interactive; --json is not supported')
+          await runLocalCallbackFlow(target, path, opts.open !== false)
+          return
+        }
+        let result: AuthorizeResult
+        try {
+          result = await withClient(
+            target,
+            async client => await client.startOAuthAuthorization(path),
+          )
+        } catch (err) {
+          // 严格上游拒网关回调(DCR redirect 白名单)→ 指引本地回调通道。
+          if (err instanceof CliError && isRedirectRejection(err.message)) {
+            throw new CliError(
+              `${err.message}\nhint: this upstream only allows localhost callbacks — retry with: tb tool auth ${path} --local`,
+            )
           }
-          let result: AuthorizeResult
-          try {
-            result = await apiJson<AuthorizeResult>(target, {
-              method: 'POST',
-              path: `${path}/~authorize`,
-            })
-          } catch (err) {
-            // 严格上游拒网关回调(DCR redirect 白名单)→ 指引本地回调通道。
-            if (err instanceof CliError && isRedirectRejection(err.message)) {
-              throw new CliError(
-                `${err.message}\nhint: this upstream only allows localhost callbacks — retry with: tb tool auth ${path} --local`,
-              )
-            }
-            throw err
-          }
-          if (asJson) {
-            printJson(result)
-            return
-          }
-          if (result.status === 'authorized') {
-            printLine(`already authorized: ${path}`)
-            return
-          }
-          if (!result.authorizationUrl) throw new CliError('gateway returned no authorization URL')
-          printLine('open this URL in a browser to authorize:')
-          printLine(`  ${result.authorizationUrl}`)
-          if (opts.open !== false) openBrowser(result.authorizationUrl)
-        })
+          throw err
+        }
+        if (asJson) {
+          printJson(result)
+          return
+        }
+        if (result.status === 'authorized') {
+          printLine(`already authorized: ${path}`)
+          return
+        }
+        if (!result.authorizationUrl) throw new CliError('gateway returned no authorization URL')
+        printLine('open this URL in a browser to authorize:')
+        printLine(`  ${result.authorizationUrl}`)
+        if (opts.open !== false) openBrowser(result.authorizationUrl)
       },
     )
 }
 
 /** `tb tool rm <path>` —— 卸载节点(管理面 system/registry delete)。 */
-export function toolRmCommand(): Command {
+export function toolRmCommand() {
   return withGlobalOpts(new Command('rm'))
     .description('Unmount a tool node')
     .argument('<path>', 'Tree path to remove')
-    .action(async (pathArg: string, opts: { baseUrl?: string, json?: boolean, sk?: string }) => {
+    .option('--yes', 'Skip the confirmation prompt')
+    .action(async (pathArg, opts) => {
       const asJson = Boolean(opts.json)
-      await guard(asJson, async () => {
-        const path = String(pathArg ?? '').trim()
-        if (!path) throw new CliError('tree path is required')
-        await deleteNode(resolveTarget(opts), path, ['mcp', 'http', 'tool'])
-        if (asJson) printJson({ ok: true, path })
-        else printLine(`removed node: ${path}`)
-      })
+      const path = String(pathArg ?? '').trim()
+      if (!path) throw new CliError('tree path is required')
+      await confirmDestructive(opts, `Unmount tool node at ${path}?`)
+      await deleteNode(resolveTarget(opts), path, ['mcp', 'http', 'tool'])
+      if (asJson) printJson({ ok: true, path })
+      else printLine(`removed node: ${path}`)
     })
 }
 
-export function toolCommand(): Command {
+export function toolCommand() {
   return new Command('tool')
     .description('Mount/remove mcp, http & plugin-backed tool sources')
     .addCommand(toolMountCommand())

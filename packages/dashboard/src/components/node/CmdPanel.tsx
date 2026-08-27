@@ -1,7 +1,6 @@
 import type { RJSFSchema } from '@rjsf/utils'
 import { Braces, ChevronRight, ClipboardList, Loader2, Play, TriangleAlert } from 'lucide-react'
 import { lazy, Suspense, useEffect, useId, useState } from 'react'
-import { useQueryClient } from '@tanstack/react-query'
 import type { HelpCmd } from '@/lib/types'
 import type { ApiError } from '@/lib/api'
 import {
@@ -23,8 +22,8 @@ import {
 } from '@/components/ui/select'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
 import { isFormFriendly, skeletonFromSchema } from '@/lib/schemaForm'
+import { useInvalidate, useInvoke, useToolHelp } from '@/lib/queries'
 import { ResultView } from '@/components/node/ResultView'
-import { useInvoke, useToolHelp } from '@/lib/queries'
 import { CliHint } from '@/components/node/CliHint'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Textarea } from '@/components/ui/textarea'
@@ -32,7 +31,7 @@ import { Button } from '@/components/ui/button'
 import { isPathSegmentSafe } from '@/lib/path'
 import { cn } from '@/lib/utils'
 
-const SchemaFormRenderer = lazy(() => import('@/components/node/SchemaFormRenderer'))
+const SchemaFormRenderer = lazy(() => import('@/components/SchemaFormRenderer'))
 
 const SCOPE_STYLE: Record<string, string> = {
   read: 'text-sky-400/90 border-sky-400/30',
@@ -111,24 +110,21 @@ export function CmdPanel({
   defaultOpen = false,
   lazySchema = false,
   variant = 'accordion',
-  onPendingChange,
 }: {
   cmd: HelpCmd
   defaultOpen?: boolean
   lazySchema?: boolean
-  /** 工作区用：调用存活期间阻止父级 remount 当前面板。 */
-  onPendingChange?: (pending: boolean) => void
   path: string
-  variant?: 'accordion' | 'workbench'
+  variant?: 'accordion' | 'dialog'
 }) {
   const [open, setOpen] = useState(defaultOpen)
-  const workbench = variant === 'workbench'
-  const effectiveOpen = workbench || open
-  // 直连工具 cmd(mcp/http/tool):~help 宣告的 path 含工具段(协议判别规则)
-  // → POST /<path>/<tool>,body 即 arguments;否则信封 POST /<path>。
-  // '/' 工具名不是单个 URL path segment；保留 ToolSpec 兼容性，改走节点信封调用。
+  // dialog(弹窗)用"常开大编辑器"形态,DialogContent 已提供外框;accordion 仍是可折叠行。
+  const dialog = variant === 'dialog'
+  const effectiveOpen = dialog || open
+  // 唯一调用形态:~help 宣告的 cmd.path 是完整命令路径(含命令/工具叶子段),
+  // 直接 POST 到它,body 即 arguments。
+  const commandPath = cmd.path.replace(/^\/+/, '')
   const segmentSafe = isPathSegmentSafe(cmd.name)
-  const direct = segmentSafe && cmd.path === `/${path}/${cmd.name}`
   const lazyNeeded = segmentSafe && lazySchema && cmd.inputSchema === undefined
   const toolHelp = useToolHelp(path, cmd.name, lazyNeeded && effectiveOpen)
   const inputSchema = cmd.inputSchema ?? toolHelp.data?.cmds[0]?.inputSchema
@@ -144,7 +140,7 @@ export function CmdPanel({
   const [accept, setAccept] = useState<'markdown' | 'json'>('markdown')
   const [pendingArgs, setPendingArgs] = useState<unknown | null>(null)
   const invoke = useInvoke()
-  const qc = useQueryClient()
+  const invalidate = useInvalidate()
   const acceptId = useId()
 
   /** 当前编辑中的参数(CliHint 展示用;JSON 模式解析失败时回落 {})。 */
@@ -166,14 +162,10 @@ export function CmdPanel({
     else setRawArgs(JSON.stringify(skeletonFromSchema(inputSchema), null, 2))
   }, [lazyNeeded, inputSchema, rawArgs, formData])
 
-  useEffect(() => {
-    onPendingChange?.(invoke.isPending)
-  }, [invoke.isPending, onPendingChange])
-
   const doInvoke = async (args: unknown) => {
     try {
-      await invoke.mutateAsync({ path, tool: cmd.name, args, accept, direct })
-      if (MUTATING.test(cmd.name)) await qc.invalidateQueries({ queryKey: ['tb'] })
+      await invoke.mutateAsync({ commandPath, args, accept })
+      if (MUTATING.test(cmd.name)) await invalidate()
     } catch {
       // Mutation 错误由 useInvoke 保留给 ResultView；这里吞掉 Promise rejection，
       // 让卸载后的调用也能安全结算，不产生未处理拒绝。
@@ -199,7 +191,7 @@ export function CmdPanel({
     <div
       className={cn(
         'mt-4 flex flex-wrap items-center gap-2 border-t pt-3',
-        workbench && 'mt-5 bg-card/20 pt-4',
+        dialog && 'mt-5 pt-4',
       )}
     >
       <Button
@@ -256,19 +248,18 @@ export function CmdPanel({
   )
 
   return (
-    <Collapsible asChild onOpenChange={workbench ? undefined : setOpen} open={effectiveOpen}>
+    <Collapsible asChild onOpenChange={dialog ? undefined : setOpen} open={effectiveOpen}>
       <section
         className={cn(
-          'border bg-card/60',
-          workbench
-            ? 'min-h-[30rem] overflow-hidden rounded-xl bg-card/45 shadow-sm'
-            : 'rounded-md',
+          dialog
+            ? 'flex min-h-0 flex-1 flex-col'
+            : 'rounded-md border bg-card/60',
         )}
         id={`cmd-${cmd.name}`}
       >
         {/* 与 ~help 的层级观感对齐:默认只露 cmd 一行,schema 表单点开才展开 */}
-        <header className={cn(workbench && 'border-b bg-background/28 px-4 py-4 sm:px-5')}>
-          {workbench
+        <header className={cn(dialog && 'shrink-0')}>
+          {dialog
             ? (
                 <div className="flex min-w-0 flex-col gap-2">
                   <div className="flex min-w-0 flex-wrap items-center gap-2">
@@ -339,8 +330,8 @@ export function CmdPanel({
               )}
         </header>
 
-        <CollapsibleContent>
-          <div className={cn('min-w-0 px-3 py-3 sm:px-4', workbench && 'p-4 sm:p-5')}>
+        <CollapsibleContent className={cn(dialog && 'min-h-0 flex-1 overflow-y-auto')}>
+          <div className={cn('min-w-0 px-3 py-3 sm:px-4', dialog && 'px-1 py-4')}>
             {lazyNeeded && toolHelp.isPending
               ? (
                   <div className="grid gap-2">
@@ -361,8 +352,8 @@ export function CmdPanel({
                     >
                       <SchemaFormRenderer
                         formData={formData}
-                        onChange={setFormData}
-                        onSubmit={submit}
+                        onChange={({ formData: next }) => setFormData(next)}
+                        onSubmit={({ formData: next }) => submit(next)}
                         schema={inputSchema as RJSFSchema}
                       >
                         {footer}
@@ -375,10 +366,10 @@ export function CmdPanel({
                         aria-label="arguments JSON"
                         className={cn(
                           'font-mono text-xs',
-                          workbench && 'min-h-56 rounded-xl bg-background/55',
+                          dialog && 'min-h-56 rounded-xl bg-background/55',
                         )}
                         onChange={e => setRawArgs(e.target.value)}
-                        rows={workbench ? 10 : 5}
+                        rows={dialog ? 10 : 5}
                         spellCheck={false}
                         value={rawArgs}
                       />
@@ -387,14 +378,14 @@ export function CmdPanel({
                     </div>
                   )}
 
-            <CliHint args={currentArgs} direct={direct} path={path} tool={cmd.name} />
+            <CliHint args={currentArgs} commandPath={commandPath} />
 
             <ResultView
               className="mt-5"
               error={(invoke.error as ApiError | null) ?? null}
               result={invoke.data}
             />
-            {!invoke.data && !invoke.error && workbench && (
+            {!invoke.data && !invoke.error && dialog && (
               <div className="mt-5 grid min-h-32 place-items-center rounded-xl border border-dashed bg-background/25 px-5 py-8 text-center">
                 <div>
                   <p className="text-sm font-medium text-foreground/80">等待调用结果</p>

@@ -17,8 +17,24 @@ import type { SecretStoreImpl } from '../secret/secretStore'
 import type { CmdSpec, HelpModel } from '../htbp/model'
 import type { OwnerRef, TreePath } from '../types'
 import type { BuiltinModule } from './types'
-import { cmdPath, requireString, VOID_ACK } from './util'
+import { cmdPath, VOID_ACK, withCommandPaths } from './util'
 import { TBError } from '../errors'
+
+/**
+ * 取必填字符串字段。
+ *
+ * 上游把 builtin 的入参校验迁到了 BuiltinCommandRegistry 的 Zod `inputSchema`,
+ * 随之删掉了 util 的 `requireString`。本模块(个人凭证,Lightspeed 定制)仍是
+ * dispatch+switch 形态,校验语义不变,故就地保留一份等价实现 —— 比连带把本模块
+ * 改写成 Registry 范式风险小,行为与旧 util 版逐字一致。
+ */
+function requireString(args: Record<string, unknown>, field: string): string {
+  const v = args[field]
+  if (typeof v !== 'string' || v.length === 0) {
+    throw new TBError('invalid_argument', `field '${field}' must be a non-empty string`)
+  }
+  return v
+}
 
 const DESCRIPTION
   = 'Your personal upstream credentials: write-only, per-user; nodes with a credentialDomain '
@@ -153,7 +169,10 @@ export function createUserCredModule(
     help(nodePath: TreePath): HelpModel {
       return {
         node: { path: nodePath, kind: 'builtin', description: DESCRIPTION },
-        cmds: usercredCmds(nodePath),
+        // 上游契约:cmd.path 必须是完整直连路径 `/<nodePath>/<cmd.name>`,由
+        // withCommandPaths 统一派生。少这一层会让 path 停在 `/<nodePath>`,被路由
+        // 判成 "command path escapes node"(2026-08-26 合并上游时 7 个 MCP 集成测试据此失败)。
+        cmds: withCommandPaths(nodePath, usercredCmds(nodePath)),
       }
     },
     async dispatch(cmd: string, args: Record<string, unknown>, ctx): Promise<unknown> {

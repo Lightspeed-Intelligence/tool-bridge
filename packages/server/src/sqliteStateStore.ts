@@ -14,21 +14,10 @@
  * 防御性地对返回行再做 startsWith 过滤。
  */
 
-import type { StateStore } from '@tool-bridge/core'
+import { prefixUpperBound, type StateStore } from '@tool-bridge/core'
 import Database from 'better-sqlite3'
 
 const DEFAULT_LIST_LIMIT = 1000
-
-/** prefix 的字典序后继(范围扫描上界);全 0xFFFF 时无上界返回 undefined。 */
-function prefixUpperBound(prefix: string): string | undefined {
-  for (let i = prefix.length - 1; i >= 0; i--) {
-    const code = prefix.charCodeAt(i)
-    if (code < 0xffff) {
-      return prefix.slice(0, i) + String.fromCharCode(code + 1)
-    }
-  }
-  return undefined
-}
 
 export class SqliteStateStore implements StateStore {
   private readonly db: Database.Database
@@ -72,6 +61,41 @@ export class SqliteStateStore implements StateStore {
 
   async put(key: string, value: unknown): Promise<void> {
     this.stmtPut.run(key, JSON.stringify(value))
+  }
+
+  async compareAndSwap(
+    key: string,
+    expectedRevision: number | null,
+    value: unknown | null,
+  ): Promise<boolean> {
+    if (expectedRevision === null) {
+      if (value === null) return false
+      const info = this.db
+        .prepare('INSERT OR IGNORE INTO kv (key, value) VALUES (?, ?)')
+        .run(key, JSON.stringify(value))
+      return info.changes > 0
+    }
+    if (!Number.isInteger(expectedRevision) || expectedRevision < 0) return false
+
+    // JSON type guard 避免 boolean true 被 SQLite json_extract 当作数字 1 误命中。
+    const predicate = `key = ?
+      AND json_type(value) = 'object'
+      AND json_type(value, '$.revision') = 'integer'
+      AND json_extract(value, '$.revision') = ?`
+    const info = value === null
+      ? this.db.prepare(`DELETE FROM kv WHERE ${predicate}`).run(key, expectedRevision)
+      : this.db
+          .prepare(`UPDATE kv SET value = ? WHERE ${predicate}`)
+          .run(JSON.stringify(value), key, expectedRevision)
+    return info.changes > 0
+  }
+
+  async putIfAbsent(key: string, value: unknown): Promise<boolean> {
+    // INSERT OR IGNORE 原子:changes=0 即已存在(输者),不覆盖。
+    const info = this.db
+      .prepare('INSERT OR IGNORE INTO kv (key, value) VALUES (?, ?)')
+      .run(key, JSON.stringify(value))
+    return info.changes > 0
   }
 
   async delete(key: string): Promise<void> {

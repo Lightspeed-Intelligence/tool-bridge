@@ -112,6 +112,8 @@ describe('expose.nodes 自定义节点转发', () => {
     const help = await helpRes.text()
     expect(help).toContain('cmd echo POST')
     expect(help).toContain('scope call')
+    expect(help).toContain('effect read')
+    expect(help).not.toContain('confirm')
     expect(help).toContain('原样返回入参')
 
     // 工具级 ~help:全量 spec 来自注册时缓存的 cmds,不打设备。
@@ -134,16 +136,13 @@ describe('expose.nodes 自定义节点转发', () => {
 
     // HTTP 调用 → WS call 帧(path 相对 mountPath)→ result 回 200。
     const callSeen = nextFrame(ws)
-    const invoke = postJson(
-      `device/${deviceId}/tools/echo`,
-      { tool: 'echo', arguments: { text: 'hi' } },
+    const invoke = postJson(`device/${deviceId}/tools/echo/echo`, { text: 'hi' },
       admin(),
     )
     const call = await callSeen
     expect(call).toMatchObject({
       type: 'call',
-      path: 'tools/echo',
-      tool: 'echo',
+      path: 'tools/echo/echo',
       arguments: { text: 'hi' },
     })
     if (call.type !== 'call') throw new Error('expected call frame')
@@ -155,9 +154,7 @@ describe('expose.nodes 自定义节点转发', () => {
     // 设备断开 → 503 unavailable retryable(与 shell 口径一致)。
     ws.close(1000)
     await new Promise(resolve => setTimeout(resolve, 20))
-    const offline = await postJson(
-      `device/${deviceId}/tools/echo`,
-      { tool: 'echo', arguments: { text: 'hi' } },
+    const offline = await postJson(`device/${deviceId}/tools/echo/echo`, { text: 'hi' },
       admin(),
     )
     expect(offline.status).toBe(503)

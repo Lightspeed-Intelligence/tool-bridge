@@ -14,7 +14,7 @@ import {
   prepareConnect,
   withDeviceConnectionGlobalOpts,
 } from './connect'
-import { asArray, guard, printJson, printLine } from '../output'
+import { asArray, printJson, printLine } from '../output'
 import { collect, withGlobalOpts } from '../args'
 import { CliError } from '../http'
 
@@ -65,7 +65,7 @@ function printStatus(status: DaemonStatus): void {
   if (status.mountPath) printLine(`path:       ${status.mountPath}`)
 }
 
-function daemonInstallCommand(): Command {
+function daemonInstallCommand() {
   return withDeviceConnectionGlobalOpts(new Command('install'))
     .description('Install or update the local device as a persistent systemd user service')
     .argument('[url]', 'Gateway base URL (mutually exclusive with --base-url)')
@@ -79,6 +79,12 @@ function daemonInstallCommand(): Command {
     )
     .option('--fs <root>', 'Expose local filesystem root (repeatable)', collect, [])
     .option('--fs-readonly', 'Expose fs as read-only; requires at least one --fs', false)
+    .option(
+      '--command-profile <file>',
+      'Expose a strict structured-command JSON profile (repeatable; direct argv, no implicit shell)',
+      collect,
+      [],
+    )
     .option('--no-shell', 'Do not expose shell; mutually exclusive with --allow')
     .option('--yes', 'Confirm persistent arbitrary command execution when --allow "*" is used')
     .addHelpText(
@@ -90,68 +96,61 @@ The resolved gateway/SK are frozen in a private 0600 daemon config; the unit nev
 Examples:
   tb daemon install --allow git --allow npm
   tb daemon install --path device/build-01 --allow '*' --yes  # trusted machines only
+  tb daemon install --no-shell --command-profile ./device-ops.json
   tb daemon install --no-shell --fs ~/projects --fs-readonly`,
     )
-    .action(async (url: string | undefined, opts: DaemonInstallOpts) => {
+    .action(async (url, opts) => {
       const asJson = Boolean(opts.json)
-      await guard(asJson, async () => {
-        await confirmAllowAll(opts)
-        const prepared = prepareConnect({ ...opts, url })
-        const status = await installDaemon(prepared)
-        if (asJson) printJson(status)
-        else {
-          printLine(`daemon installed for ${prepared.deviceId}`)
-          printStatus(status)
-          if (status.connection !== 'ready') {
-            printLine('connection is still starting; inspect with `tb daemon status` or `tb daemon logs`')
-          }
+      await confirmAllowAll(opts)
+      const prepared = prepareConnect({ ...opts, url })
+      const status = await installDaemon(prepared)
+      if (asJson) printJson(status)
+      else {
+        printLine(`daemon installed for ${prepared.deviceId}`)
+        printStatus(status)
+        if (status.connection !== 'ready') {
+          printLine('connection is still starting; inspect with `tb daemon status` or `tb daemon logs`')
         }
-      })
+      }
     })
 }
 
-function daemonStatusCommand(): Command {
+function daemonStatusCommand() {
   return withGlobalOpts(new Command('status'))
     .description('Show the local daemon and device connection state')
-    .action(async (opts: LocalOpts) => {
+    .action(async (opts) => {
       const asJson = Boolean(opts.json)
-      await guard(asJson, async () => {
-        assertLocalOpts(opts)
-        const status = await daemonStatus()
-        if (asJson) printJson(status)
-        else printStatus(status)
-      })
+      assertLocalOpts(opts)
+      const status = await daemonStatus()
+      if (asJson) printJson(status)
+      else printStatus(status)
     })
 }
 
-function daemonRestartCommand(): Command {
+function daemonRestartCommand() {
   return withGlobalOpts(new Command('restart'))
     .description('Restart the installed local device daemon')
-    .action(async (opts: LocalOpts) => {
+    .action(async (opts) => {
       const asJson = Boolean(opts.json)
-      await guard(asJson, async () => {
-        assertLocalOpts(opts)
-        const status = await restartDaemon()
-        if (asJson) printJson(status)
-        else {
-          printLine('daemon restarted')
-          printStatus(status)
-        }
-      })
+      assertLocalOpts(opts)
+      const status = await restartDaemon()
+      if (asJson) printJson(status)
+      else {
+        printLine('daemon restarted')
+        printStatus(status)
+      }
     })
 }
 
-function daemonUninstallCommand(): Command {
+function daemonUninstallCommand() {
   return withGlobalOpts(new Command('uninstall'))
     .description('Stop and remove the local daemon (does not revoke or delete the login profile)')
-    .action(async (opts: LocalOpts) => {
+    .action(async (opts) => {
       const asJson = Boolean(opts.json)
-      await guard(asJson, async () => {
-        assertLocalOpts(opts)
-        const result = await uninstallDaemon()
-        if (asJson) printJson(result)
-        else printLine(result.removed ? 'daemon uninstalled' : 'daemon is not installed')
-      })
+      assertLocalOpts(opts)
+      const result = await uninstallDaemon()
+      if (asJson) printJson(result)
+      else printLine(result.removed ? 'daemon uninstalled' : 'daemon is not installed')
     })
 }
 
@@ -163,31 +162,29 @@ function parseLines(value: string): number {
   return lines
 }
 
-function daemonLogsCommand(): Command {
+function daemonLogsCommand() {
   return withGlobalOpts(new Command('logs'))
     .description('Read local daemon logs from the systemd user journal')
     .option('--follow', 'Follow new log entries', false)
     .option('--lines <n>', 'Number of existing lines to show (1-10000)', '100')
-    .action(async (opts: LocalOpts & { follow?: boolean, lines: string }) => {
+    .action(async (opts) => {
       const asJson = Boolean(opts.json)
-      await guard(asJson, async () => {
-        assertLocalOpts(opts)
-        if (asJson) throw new CliError('--json is not supported with daemon logs')
-        await daemonLogs({ follow: Boolean(opts.follow), lines: parseLines(opts.lines) })
-      })
+      assertLocalOpts(opts)
+      if (asJson) throw new CliError('--json is not supported with daemon logs')
+      await daemonLogs({ follow: Boolean(opts.follow), lines: parseLines(opts.lines) })
     })
 }
 
-function daemonRunCommand(): Command {
+function daemonRunCommand() {
   return new Command('_run')
     .description('Internal systemd entrypoint')
     .requiredOption('--config <path>', 'Absolute daemon config path')
-    .action(async (opts: { config: string }) => {
-      await guard(false, () => runDaemon(String(opts.config)))
+    .action(async (opts) => {
+      await runDaemon(String(opts.config))
     })
 }
 
-export function daemonCommand(): Command {
+export function daemonCommand() {
   const command = new Command('daemon').description('Manage the persistent local device connection')
   command.addCommand(daemonInstallCommand())
   command.addCommand(daemonStatusCommand())

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { resetFetch, setFetch } from '../src/http'
@@ -80,8 +80,7 @@ describe('tb sk create:--scope / --register-path 可重复', () => {
       'p/b',
       ...gw,
     ])
-    const body = requestBody(fn)
-    const args = body.arguments as { registerPaths: string[], scopes: unknown[] }
+    const args = requestBody(fn) as { registerPaths: string[], scopes: unknown[] }
     expect(args.scopes).toEqual([
       { pattern: 'a/**', actions: ['read'] },
       { pattern: 'b/**', actions: ['call'] },
@@ -92,7 +91,7 @@ describe('tb sk create:--scope / --register-path 可重复', () => {
   it('单个 --scope 仍工作', async () => {
     const fn = captureFetch({ key: { id: 'sk1', owner: 'user:a' }, secret: 'tbk_s' })
     await runCli(['sk', 'create', '--owner', 'user:a', '--scope', 'a/**:read', ...gw])
-    const args = requestBody(fn).arguments as { scopes: unknown[] }
+    const args = requestBody(fn) as { scopes: unknown[] }
     expect(args.scopes).toEqual([{ pattern: 'a/**', actions: ['read'] }])
   })
 
@@ -146,6 +145,51 @@ describe('tb connect:--allow / --fs 可重复', () => {
       expect.objectContaining({ expose: { shell: { allow: ['echo', 'git'] } } }),
     )
   })
+
+  it('--command-profile 可重复并允许完全关闭 arbitrary shell', async () => {
+    if (tmpConfig === undefined) throw new Error('missing temp config')
+    const profile = (file: string, path: string, command: string) => {
+      const target = join(tmpConfig!, file)
+      writeFileSync(target, JSON.stringify({
+        version: 1,
+        path,
+        description: path,
+        commands: [{
+          name: command,
+          description: command,
+          executable: '/usr/bin/true',
+          effect: 'read',
+        }],
+      }))
+      return target
+    }
+    await runCli([
+      'connect',
+      '--base-url',
+      'https://gw',
+      '--sk',
+      'tbk_x',
+      '--device-id',
+      'd-profiles',
+      '--no-shell',
+      '--command-profile',
+      profile('system.json', 'ops/system', 'info'),
+      '--command-profile',
+      profile('docker.json', 'ops/docker', 'status'),
+    ])
+    expect(vi.mocked(runDeviceConnection)).toHaveBeenCalledWith(expect.objectContaining({
+      expose: {
+        nodes: [
+          expect.objectContaining({ path: 'ops/system', cmds: [expect.objectContaining({ effect: 'read' })] }),
+          expect.objectContaining({ path: 'ops/docker', cmds: [expect.objectContaining({ effect: 'read' })] }),
+        ],
+      },
+      commandProfiles: [
+        expect.objectContaining({ path: 'ops/system' }),
+        expect.objectContaining({ path: 'ops/docker' }),
+      ],
+    }))
+  })
 })
 
 describe('tb tool mount:--rename / --hide / --describe 可重复', () => {
@@ -198,7 +242,7 @@ describe('tb ctx put/patch:--meta 可重复', () => {
       'k2=v2',
       ...gw,
     ])
-    const args = requestBody(fn).arguments as { entry: { metadata?: Record<string, string> } }
+    const args = requestBody(fn) as { entry: { metadata?: Record<string, string> } }
     expect(args.entry.metadata).toEqual({ k1: 'v1', k2: 'v2' })
   })
 
@@ -215,7 +259,7 @@ describe('tb ctx put/patch:--meta 可重复', () => {
       'k2=v2',
       ...gw,
     ])
-    const args = requestBody(fn).arguments as { patch: { metadata?: Record<string, string> } }
+    const args = requestBody(fn) as { patch: { metadata?: Record<string, string> } }
     expect(args.patch.metadata).toEqual({ k1: 'v1', k2: 'v2' })
   })
 })

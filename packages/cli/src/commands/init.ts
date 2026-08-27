@@ -1,10 +1,10 @@
 import { Command } from 'commander'
-import { type CloudflareInitOptions, runCloudflareInit } from '../cloudflareInit'
-import { guard, printJson, printLine } from '../output'
+import { runCloudflareInit } from '../cloudflareInit'
+import { printJson, printLine } from '../output'
 import { withGlobalOpts } from '../args'
 
 /** 首次部署向导；当前 Cloudflare 编排依赖源码仓库中的 provision/build 配置。 */
-export function initCommand(): Command {
+export function initCommand() {
   const cloudflare = withGlobalOpts(new Command('cloudflare'))
     .description('Provision and deploy tool-bridge to Cloudflare from a source checkout')
     .option('--account-id <id>', 'Cloudflare account ID (required when more than one is available)')
@@ -17,26 +17,24 @@ export function initCommand(): Command {
       'after',
       '\nSecurity: init never accepts an Admin SK via --sk; it generates one for a new Worker or verifies the saved --profile for an existing Worker.',
     )
-    .action(async (opts: CloudflareInitOptions) => {
+    .action(async (opts) => {
       const asJson = Boolean(opts.json)
-      await guard(asJson, async () => {
-        const result = await runCloudflareInit(opts, {
-          onStep: asJson ? undefined : message => printLine(`→ ${message}`),
-        })
-        if (asJson) {
-          printJson({ ok: true, platform: 'cloudflare', ...result })
-          return
-        }
-        printLine(`deployed: ${result.baseUrl}`)
-        printLine(`profile: ${result.profile}`)
-        if (result.adminSk) {
-          printLine('')
-          printLine('Admin SK（仅显示这一次，请立即保存到密码管理器）:')
-          printLine(result.adminSk)
-        } else {
-          printLine('existing Admin SK preserved; local profile verified')
-        }
+      const result = await runCloudflareInit(opts, {
+        onStep: asJson ? undefined : message => printLine(`→ ${message}`),
       })
+      if (asJson) {
+        printJson({ ok: true, platform: 'cloudflare', ...result })
+        return
+      }
+      printLine(`deployed: ${result.baseUrl}`)
+      printLine(`profile: ${result.profile}`)
+      if (result.adminSk) {
+        printLine('')
+        printLine('Admin SK（仅显示这一次，请立即保存到密码管理器）:')
+        printLine(result.adminSk)
+      } else {
+        printLine('existing Admin SK preserved; local profile verified')
+      }
     })
 
   return new Command('init')

@@ -3,17 +3,15 @@ import { Navigate, Route, Routes } from 'react-router'
 import { useSession } from '@/lib/session-context'
 
 // 路由级拆包:登录门不再下载 RJSF/AJV 与千行管理表单;进入某页时才加载对应能力。
-const AppShell = lazy(() =>
-  import('@/components/layout/AppShell').then(module => ({ default: module.AppShell })),
+// React Flow 画布也在 CanvasPage 里懒加载,登录门不含图库。
+const WorkspaceShell = lazy(() =>
+  import('@/canvas/WorkspaceShell').then(module => ({ default: module.WorkspaceShell })),
 )
 const LoginPage = lazy(() =>
   import('@/pages/LoginPage').then(module => ({ default: module.LoginPage })),
 )
-const OverviewPage = lazy(() =>
-  import('@/pages/OverviewPage').then(module => ({ default: module.OverviewPage })),
-)
-const NodePage = lazy(() =>
-  import('@/pages/NodePage').then(module => ({ default: module.NodePage })),
+const CanvasPage = lazy(() =>
+  import('@/canvas/CanvasPage').then(module => ({ default: module.CanvasPage })),
 )
 const SearchPage = lazy(() =>
   import('@/pages/SearchPage').then(module => ({ default: module.SearchPage })),
@@ -35,6 +33,9 @@ const SecretsPage = lazy(() =>
 )
 const SkPage = lazy(() =>
   import('@/pages/system/SkPage').then(module => ({ default: module.SkPage })),
+)
+const StorePage = lazy(() =>
+  import('@/pages/system/StorePage').then(module => ({ default: module.StorePage })),
 )
 const MyCredentialsPage = lazy(() =>
   import('@/pages/MyCredentialsPage').then(module => ({ default: module.MyCredentialsPage })),
@@ -80,7 +81,15 @@ export default function App() {
   return (
     <Suspense fallback={<AppBooting />}>
       <Routes>
-        <Route element={<AppShell />}>
+        <Route element={<WorkspaceShell />}>
+          <Route
+            element={(
+              <DeferredPage>
+                <StorePage />
+              </DeferredPage>
+            )}
+            path="manage/store"
+          />
           <Route
             element={(
               <DeferredPage>
@@ -92,7 +101,7 @@ export default function App() {
           <Route
             element={(
               <DeferredPage>
-                <OverviewPage />
+                <CanvasPage />
               </DeferredPage>
             )}
             index
@@ -100,7 +109,7 @@ export default function App() {
           <Route
             element={(
               <DeferredPage>
-                <NodePage />
+                <CanvasPage />
               </DeferredPage>
             )}
             path="nodes/*"

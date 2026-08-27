@@ -1,0 +1,96 @@
+---
+description: 设备会话的服务端与客户端边界:DO WebSocket 休眠、presence 三态、call-scoped Store upload 与 SDK device 子入口的运行时中立约束。
+kind: guide
+relations:
+  related:
+    - store/default-store.mdx
+code:
+  paths:
+    - packages/core/src/device/**
+    - packages/gateway/src/deviceSession.ts
+    - packages/server/src/deviceHub.ts
+    - packages/server/src/deviceRouter.ts
+    - packages/sdk/src/device/**
+    - packages/cli/src/deviceRuntime.ts
+---
+
+# 设备会话:DO 休眠、presence 与 SDK device
+
+Cloudflare 设备连接由 Durable Object(`DeviceSession`)持有。正确性不只包括"能连上",还包括对象被回收后能恢复会话归属并继续转发。Node 宿主的对应实现是 `deviceHub.ts`/`deviceRouter.ts`(多副本 Redis 路由见 [node-docker-and-helm](../hosts-deploy/node-docker-and-helm.mdx))。
+
+## 不变量
+
+- 设备帧使用 core 的稳定 codec(`packages/core/src/device/frames.ts`);ping/pong 字面量由共享常量产生。
+- DO 使用 WebSocket auto-response 处理 heartbeat,避免仅为 pong 唤醒对象。
+- 当前活动连接标识写入 DO storage;对象恢复时从 storage 重建必要状态,不依赖旧内存。
+- D1 state store(registry)里的 online 位不是活连接租约;真正发送以 DO 内活动 socket 为准。发现面不再只凭这个位:节点带 `lastSeenAt`(hello 与 alarm 心跳巡检写入),`~tree`/`~help`/`device ls` 投影时经 `derivePresence` 结合 TTL 把过期的 online 降级为 `stale`——避免树谎报 online 而调用返回 offline。
+- auto-response 应答 ping/pong **不唤醒对象**,故心跳无法在收到 pong 时写 state store。改由周期 alarm 巡检:有活连接时读 `getWebSocketAutoResponseTimestamp(ws)` 回写 `lastSeenAt` 并重排 alarm;无活连接且已断线时才执行 reclaim。同一个 alarm 多用途,靠 `meta.activeConnId` 是否存在分流。
+- 投影是只读降级:读路径按 `lastSeenAt` 把 online 显示为 stale,但**绝不回写** `setOnline(false)`(权威状态只由连接生命周期写)。
+- close/error、替换连接和过期状态都必须清理,且不得让旧连接覆盖新连接(generation guard)。Node 宿主启动 `sweepOrphans` 的崩溃态分支(meta 无 disconnectedAt 却无活连接)也要同步把 registry online 翻 false,不能只排 reclaim。
+
+## 为什么保留 raw WebSocket
+
+设备反向注册的稳定 wire 是 raw WebSocket 上的 core JSON frame，不是 Socket.IO/Engine.IO 协议。Socket.IO client 不能直接连接当前 endpoint；同时更换两端也不会代替 generation、presence、reclaim、call/result/cancel 或 Store capability 这些服务端权威状态机，反而增加第二层协议。因此服务端保留 raw WS；客户端可使用 PartySocket 的 reconnect transport，但不引入 PartyServer/rooms 来重新定义连接归属。
+
+可复用的边界是 `@tool-bridge/sdk/device` 的 portable connection supervisor：它持有 reconnect、heartbeat、credential refresh、suspend/resume 与 call dispatch；Node CLI、React Native 等宿主只注入 WebSocket factory 和凭证 provider。CLI 的 `deviceRuntime.ts` 可保留 shell/FS/structured process dispatch 与 `ws` adapter，不得复制 supervisor 状态机。任何未来协议替换都必须先证明上述安全不变量和 Workers DO hibernation 语义仍可保持，不能只以 rooms/reconnect API 更便利为理由。
+
+## Linux process 暴露与终态
+
+Linux CLI/daemon 的 structured command profile 只是在已有 `DeviceExpose.nodes` 中产生 `kind:'tool'` 节点,
+command metadata 携带 strict input/output schema、设备所有者声明的 effect 与 confirm。wire 继续使用既有
+hello/expose、call、result、cancel,没有增加 operation frame 或另一套调用协议。任意 `shell/exec` 仍保持
+`effect:destructive + confirm:true`,不能按 shell 字符串或命令名启发式降级。
+
+shell 与 structured command 的最终结果保留 `stdout/stderr/exitCode`,并附加
+`startedAt/completedAt`、`outcome: exited | signaled | timed_out`、可选 signal 以及两条输出流各自的截断标志。
+正常非零 exit code 仍是 `outcome:exited`;调用方必须检查 exitCode/outcome,不能把收到 result 当作业务成功。
+timeout 会杀直接 child 并返回 `timed_out`;structured handler 收到协作式 AbortSignal 时也会杀直接 child,
+但没有独立 `cancelled` outcome,也不承诺清理其自行派生的全部 descendants。现有 shell dispatch 没有传入同一
+AbortSignal。
+
+这些字段只在一次同步 device call 收敛后的最终 result 中出现:当前没有公开 `start -> operationId`、
+status/poll/cancel、增量 stdout/stderr、重连恢复或跨宿主持久化 operation store。cancel 仍是协作式提示,
+timeout/cancel/disconnect 后若外部副作用无法从终态证明,调用方必须按 outcome unknown 处理且不得盲目自动重试。
+
+## 验证
+
+普通 Miniflare 测试能覆盖帧、路由和状态转换,但不能证明真实边缘发生过 eviction。真实环境验证使用:
+
+```bash
+TB_BASE_URL=https://example.invalid \
+TB_ADMIN_SK=... \
+TB_VERIFY_HIBERNATION=1 \
+pnpm tsx scripts/verify-device.ts
+```
+
+脚本会跨越足够长的空闲窗口后再次调用。该验证消耗真实部署,只在明确授权后执行;一次成功的时间数字不是长期 SLA,也不应固化进文档。
+
+若失败,分别检查设备端 heartbeat、DO storage 的连接归属、state store 的 presence 记录和调用端超时,不要用增加重试掩盖状态恢复错误。
+
+## SDK device 运行时边界
+
+设备客户端的 npm 消费面分为 Node-only 根入口与独立的 `@tool-bridge/sdk/device` neutral 子入口，后者供 React Native/Hermes 等宿主使用。约束与经验:
+
+- 多运行时包的兼容性按**目标子入口的 JS/d.ts 依赖闭包**判定,不按包级 `engines`/`dependencies` 猜测。`ws` 可以继续被 sdk 安装,但不得进入 device 子入口的模块图;JS 与声明文件两条依赖图要同时隔离。
+- 设备核心以 WebSocket factory、credential provider 和显式 suspend/resume 注入宿主差异;RN 第三参数 headers 只存在于薄 adapter。
+- 拍照等二进制产物不新增 WebSocket 二进制帧。网关为每个已鉴权 call 把窄 Store capability 放进
+  wire `context.upload`(`token/expiresAt/maxBytes/maxObjects`)。SDK 在进入用户 handler 前删除原始 token，
+  handler 的 `context.upload` 只含期限/限额，并获得
+  `call.uploadObject({body,contentType,filename?,size?,checksum?,idempotencyKey?})`。它经普通 HTTP 创建
+  upload session；只有 create 携带精确 size 且 backend 能签 `Content-Length` 时走 R2/S3 direct，否则
+  relay。result 帧只返回 JSON 可序列化的 ready descriptor/`store://default/...`。owner 是 caller，
+  producer 是 `device:<deviceId>`。
+- `call.uploadObject` 会把 create capability 放进 `x-tb-store-capability`、把 session capability 放进
+  `x-tb-store-upload`，不会塞进 arguments、result 或 URL；网关在 call 结束后撤销 create capability，
+  期限与后台清理兜底。SDK 只用已知 size 做本地早拒，不在 create 成功前自行递增对象计数；数量/字节
+  reservation 与幂等 replay 以服务端 CAS 为准。call idempotency 还绑定 producer + call id，不能跨 call
+  恢复 session。老网关不带 upload 时明确 `unavailable`，不能悄悄退回 Context。
+- device 子入口也保留顶层 `uploadObject`，使用 `purpose:'http'` 的设备 Bearer 身份做自主 Store 上传。
+  旧 `uploadContextObject` 已删除。Context 的 `create_upload`、`tb ctx upload` 与 Dashboard Context upload
+  仍保留为管理/authoring 能力，但不再是设备产物入口。
+- 上传保持跨运行时流式：浏览器/RN 沿用 Web fetch，Node 原生 fetch 遇到 `ReadableStream` request body
+  时 SDK 内部补 `duplex:'half'`；该运行时细节不进入公开 grant 或设备帧。
+- 设备 handler **执行结果**只保留进程内同 call id 去重(handler 获得 id 与协作式 AbortSignal)，与上面的
+  Store upload session 幂等不是同一件事。当前网关重试不会稳定复用同一个 call id,持久化结果缓存会制造
+  exactly-once 的错误承诺;跨进程 durable execution 要等端到端 idempotency key 与重放协议完整设计。
+- 发布验收不止看 manifest:检查全部条件导出目标、扫描 device 产物的 Node/私有依赖泄漏、从最终 tarball 干净安装并同时 import 两个入口(闸门细节见 [npm-publishing](../release/npm-publishing.mdx))。

@@ -15,6 +15,7 @@ import type { BuiltinModule } from './types'
 import { createUserCredModule, type CredentialDomainInfo } from './usercred'
 import { type CatalogModuleDeps, createCatalogModule } from './catalog'
 import { createPluginModule, type PluginModuleDeps } from './plugin'
+import { createStoreModule, type StoreModuleDeps } from './store'
 import { createAnnotationModule } from './annotation'
 import { createFederationModule } from './federation'
 import { createRegistryModule } from './registry'
@@ -46,6 +47,8 @@ export interface BuiltinDeps {
   registry: NodeRegistryStore
   secret: SecretStoreImpl
   sk: SKRegistryStore
+  /** 部署级 default Store；正式宿主应注入，纯 core 旧单测可缺省。 */
+  store?: StoreModuleDeps
   /** 网关 version(单一真源:package.json),status.get 回显。 */
   version: () => string
   /**
@@ -139,6 +142,9 @@ export function createBuiltins(deps: BuiltinDeps): Map<string, BuiltinModule> {
       createAnnotationModule({ store: deps.annotation.store, registry: deps.registry, now }),
     )
   }
+  if (deps.store !== undefined) {
+    modules.set('store', createStoreModule(deps.store))
+  }
   return modules
 }
 
@@ -165,7 +171,15 @@ export { createRegistryModule, parseNodeInput } from './registry'
 export { createSecretModule } from './secret'
 export { createSkModule } from './sk'
 export { createStatusModule, type StatusDeps, type StatusSummary } from './status'
-export type { BuiltinModule } from './types'
+export {
+  createStoreModule,
+  STORE_COMMANDS,
+  type StoreCommand,
+  type StoreModuleCallbacks,
+  type StoreModuleDeps,
+  storeScopeForCmd,
+} from './store'
+export type { BuiltinDispatchRuntime, BuiltinModule } from './types'
 export {
   createUserCredModule,
   type CredentialDomainInfo,

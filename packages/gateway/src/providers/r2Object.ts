@@ -1,5 +1,5 @@
 /**
- * R2 ObjectStore 适配(r2 义务):R2 binding → core `ObjectStore` 接口。
+ * R2 ObjectStore 适配(default Store 与 r2 Context 共用):R2 binding → core `ObjectStore` 接口。
  *
  * 四动词语义(幂等/conflict/$ref 阈值)全部在 core objectProvider,这里只做 API 映射:
  * - `version` = R2 etag;条件写用 `onlyIf.etagMatches`(不满足时 R2 put 返回 null → conflict)。
@@ -10,14 +10,20 @@
  */
 
 import {
-  objectBodyToBytes,
+  type ObjectBody,
   type ObjectListOptions,
   type ObjectListResult,
   type ObjectMeta,
+  type ObjectPutOptions,
   type ObjectStore,
   TBError,
 } from '@tool-bridge/core'
-import { encodeObjectKey, presignS3Url } from '@tool-bridge/app'
+import {
+  encodeObjectKey,
+  presignS3Put,
+  presignS3Url,
+  toWebObjectBodyStream,
+} from '@tool-bridge/app'
 import { AwsClient } from 'aws4fetch'
 
 /** R2 S3 兼容端点的 presign 参数(凭证链解析见 app.ts;缺省 = 不提供 presign)。 */
@@ -26,6 +32,38 @@ export interface R2PresignCredentials {
   bucket: string
   endpoint: string
   secretAccessKey: string
+}
+
+function toR2Body(body: ObjectBody): ReadableStream | ArrayBuffer | ArrayBufferView | string {
+  if (typeof body === 'string' || body instanceof ArrayBuffer || body instanceof Uint8Array) {
+    return body
+  }
+  if (body instanceof ReadableStream) return body
+
+  // core 只要求最小 ObjectBodyStream；共享桥接仍逐块背压、不聚合字节。
+  return toWebObjectBodyStream(body)
+}
+
+function onlyIfForPut(opts: ObjectPutOptions | undefined): R2Conditional | Headers | undefined {
+  if (opts?.ifNoneMatch === '*') {
+    // R2 Workers API 支持条件 Headers；HTTP `If-None-Match: *` 即原子 create-only。
+    return new Headers({ 'If-None-Match': '*' })
+  }
+  return opts?.ifMatchEtag !== undefined ? { etagMatches: opts.ifMatchEtag } : undefined
+}
+
+function isPreconditionFailed(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null) return false
+  const candidate = error as {
+    code?: unknown
+    name?: unknown
+    status?: unknown
+    statusCode?: unknown
+  }
+  return candidate.status === 412
+    || candidate.statusCode === 412
+    || candidate.code === 412
+    || candidate.name === 'PreconditionFailed'
 }
 
 function toMeta(obj: R2Object): ObjectMeta {
@@ -53,15 +91,26 @@ export function createR2ObjectStore(bucket: R2Bucket, presign?: R2PresignCredent
       return { meta: toMeta(obj), body: obj.body }
     },
 
-    async put(key, body, opts) {
-      const bytes = await objectBodyToBytes(body)
-      const res = await bucket.put(key, bytes, {
-        httpMetadata: opts?.contentType !== undefined ? { contentType: opts.contentType } : {},
-        customMetadata: opts?.metadata ?? {},
-        ...(opts?.ifMatchEtag !== undefined ? { onlyIf: { etagMatches: opts.ifMatchEtag } } : {}),
-      })
+    async put(key, body, opts: ObjectPutOptions | undefined) {
+      if (opts?.ifMatchEtag !== undefined && opts.ifNoneMatch !== undefined) {
+        throw new TBError('invalid_argument', 'ifMatchEtag 与 ifNoneMatch 不能同时使用')
+      }
+      const onlyIf = onlyIfForPut(opts)
+      let res: R2Object | null
+      try {
+        res = await bucket.put(key, toR2Body(body), {
+          httpMetadata: opts?.contentType !== undefined ? { contentType: opts.contentType } : {},
+          customMetadata: opts?.metadata ?? {},
+          ...(onlyIf !== undefined ? { onlyIf } : {}),
+        })
+      } catch (error) {
+        if (isPreconditionFailed(error)) {
+          throw new TBError('conflict', `对象写入条件不满足:'${key}'`)
+        }
+        throw error
+      }
       // 条件不满足(含对象不存在)时 R2 put 返回 null → conflict(core 接口契约)。
-      if (res === null) throw new TBError('conflict', `etag 不匹配:'${key}'`)
+      if (res === null) throw new TBError('conflict', `对象写入条件不满足:'${key}'`)
       return toMeta(res)
     },
 
@@ -103,6 +152,20 @@ export function createR2ObjectStore(bucket: R2Bucket, presign?: R2PresignCredent
     const base = presign.endpoint.replace(/\/+$/, '')
     store.presign = (key, ttlSec) =>
       presignS3Url(client, `${base}/${presign.bucket}/${encodeObjectKey(key)}`, ttlSec)
+    store.presignPut = (key, ttlSec, opts) =>
+      presignS3Put(
+        client,
+        `${base}/${presign.bucket}/${encodeObjectKey(key)}`,
+        ttlSec,
+        opts,
+      )
+    store.presignPutExact = (key, ttlSec, opts) =>
+      presignS3Put(
+        client,
+        `${base}/${presign.bucket}/${encodeObjectKey(key)}`,
+        ttlSec,
+        opts,
+      )
   }
 
   return store

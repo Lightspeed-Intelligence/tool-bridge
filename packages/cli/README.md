@@ -82,7 +82,7 @@ tb login --base-url https://your-gateway.example.com   # 交互输入 SK
 tb status            # 网关健康与版本
 tb tree              # 浏览可见的工具树
 tb help docs/context7            # 节点级 ~help(工具索引)
-tb call docs/context7 --tool resolve-library-id --args '{"query":"react"}'
+tb call docs/context7/resolve-library-id --args '{"query":"react"}'
 ```
 
 ## 把 Linux 机器作为 daemon 接入
@@ -120,6 +120,33 @@ Shell 缺省仍然拒绝所有命令。`--allow '*'` 会把任意 shell 命令�
 传 `--yes`。daemon 配置可被同一用户读取，因此只能使用最小权限 Device SK，绝不能复用 Admin
 SK。Device SK 的注册权限应类似：
 
+需要让 Agent 无确认地执行只读诊断时，不要降低 `shell/exec` 的危险等级。改用结构化命令
+profile，并关闭 arbitrary shell：
+
+```sh
+tb daemon install \
+  --device-id build-01 \
+  --path device/build-01 \
+  --no-shell \
+  --command-profile ./packages/cli/examples/structured-command-profile.json
+```
+
+profile 是 strict JSON，完整示例见
+[`examples/structured-command-profile.json`](./examples/structured-command-profile.json)。每个文件定义
+一个相对设备路径和若干命令；每条命令必须声明 `executable`、`effect` 与描述，`argv` 由固定字符串和
+受类型约束的输入槽组成。输入槽支持 `string` / `number` / `boolean`、`choices`、`required`、
+`multiple` 与固定 `flag`。执行始终使用 `spawn(executable, argv, {shell:false})`；只有 profile 明确把
+shell 本身写成 executable 时才会进入 shell。
+
+可选的 `cwd`、`timeoutMs`、`maxOutputBytes` 与 `inheritEnv` 也是逐命令策略。子进程缺省只继承
+PATH、locale、HOME、USER 等非凭证基础环境；`inheritEnv` 只记录变量名并在执行时取值。它不是
+SecretStore 注入，也不提供输出脱敏，因此不要用它传 token、SK 或密码。`effect:'destructive'` 始终
+强制 `confirm:true`。结果除兼容的 stdout/stderr/exitCode 外，还包含起止时间、
+`outcome`、signal 与两条输出流的截断标记。
+
+`tb connect` 支持同一个可重复的 `--command-profile` 参数。`tb daemon install` 会把已经校验和
+规范化的 profile 冻结到 `0600` daemon 配置，后续重启不再读取原文件。
+
 ```sh
 tb sk create \
   --owner device:build-01 \
@@ -147,16 +174,25 @@ KV/R2/D1、构建部署、验证 `~help`，最后保存本机 profile。Admin SK
 | `tb init cloudflare` | 从源码仓库初始化、部署并验证 Cloudflare Worker |
 | `tb login` / `tb whoami` / `tb use` | 档案管理(多网关/多 SK 切换) |
 | `tb ls` / `tb tree` / `tb help <path>` | 浏览工具树与节点文档 |
-| `tb call <path> --tool <tool>` / `tb call <tool-path> '{…}'` | 调用任意已挂载工具 |
+| `tb call <path>/<command> '{…}'` | 调用任意已挂载工具/命令(直连,body 即 arguments) |
 | `tb tool mount/rm` · `tb server add/ls/rm` | 挂载 HTTP/MCP/plugin 上游与远端 HTBP 服务 |
-| `tb ctx ls/cat/put/patch/rm/search` | 上下文(对象存储)读写 |
+| `tb store upload/ls/stat/get/share/revoke-share/rm` | 管理部署级 default Store；设备产物不需要 Context 挂载 |
+| `tb ctx ls/cat/put/upload/patch/rm/search` | 上下文读写；`upload` 通过限时 PUT 直传二进制 |
 | `tb sk` / `tb secret` | SK 签发/查看/更新/禁用/吊销与上游凭证管理 |
-| `tb connect` | 将本机注册为设备(shell/fs 反向通道) |
+| `tb connect` | 将本机注册为设备(shell/fs/结构化命令反向通道) |
 | `tb daemon install/status/logs/restart/uninstall` | 在 Linux 上持久运行本机设备连接 |
 | `tb device ls` | 设备清单 |
 | `tb skill ls/get/search/publish/rm/mount/unmount` | Agent Skill 仓库 |
 | `tb federation` / `tb note` / `tb feedback` | 联邦白名单、路径注解与使用反馈 |
 | `tb plugin register/list/get/update/health/rm` | 插件注册表与探活 |
+
+`tb ctx put` 面向可内联的文本/JSON，支持 stdin 与 `--meta`；`tb ctx upload` 面向大文件或
+二进制，先申请短期 PUT 后直传对象存储。`upload` 缺省拒绝覆盖同名 entry，确认替换时显式加
+`--force`。
+
+`tb store upload` 则把普通附件、设备照片/视频等写入每个部署必备的 default Store，返回稳定的
+`store://default/...` URI；它不要求也不创建 Context。`tb store share` 的成功 stdout/JSON 会返回
+用户明确请求的短期 bearer `$ref`，stderr 与错误响应不会打印该链接。大文件上传、下载均流式执行。
 
 全局参数 `--json` / `--base-url` / `--sk` / `--timeout` 可放在命令前、中、后任一层级；
 即使 Commander 在业务 action 前报错，`--json` 也会返回单个可解析错误对象。配置存于

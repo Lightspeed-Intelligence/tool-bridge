@@ -40,6 +40,28 @@ export interface ContextPatch {
   metadata?: Record<string, string>
 }
 
+/** 为 namespace 内单个对象签发的限时直传凭证。URL 本身是 bearer secret。 */
+export interface ContextUploadGrant {
+  /** 凭证失效时间(ISO 8601)。 */
+  expiresAt: Timestamp
+  /** 上传时必须原样携带的请求头；这些值可能参与签名。 */
+  headers: Record<string, string>
+  method: 'PUT'
+  /** 上传成功后可长期保存和分享的稳定引用；不包含临时凭证。 */
+  uri: URI
+  /** 仅交给上传方使用的限时 URL，不应写入日志或持久化。 */
+  url: string
+}
+
+export interface ContextUploadInput {
+  /** 将要上传的媒体类型；会被签入 PUT 请求。 */
+  contentType: string
+  /** 缺省 false：仅当目标不存在时写入；true 才允许覆盖既有对象。 */
+  overwrite?: boolean
+  /** namespace 内的目标 entry path。 */
+  path: string
+}
+
 export interface SearchOptions extends ListOptions {
   /** 缺省 keyword;semantic 需 capabilities 声明 "search:semantic",未声明 → invalid_argument。 */
   mode?: 'keyword' | 'semantic'
@@ -53,14 +75,14 @@ export interface SearchOptions extends ListOptions {
  * 方法或抛 unimplemented。未实现的动词在数据面按 unknown cmd 拒绝(invalid_argument)。
  */
 export interface ContextProvider {
-  Delete?(path: string): Promise<void>
+  delete?(path: string): Promise<void>
   /** 读取单个条目(含内容);不存在 → not_found。 */
-  Get?(path: string): Promise<ContextEntry>
+  get?(path: string): Promise<ContextEntry>
   /** 枚举条目(浅层列表 + 分页);path 为 namespace 内相对路径前缀。 */
-  List?(path: string, opts?: ListOptions): Promise<Page<ContextEntryMeta>>
-  Search?(query: string, opts?: SearchOptions): Promise<Page<ContextEntryMeta>>
+  list?(path: string, opts?: ListOptions): Promise<Page<ContextEntryMeta>>
+  search?(query: string, opts?: SearchOptions): Promise<Page<ContextEntryMeta>>
   /** 部分更新已存在条目的内容或 metadata;不存在 → not_found。 */
-  Update?(path: string, patch: ContextPatch): Promise<ContextEntryMeta>
+  update?(path: string, patch: ContextPatch): Promise<ContextEntryMeta>
   /** 创建或整体替换条目(幂等 upsert)。 */
-  Write?(path: string, entry: ContextEntryInput): Promise<ContextEntryMeta>
+  write?(path: string, entry: ContextEntryInput): Promise<ContextEntryMeta>
 }

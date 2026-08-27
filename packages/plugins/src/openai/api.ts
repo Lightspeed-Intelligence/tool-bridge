@@ -39,8 +39,11 @@ import type {
   listInputItemsInput,
   listModelsInput,
 } from './schema'
+import { bytesToBase64 as encodeBase64, readBoundedResponseBytes } from '../_runtime/responseBytes'
+import { createProviderHttpClient, type ProviderHttpErrorContext } from '../_runtime/providerHttp'
 import { assertPublicHttpUrl, guardedFetch } from '../_runtime/guardedFetch'
 import { type ProviderContext, requireApiKey } from '../_runtime/plugin'
+import { trimmedText as text } from '../_runtime/jsonValue'
 import { upstreamError } from '../_runtime/upstreamError'
 
 const SERVICE = 'openai'
@@ -48,29 +51,13 @@ const API_BASE = 'https://api.openai.com/v1'
 /** OpenAI 音频接口本身的上限,提前挡住可以省掉一次 25 MB 的无效上传。 */
 const AUDIO_SOURCE_MAX_BYTES = 25 * 1024 * 1024
 const AUDIO_SOURCE_FETCH_TIMEOUT_MS = 30_000
+const http = createProviderHttpClient({ baseUrl: `${API_BASE}/`, service: SERVICE })
 
 type Json = Record<string, unknown>
-
-/** 上游 `optionalString` 的等价物:非字符串、或去空白后为空,都算缺失。 */
-function text(value: unknown): string | undefined {
-  if (typeof value !== 'string') return undefined
-  const trimmed = value.trim()
-  return trimmed === '' ? undefined : trimmed
-}
 
 function normalizedContentType(value: string | null, fallback: string): string {
   if (value === null || value === '') return fallback
   return value.split(';', 1)[0]?.trim() || fallback
-}
-
-/** 分块喂 `btoa`:一次性 `String.fromCharCode(...bytes)` 会在几 MB 的音频上爆参数上限。 */
-function encodeBase64(bytes: Uint8Array): string {
-  const CHUNK = 0x8000
-  let binary = ''
-  for (let i = 0; i < bytes.length; i += CHUNK) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK))
-  }
-  return btoa(binary)
 }
 
 function stripPadding(value: string): string {
@@ -163,8 +150,34 @@ async function rawRequest(ctx: ProviderContext, input: RequestInput): Promise<Re
   return response
 }
 
+function errorMessageFromContext(context: ProviderHttpErrorContext): string {
+  const fallback = `openai request failed with ${context.status}`
+  const payload = context.data as { error?: { message?: unknown }, message?: unknown } | undefined
+  const message = payload !== null && typeof payload === 'object'
+    ? payload.error?.message ?? payload.message
+    : undefined
+  if (typeof message === 'string' && message !== '') return message
+  return context.rawText?.trim() || fallback
+}
+
 async function jsonRequest(ctx: ProviderContext, input: RequestInput): Promise<unknown> {
-  return (await rawRequest(ctx, input)).json()
+  if (input.body instanceof FormData) {
+    throw new TBError('internal', 'openai jsonRequest cannot send multipart data')
+  }
+  const method = input.method ?? 'GET'
+  const result = await http.request({
+    path: input.path,
+    method,
+    headers: input.headers ?? baseHeaders(requireApiKey(ctx, SERVICE)),
+    ...(input.body === undefined ? {} : { json: input.body }),
+    invalidJsonMessage: 'OpenAI 返回了非 JSON 响应',
+    mapError: context => upstreamError(context.status, errorMessageFromContext(context)),
+    mapTransportError: ({ message }) => upstreamError(
+      502,
+      `openai request failed before receiving response: ${message ?? 'unknown network error'}`,
+    ),
+  })
+  return result.data
 }
 
 function assertStreamingDisabled(input: { stream?: boolean }): void {
@@ -198,40 +211,13 @@ function withQuery(path: string, query: Json): string {
  * 一个谎报 content-length 的 URL 就能让插件把内存吃干。
  */
 async function readBoundedBytes(response: Response, fieldName: string): Promise<Uint8Array<ArrayBuffer>> {
-  const declared = Number(response.headers.get('content-length'))
-  if (Number.isSafeInteger(declared) && declared > 0) assertAudioSourceSize(declared, fieldName)
-
-  if (response.body === null) {
-    const bytes = new Uint8Array(await response.arrayBuffer())
-    assertAudioSourceSize(bytes.byteLength, fieldName)
-    return bytes
-  }
-
-  const reader = response.body.getReader()
-  const chunks: Uint8Array[] = []
-  let total = 0
-  try {
-    for (;;) {
-      const { done, value } = await reader.read()
-      if (done) break
-      total += value.byteLength
-      if (total > AUDIO_SOURCE_MAX_BYTES) {
-        await reader.cancel().catch(() => undefined)
-        assertAudioSourceSize(total, fieldName)
-      }
-      chunks.push(value)
-    }
-  } finally {
-    reader.releaseLock()
-  }
-
-  const bytes = new Uint8Array(total)
-  let offset = 0
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset)
-    offset += chunk.byteLength
-  }
-  return bytes
+  return readBoundedResponseBytes(response, {
+    maxBytes: AUDIO_SOURCE_MAX_BYTES,
+    tooLarge: () => new TBError(
+      'invalid_argument',
+      `${fieldName} exceeds ${AUDIO_SOURCE_MAX_BYTES} bytes`,
+    ),
+  })
 }
 
 async function fetchAudioSource(url: string): Promise<Response> {

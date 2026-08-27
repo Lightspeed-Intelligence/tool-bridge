@@ -9,6 +9,7 @@ import {
   encodeDeviceFrame,
   identify,
   NodeRegistryStore,
+  parsePositiveIntEnv,
   PING_FRAME_JSON,
   PONG_FRAME_JSON,
   type StateStore,
@@ -22,15 +23,16 @@ import {
   SearchSynchronizer,
 } from '@tool-bridge/app'
 import { DurableObject } from 'cloudflare:workers'
-import { D1SearchIndex } from './search/d1SearchIndex'
-import { KvStateStore } from './kvStateStore'
+import type { D1SchemaGate } from './d1Runtime'
+import { createD1SearchSchema, D1SearchIndex } from './search/d1SearchIndex'
+import { createD1StateSchema, D1StateStore } from './d1StateStore'
 
 interface DeviceSessionEnv {
   TB_BOOTSTRAP_ADMIN_SK?: string
   TB_DEVICE_RECLAIM_SEC?: string
-  TB_KV: KVNamespace
   TB_SEARCH?: D1Database
   TB_SECRET_ENCRYPTION_KEY?: string
+  TB_STATE: D1Database
 }
 
 interface SocketAttachment {
@@ -52,6 +54,13 @@ interface DeviceMeta {
 const META_KEY = 'meta'
 const RESULT_KEY_PREFIX = 'result:'
 const DEFAULT_RECLAIM_SEC = 24 * 60 * 60
+/**
+ * presence 心跳刷新间隔。DO 用 auto-response 应答 ping/pong 时**不唤醒对象**,所以 DO 代码
+ * 路径看不到心跳,无法在收到 pong 时刷新 KV 的 lastSeenAt。改由周期 alarm 主动巡检:读平台
+ * 记录的最后 auto-response 时刻(getWebSocketAutoResponseTimestamp)回写 lastSeenAt。
+ * 取 45s——小于 presence TTL(90s)确保活动设备不被误降级 stale,又不过度放大 KV 写。
+ */
+const PRESENCE_REFRESH_MS = 45_000
 
 function jsonResponse(value: unknown, status = 200): Response {
   return new Response(JSON.stringify(value), {
@@ -62,12 +71,6 @@ function jsonResponse(value: unknown, status = 200): Response {
 
 function tbErrorResponse(error: TBError): Response {
   return jsonResponse(error.toJSON(), error.httpStatus)
-}
-
-function parsePositiveInt(value: string | undefined, fallback: number): number {
-  if (value === undefined) return fallback
-  const n = Number(value)
-  return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback
 }
 
 function resultKey(id: string): string {
@@ -99,17 +102,15 @@ function invokeRequestFromBody(body: unknown): DeviceCallRequest {
   if (
     typeof b.id !== 'string'
     || typeof b.path !== 'string'
-    || typeof b.tool !== 'string'
     || typeof b.arguments !== 'object'
     || b.arguments === null
     || Array.isArray(b.arguments)
   ) {
-    throw new TBError('invalid_argument', 'device invoke body must be {id,path,tool,arguments}')
+    throw new TBError('invalid_argument', 'device invoke body must be {id,path,arguments}')
   }
   return {
     id: b.id,
     path: b.path,
-    tool: b.tool,
     arguments: b.arguments as Record<string, unknown>,
   }
 }
@@ -121,9 +122,13 @@ function invokeRequestFromBody(body: unknown): DeviceCallRequest {
 export class DeviceSession extends DurableObject<DeviceSessionEnv> {
   /** 惰性建会话(Promise 防并发重建):hibernation 唤醒后由 sessionFor 按 meta 恢复 ready 态。 */
   private readonly sessions = new Map<WebSocket, Promise<DeviceGatewaySession>>()
+  private readonly searchSchema: D1SchemaGate | undefined
+  private readonly stateSchema: D1SchemaGate
 
   constructor(ctx: DurableObjectState, env: DeviceSessionEnv) {
     super(ctx, env)
+    this.stateSchema = createD1StateSchema(env.TB_STATE)
+    this.searchSchema = env.TB_SEARCH === undefined ? undefined : createD1SearchSchema(env.TB_SEARCH)
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair(PING_FRAME_JSON, PONG_FRAME_JSON))
   }
 
@@ -168,23 +173,30 @@ export class DeviceSession extends DurableObject<DeviceSessionEnv> {
 
   override async alarm(): Promise<void> {
     const meta = await this.ctx.storage.get<DeviceMeta>(META_KEY)
-    if (
-      meta === undefined
-      || meta.activeConnId !== undefined
-      || meta.disconnectedAt === undefined
-    ) {
+    if (meta === undefined) return
+
+    // 有活连接:这是一次 presence 心跳巡检,不是 reclaim。读平台记录的最后 auto-response
+    // 时刻回写 lastSeenAt,并重排下一次刷新。设备虽在线但 socket 实际已消失(半开/evict)时,
+    // activeSocket() 会返回 null 并触发 markDisconnected——此处只负责活动设备的新鲜度续期。
+    if (meta.activeConnId !== undefined) {
+      await this.refreshPresence(meta)
+      await this.ctx.storage.setAlarm(Date.now() + PRESENCE_REFRESH_MS)
       return
     }
-    const reclaimMs = parsePositiveInt(this.env.TB_DEVICE_RECLAIM_SEC, DEFAULT_RECLAIM_SEC) * 1000
+
+    if (meta.disconnectedAt === undefined) return
+    const reclaimMs
+      = (parsePositiveIntEnv(this.env.TB_DEVICE_RECLAIM_SEC) ?? DEFAULT_RECLAIM_SEC) * 1000
     if (Date.now() - Date.parse(meta.disconnectedAt) < reclaimMs) {
       await this.ctx.storage.setAlarm(Date.parse(meta.disconnectedAt) + reclaimMs)
       return
     }
     const registry = await this.registry()
-    const state = new KvStateStore(this.env.TB_KV)
-    const searchSync = this.env.TB_SEARCH === undefined
+    const state = this.stateStore()
+    const search = this.searchIndex()
+    const searchSync = search === undefined
       ? undefined
-      : new SearchSynchronizer(state, new D1SearchIndex(this.env.TB_SEARCH))
+      : new SearchSynchronizer(state, search)
     const marker = await searchSync?.markSubtree(meta.mountPath)
     try {
       await registry.deleteSubtree(meta.mountPath)
@@ -198,7 +210,7 @@ export class DeviceSession extends DurableObject<DeviceSessionEnv> {
   private async acceptWebSocket(request: Request, url: URL): Promise<Response> {
     const deviceIdHint = url.searchParams.get('deviceId') ?? ''
     assertDeviceId(deviceIdHint)
-    await ensureBootstrapped(new KvStateStore(this.env.TB_KV), this.env)
+    await ensureBootstrapped(this.stateStore(), this.env)
 
     const pair = new WebSocketPair()
     const client = pair[0]
@@ -280,20 +292,26 @@ export class DeviceSession extends DurableObject<DeviceSessionEnv> {
     hello: { deviceId: string, expose: DeviceExpose, mountPath?: TreePath },
   ): Promise<void> {
     const attachment = attachmentOf(ws)
-    const store = new KvStateStore(this.env.TB_KV)
+    const store = this.stateStore()
     await ensureBootstrapped(store, this.env)
+    const search = this.searchIndex()
 
     const now = new Date().toISOString()
-    const { mountPath, keyId } = await processDeviceHello({
+    const { mountPath, keyId, searchIndexed } = await processDeviceHello({
       store,
       authorization: attachment.authorization,
       deviceIdHint: attachment.deviceIdHint,
       hello,
       now,
-      ...(this.env.TB_SEARCH === undefined
+      ...(search === undefined
         ? {}
-        : { search: new D1SearchIndex(this.env.TB_SEARCH) }),
+        : { search }),
     })
+    if (!searchIndexed) {
+      console.warn(
+        `[tool-bridge] device '${hello.deviceId}' mounted at ${mountPath} but its tools are NOT in the search index: registry exceeds the tool-search capacity (TOOL_SEARCH_AUDIT_NODE_LIMIT). The device is callable but won't appear in tool search until capacity frees up.`,
+      )
+    }
     await this.ctx.storage.put<DeviceMeta>(META_KEY, {
       deviceId: hello.deviceId,
       mountPath,
@@ -302,7 +320,9 @@ export class DeviceSession extends DurableObject<DeviceSessionEnv> {
       activeConnId: attachment.connId,
       connectedAt: now,
     })
-    await this.ctx.storage.deleteAlarm()
+    // 设备已上线:排一个心跳刷新 alarm(取代原先的 deleteAlarm)。alarm 现在多用途——
+    // 有活连接时刷新 presence 的 lastSeenAt,无活连接且已断线时执行 reclaim。
+    await this.ctx.storage.setAlarm(Date.now() + PRESENCE_REFRESH_MS)
     this.closeSupersededSockets(ws, attachment.connId)
     session.accept(mountPath)
   }
@@ -357,7 +377,7 @@ export class DeviceSession extends DurableObject<DeviceSessionEnv> {
       activeConnId: undefined,
       disconnectedAt: now,
     })
-    const reclaimSec = parsePositiveInt(this.env.TB_DEVICE_RECLAIM_SEC, DEFAULT_RECLAIM_SEC)
+    const reclaimSec = parsePositiveIntEnv(this.env.TB_DEVICE_RECLAIM_SEC) ?? DEFAULT_RECLAIM_SEC
     await this.ctx.storage.setAlarm(Date.now() + reclaimSec * 1000)
   }
 
@@ -383,7 +403,7 @@ export class DeviceSession extends DurableObject<DeviceSessionEnv> {
   private async reverifyConn(meta: DeviceMeta, attachment: SocketAttachment): Promise<boolean> {
     if (attachment.connId !== meta.activeConnId) return false
     const authCtx = await identify(
-      new KvStateStore(this.env.TB_KV),
+      this.stateStore(),
       attachment.authorization,
       new Date().toISOString(),
     )
@@ -398,6 +418,33 @@ export class DeviceSession extends DurableObject<DeviceSessionEnv> {
       action: 'write',
       existing: null,
     }).allow
+  }
+
+  /**
+   * presence 心跳续期(alarm 巡检调用):找到当前活动连接的 socket,读平台记录的最后
+   * auto-response(pong)时刻,回写 registry 的 lastSeenAt。socket 已消失(半开/未 attach)或
+   * 平台无时刻记录时不回写——宁可让 lastSeenAt 自然过期降级为 stale,也不谎报新鲜。
+   */
+  private async refreshPresence(meta: DeviceMeta): Promise<void> {
+    const tagged = this.ctx.getWebSockets(`device:${meta.deviceId}`)
+    const sockets = tagged.length > 0 ? tagged : this.ctx.getWebSockets()
+    let seenAt: Date | null = null
+    for (const ws of sockets) {
+      try {
+        if (attachmentOf(ws).connId !== meta.activeConnId) continue
+      } catch {
+        continue
+      }
+      seenAt = this.ctx.getWebSocketAutoResponseTimestamp(ws)
+      break
+    }
+    if (seenAt === null) return
+    try {
+      const registry = await this.registry()
+      await registry.touchSeen(meta.mountPath, seenAt.toISOString())
+    } catch {
+      // 节点可能已被管理面删除;心跳续期失败不影响连接与调用。
+    }
   }
 
   private async activeSocket(): Promise<WebSocket | null> {
@@ -432,8 +479,23 @@ export class DeviceSession extends DurableObject<DeviceSessionEnv> {
   }
 
   private async registry(): Promise<NodeRegistryStore> {
-    const store: StateStore = new KvStateStore(this.env.TB_KV)
+    const store: StateStore = this.stateStore()
     await ensureBootstrapped(store, this.env)
     return new NodeRegistryStore(store)
+  }
+
+  /** 每条独立 D1 操作链创建新 session；不把 bookmark 与 I/O 对象跨 hibernation 复用。 */
+  private stateStore(): D1StateStore {
+    return new D1StateStore(this.env.TB_STATE.withSession('first-primary'), {
+      schema: this.stateSchema,
+    })
+  }
+
+  /** Search 首读 primary，避免惰性 schema 尚未复制；后续读可使用满足 bookmark 的副本。 */
+  private searchIndex(): D1SearchIndex | undefined {
+    if (this.env.TB_SEARCH === undefined || this.searchSchema === undefined) return undefined
+    return new D1SearchIndex(this.env.TB_SEARCH.withSession('first-primary'), {
+      schema: this.searchSchema,
+    })
   }
 }

@@ -1,8 +1,7 @@
 import { readFileSync } from 'node:fs'
 import type { HttpToolDef, Node, NodeInput, Virtualize } from './types'
-import { apiJson, callTool, CliError, type Target } from './http'
+import { callDirect, CliError, type Target, withClient } from './http'
 import { asArray } from './output'
-import { nodePath } from './paths'
 
 /**
  * 挂载/卸载节点的共用逻辑。CLI 统一走 `~register` 注册(受限 SK 亦可用),
@@ -14,11 +13,8 @@ import { nodePath } from './paths'
  * body = NodeInput,且 body.path 必须等于 URL path。
  */
 export async function registerNode(target: Target, input: NodeInput): Promise<Node> {
-  return apiJson<Node>(target, {
-    method: 'POST',
-    path: nodePath('~register', input.path),
-    body: input,
-  })
+  // NodeInput/response 都由 SDK 固定 wire schema 做运行时校验；CLI 只保留构造与展示类型。
+  return await withClient(target, async client => await client.registerNode(input)) as Node
 }
 
 /**
@@ -32,7 +28,7 @@ export async function deleteNode(
 ): Promise<void> {
   try {
     if (expectedKinds !== undefined) {
-      const node = await callTool<Node>(target, '/system/registry', 'get', { path })
+      const node = await callDirect<Node>(target, '/system/registry/get', { path })
       if (!expectedKinds.includes(node.kind)) {
         throw new CliError(
           `node '${path}' is kind '${node.kind}', expected ${expectedKinds.join(' | ')}`,
@@ -40,7 +36,7 @@ export async function deleteNode(
         )
       }
     }
-    await callTool(target, '/system/registry', 'delete', { path })
+    await callDirect(target, '/system/registry/delete', { path })
   } catch (err) {
     if (err instanceof CliError && err.code === 'not_found') {
       throw new CliError(

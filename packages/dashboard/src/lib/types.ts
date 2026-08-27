@@ -1,20 +1,23 @@
-/**
- * HTBP 线上形状(与 core 的 HelpJson/TreeJson/TBError 对齐)。
- * Dashboard 是纯 API 客户端,不 import core——形状按网关契约手抄,字段不多不少。
- */
+import type { Action } from '@tool-bridge/sdk/client'
 
-export type NodeKind
-  = | 'directory'
-    | 'builtin'
-    | 'mcp'
-    | 'http'
-    | 'remote'
-    | 'context'
-    | 'skillhub'
-    | 'device'
-    | 'tool'
-
-export type Action = 'read' | 'write' | 'call' | 'register' | 'admin'
+/** 固定控制面 wire 类型来自 SDK public artifact，不再由 Dashboard 手抄。 */
+export type {
+  Action,
+  FeedbackView,
+  HelpCommand as HelpCmd,
+  HelpJson,
+  NodeKind,
+  Page,
+  Presence,
+  PresenceState,
+  RegistryNode,
+  TBErrorBody,
+  ToolSearchItem,
+  ToolSearchPage,
+  ToolSearchRequest,
+  ToolSpec,
+  TreeJson,
+} from '@tool-bridge/sdk/client'
 
 export const ACTIONS: readonly Action[] = ['read', 'write', 'call', 'register', 'admin']
 
@@ -24,76 +27,6 @@ export interface Scope {
   effect?: 'allow' | 'deny'
   /** 树路径 glob:"**" | "docs/**"。 */
   pattern: string
-}
-
-export interface TBErrorBody {
-  code:
-    | 'not_found'
-    | 'permission_denied'
-    | 'invalid_argument'
-    | 'conflict'
-    | 'unavailable'
-    | 'rate_limited'
-    | 'internal'
-  message: string
-  retryable: boolean
-}
-
-export interface HelpCmd {
-  confirm?: boolean
-  effect?: string
-  h?: string
-  inputSchema?: Record<string, unknown>
-  method: 'POST'
-  name: string
-  path: string
-  returns?: string
-  scope: Action
-}
-
-export interface HelpJson {
-  children?: Array<{ description: string, kind: NodeKind, path: string }>
-  cmds: HelpCmd[]
-  /** Agent feedback 默认区块(头部条目,只含 id/title/score)。 */
-  feedback?: Array<{ id: string, score: number, title: string }>
-  htbp: string
-  node: { description: string, kind: NodeKind, path: string }
-  /** 管理员补充说明(system/annotation,网关 ~help 注入)。 */
-  note?: string
-}
-
-/** ~feedback 端点的条目视图(list 不含 detail;get 含)。 */
-export interface FeedbackView {
-  at: string
-  by: string
-  detail?: string
-  down: number
-  id: string
-  score: number
-  title: string
-  up: number
-}
-
-export interface TreeJson {
-  children?: TreeJson[]
-  description: string
-  kind: NodeKind
-  online?: boolean
-  path: string
-  truncated?: boolean
-}
-
-/** system/registry 返回的节点(builtin/registry.ts 的 Node 面)。 */
-export interface RegistryNode {
-  config?: Record<string, unknown>
-  createdAt?: string
-  description: string
-  kind: NodeKind
-  online?: boolean
-  path: string
-  registeredBy?: string
-  updatedAt?: string
-  virtualize?: Record<string, unknown>
 }
 
 /** system/sk 返回的 SecretKey(无 hash)。 */
@@ -106,25 +39,6 @@ export interface SecretKeyInfo {
   owner: string
   registerPaths?: string[]
   scopes: Scope[]
-}
-
-export interface Page<T> {
-  cursor?: string
-  items: T[]
-}
-
-/** root `~search` 返回的虚拟化后 ToolSpec。 */
-export interface ToolSpec {
-  confirm?: boolean
-  description?: string
-  effect?: string
-  inputSchema?: unknown
-  name: string
-}
-
-export interface ToolSearchItem {
-  path: string
-  tool: ToolSpec
 }
 
 /** system/federation list 的一行:remote 联邦 host 白名单合并视图。 */
@@ -288,7 +202,7 @@ export interface ContextEntry extends ContextEntryMeta {
   content: string | unknown
 }
 
-/** skillhub 目录条目摘要(List/Search 返回的 SkillSummary)。 */
+/** skillhub 目录条目摘要(list/search 返回的 SkillSummary)。 */
 export interface SkillSummary {
   description: string
   id: string
@@ -297,7 +211,7 @@ export interface SkillSummary {
   version?: string
 }
 
-/** skillhub 技能内文件(Get{id,file} 返回;大对象 content = { $ref })。 */
+/** skillhub 技能内文件(get{id,file} 返回;大对象 content = { $ref })。 */
 export interface SkillFile {
   content?: string | { $ref: string }
   contentType: string
@@ -306,7 +220,7 @@ export interface SkillFile {
   version: string
 }
 
-/** skillhub 技能详情(Get{id} 返回:SKILL.md 正文 + 文件清单)。 */
+/** skillhub 技能详情(get{id} 返回:SKILL.md 正文 + 文件清单)。 */
 export interface SkillDetail extends SkillSummary {
   /** SKILL.md 正文(YAML frontmatter + Markdown)。 */
   content: string

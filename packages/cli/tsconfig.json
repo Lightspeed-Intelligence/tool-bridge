@@ -1,6 +1,12 @@
 {
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@tool-bridge/sdk/client": ["../sdk/src/client/index.ts"],
+      "@tool-bridge/sdk/device": ["../sdk/src/device/index.ts"],
+      "@tool-bridge/sdk/store": ["../sdk/src/store/index.ts"]
+    },
     "types": ["node"]
   },
   "include": ["src", "tsup.config.ts"]

@@ -1,11 +1,14 @@
-/**
- * CLI 的 HTTP 层:fetch + Bearer + Accept 内容协商 + TBError 归一。
- *
- * 契约(与网关约定,见任务书):
- * - 认证:`Authorization: Bearer <SK>`;无/无效 → 401 TBError。
- * - `Accept: application/json` → 结构化 JSON;缺省 text/plain(Help DSL 等)。
- * - 错误响应:TBError JSON `{code,message,retryable}` + 对应 HTTP 码。
- */
+/** CLI 宿主适配：SDK neutral client + CliError/对象直传边界。 */
+import {
+  type ContextUploadGrant,
+  createToolBridgeClient,
+  parseContextUploadGrant as parseSdkContextUploadGrant,
+  PresignedPutError,
+  type PresignedPutGrant,
+  putPresignedObject,
+  type ToolBridgeClient,
+  ToolBridgeClientError,
+} from '@tool-bridge/sdk/client'
 
 /** CLI 错误:携带可选 TBError code/retryable,统一由 output.reportError 落地为退出码 1。 */
 export class CliError extends Error {
@@ -50,12 +53,17 @@ export function resetFetch(): void {
   fetchImpl = globalThis.fetch
 }
 
+/** 共享当前注入的 transport；SDK-backed 命令必须沿用同一个测试/宿主边界。 */
+export function getFetch(): typeof fetch {
+  return fetchImpl
+}
+
 export interface ApiOptions {
   accept?: 'json' | 'text' | 'markdown'
   body?: unknown
   method?: 'GET' | 'POST' | 'DELETE'
   path: string
-  query?: Record<string, string | number | undefined>
+  query?: Record<string, boolean | number | string | readonly (boolean | number | string)[] | undefined>
 }
 
 export interface ApiResult {
@@ -65,166 +73,152 @@ export interface ApiResult {
   text: string
 }
 
-function buildQuery(query?: ApiOptions['query']): string {
-  if (!query) return ''
-  const parts: string[] = []
-  for (const [k, v] of Object.entries(query)) {
-    if (v !== undefined) parts.push(`${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`)
-  }
-  return parts.length ? `?${parts.join('&')}` : ''
-}
-
 /** 无显式 --timeout 时的单请求等待上限(上游长查询可用 --timeout 加大)。 */
 export const DEFAULT_TIMEOUT_MS = 120_000
 
-/** 底层请求:构造 URL/头,执行 fetch;网络错误 → CliError,超时 → retryable CliError。 */
-export async function apiFetch(target: Target, opts: ApiOptions): Promise<ApiResult> {
-  const { baseUrl, sk } = requireTarget(target)
-  const timeoutMs = target.timeoutMs ?? DEFAULT_TIMEOUT_MS
-  const base = baseUrl.replace(/\/+$/, '')
-  const path = opts.path.startsWith('/') ? opts.path : `/${opts.path}`
-  const url = `${base}${path}${buildQuery(opts.query)}`
-
-  const headers: Record<string, string> = {}
-  if (sk) headers.authorization = `Bearer ${sk}`
-  if (opts.accept === 'json') headers.accept = 'application/json'
-  else if (opts.accept === 'markdown') headers.accept = 'text/markdown'
-  else if (opts.accept === 'text') headers.accept = 'text/plain'
-
-  const init: RequestInit = {
-    method: opts.method ?? 'GET',
-    headers,
-    signal: AbortSignal.timeout(timeoutMs),
-  }
-  if (opts.body !== undefined) {
-    headers['content-type'] = 'application/json'
-    init.body = JSON.stringify(opts.body)
-  }
-
-  let res: Response
-  try {
-    res = await fetchImpl(url, init)
-  } catch (err) {
-    if (err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError')) {
-      throw new CliError(
+function clientError(error: unknown, target: Target): CliError {
+  if (error instanceof ToolBridgeClientError) {
+    if (error.kind === 'timeout') {
+      const timeoutMs = target.timeoutMs ?? DEFAULT_TIMEOUT_MS
+      return new CliError(
         `request timed out after ${Math.round(timeoutMs / 1000)}s — the upstream may still be processing; retry or raise --timeout`,
         'unavailable',
         true,
       )
     }
-    throw new CliError(`request failed: ${(err as Error).message}`)
-  }
-  const text = await res.text()
-  return {
-    status: res.status,
-    ok: res.ok,
-    text,
-    contentType: res.headers.get('content-type') ?? '',
-  }
-}
-
-/** 把非 2xx 响应体解释为 TBError(拿不到规范形状则回退到 HTTP 码)。 */
-function toCliError(body: unknown, status: number): CliError {
-  if (
-    body
-    && typeof body === 'object'
-    && 'code' in body
-    && 'message' in body
-    && typeof (body as { message: unknown }).message === 'string'
-  ) {
-    const b = body as { code: unknown, message: string, retryable?: unknown }
-    const retryable = typeof b.retryable === 'boolean' ? b.retryable : undefined
-    return new CliError(b.message, String(b.code), retryable)
-  }
-  return new CliError(`gateway returned HTTP ${status}`)
-}
-
-/** JSON 请求:强制 `Accept: application/json`,成功返回解析结果,失败抛 CliError。 */
-export async function apiJson<T>(target: Target, opts: Omit<ApiOptions, 'accept'>): Promise<T> {
-  const r = await apiFetch(target, { ...opts, accept: 'json' })
-  let body: unknown
-  if (r.text) {
-    try {
-      body = JSON.parse(r.text)
-    } catch {
-      if (!r.ok) throw new CliError(`gateway returned HTTP ${r.status}`)
-      throw new CliError('invalid JSON response from gateway')
+    if (error.kind === 'network') {
+      const detail = error.networkCode === undefined ? '' : ` (${error.networkCode})`
+      return new CliError(`request failed: gateway unavailable${detail}`, 'unavailable', true)
     }
+    return new CliError(
+      error.message,
+      error.code === 'network' ? 'unavailable' : error.code,
+      error.retryable,
+    )
   }
-  if (!r.ok) throw toCliError(body, r.status)
-  return body as T
+  return new CliError('request failed: gateway unavailable', 'unavailable', true)
 }
 
-/**
- * 文本请求(Help DSL / Markdown 等):成功返回原始文本,失败尝试解释 TBError JSON。
- * 缺省 `Accept: text/plain`;`accept: 'markdown'` 请求可读 Markdown 表现。
- */
+/** 当前 target 对应的 SDK client；保留 CLI 的 fetch 注入与单请求 timeout 默认。 */
+export function clientForTarget(target: Target): ToolBridgeClient {
+  const { baseUrl, sk } = requireTarget(target)
+  try {
+    return createToolBridgeClient({
+      baseUrl,
+      sk,
+      fetcher: fetchImpl,
+      timeoutMs: target.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+    })
+  } catch (error) {
+    throw clientError(error, target)
+  }
+}
+
+export async function withClient<T>(
+  target: Target,
+  fn: (client: ToolBridgeClient) => Promise<T>,
+): Promise<T> {
+  try {
+    return await fn(clientForTarget(target))
+  } catch (error) {
+    if (error instanceof CliError) throw error
+    throw clientError(error, target)
+  }
+}
+
+/** 底层请求保留非 2xx 原始结果，供 status/login 的既有判定使用。 */
+export async function apiFetch(target: Target, opts: ApiOptions): Promise<ApiResult> {
+  return await withClient(target, async client => await client.raw({
+    path: opts.path,
+    method: opts.method,
+    body: opts.body,
+    query: opts.query,
+    accept: opts.accept === 'json'
+      ? 'application/json'
+      : opts.accept === 'markdown'
+        ? 'text/markdown'
+        : opts.accept === 'text'
+          ? 'text/plain'
+          : undefined,
+  }))
+}
+
+export async function apiJson<T>(target: Target, opts: Omit<ApiOptions, 'accept'>): Promise<T> {
+  return await withClient(target, async client => await client.json<T>({
+    ...opts,
+    accept: 'application/json',
+  }))
+}
+
 export async function apiText(
   target: Target,
   opts: Omit<ApiOptions, 'accept'> & { accept?: 'text' | 'markdown' },
 ): Promise<string> {
-  const r = await apiFetch(target, { ...opts, accept: opts.accept ?? 'text' })
-  if (!r.ok) {
-    let body: unknown
-    try {
-      body = JSON.parse(r.text)
-    } catch {
-      // 非 JSON 错误体:回退到 HTTP 码
-    }
-    throw toCliError(body, r.status)
-  }
-  return r.text
+  return await withClient(target, async client => await client.text({
+    ...opts,
+    accept: opts.accept === 'markdown' ? 'text/markdown' : 'text/plain',
+  }))
 }
 
-/** 数据面工具调用(信封形态):`POST /<path>` body `{tool, arguments}`。 */
-export async function callTool<T>(
-  target: Target,
-  path: string,
-  tool: string,
-  args: Record<string, unknown> = {},
-): Promise<T> {
-  return apiJson<T>(target, { method: 'POST', path, body: { tool, arguments: args } })
-}
-
-/** 直连工具调用:`POST /<node>/<tool>`,body 即 arguments 本体(无信封)。 */
+/** 动态 HTBP 直连：完整 path + 裸 arguments，绝不引入静态 envelope。 */
 export async function callDirect<T>(
   target: Target,
   toolPath: string,
   args: Record<string, unknown> = {},
 ): Promise<T> {
-  return apiJson<T>(target, { method: 'POST', path: toolPath, body: args })
-}
-
-async function invokeText(target: Target, path: string, body: unknown): Promise<string> {
-  const r = await apiFetch(target, {
-    method: 'POST',
-    path,
-    body,
-    accept: 'markdown',
-  })
-  if (!r.ok) {
-    let body: unknown
-    try {
-      body = JSON.parse(r.text)
-    } catch {
-      // 非 JSON 错误体:回退到 HTTP 码
-    }
-    throw toCliError(body, r.status)
-  }
-  return r.text
+  return await withClient(target, async client => await client.invokeJson<T>(toolPath, args))
 }
 
 /**
- * 数据面调用(人类模式):`Accept: text/markdown`,返回原始渲染文本。
- * 非 2xx 时按 TBError 归一为 CliError。
+ * 把二进制直接 PUT 到对象存储。此请求绝不携带 Tool Bridge SK，错误也不读取/回显
+ * 上游响应体或预签名 URL（两者都可能含敏感信息）。
  */
-export async function callToolText(
-  target: Target,
-  path: string,
-  tool: string,
-  args: Record<string, unknown> = {},
-): Promise<string> {
-  return invokeText(target, path, { tool, arguments: args })
+export async function putPresigned(
+  grant: PresignedPutGrant,
+  body: NonNullable<RequestInit['body']>,
+  timeoutMs: number = DEFAULT_TIMEOUT_MS,
+): Promise<{ etag?: string }> {
+  try {
+    return await putPresignedObject(grant, body, {
+      fetcher: fetchImpl,
+      timeoutMs,
+    })
+  } catch (error) {
+    if (!(error instanceof PresignedPutError)) throw error
+    if (error.kind === 'invalid') {
+      throw new CliError(error.message, 'internal', true)
+    }
+    if (error.kind === 'expired') {
+      throw new CliError(error.message, 'unavailable', true)
+    }
+    if (error.kind === 'timeout' || error.kind === 'aborted') {
+      throw new CliError('object upload timed out', 'unavailable', true)
+    }
+    if (error.kind === 'conflict') {
+      throw new CliError(
+        'object already exists; re-run with --force to overwrite it',
+        'conflict',
+        false,
+      )
+    }
+    throw new CliError(
+      error.message,
+      'unavailable',
+      error.retryable,
+    )
+  }
+}
+
+/** Context grant 的 CLI 错误适配；必须在读取/发送本地文件前完成。 */
+export function parseContextUploadGrant(value: unknown): ContextUploadGrant {
+  try {
+    return parseSdkContextUploadGrant(value)
+  } catch (error) {
+    if (error instanceof PresignedPutError) {
+      throw new CliError(error.message, 'internal', true)
+    }
+    throw error
+  }
 }
 
 /** 直连工具调用(人类模式):body 即 arguments 本体。 */
@@ -233,5 +227,8 @@ export async function callDirectText(
   toolPath: string,
   args: Record<string, unknown> = {},
 ): Promise<string> {
-  return invokeText(target, toolPath, args)
+  return await withClient(
+    target,
+    async client => (await client.invoke(toolPath, args, { accept: 'markdown' })).text,
+  )
 }

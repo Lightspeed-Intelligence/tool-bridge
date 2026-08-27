@@ -1,10 +1,10 @@
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { buildExpose, readCommandProfiles } from '../src/commands/connect'
 import { normalizeDeviceId, resolveDeviceId } from '../src/deviceId'
-import { deviceWsUrl, startHeartbeat } from '../src/deviceRuntime'
-import { buildExpose } from '../src/commands/connect'
+import { deviceWsUrl } from '../src/deviceRuntime'
 import { resetFetch, setFetch } from '../src/http'
 import { configPath } from '../src/config'
 import { runCli } from './cliHarness'
@@ -80,83 +80,104 @@ describe('device runtime helpers', () => {
       fs: { roots: ['/tmp'], readOnly: false },
     })
   })
-})
 
-describe('startHeartbeat', () => {
-  function fakeSocket(readyState = 1) {
-    return { readyState, send: vi.fn(), reconnect: vi.fn() }
-  }
-
-  it('每周期发 ping;markAlive(收到任何入站帧)后持续保活不重连', () => {
-    vi.useFakeTimers()
-    try {
-      const socket = fakeSocket()
-      const hb = startHeartbeat(socket, 1000)
-      vi.advanceTimersByTime(1000)
-      expect(socket.send).toHaveBeenCalledWith('{"type":"ping"}')
-      hb.markAlive() // 模拟 pong 到达
-      vi.advanceTimersByTime(1000)
-      expect(socket.send).toHaveBeenCalledTimes(2)
-      expect(socket.reconnect).not.toHaveBeenCalled()
-      hb.stop()
-      vi.advanceTimersByTime(5000)
-      expect(socket.send).toHaveBeenCalledTimes(2)
-    } finally {
-      vi.useRealTimers()
-    }
+  it('structured command profile 投影为显式 effect 的 device tool 节点', () => {
+    if (tmpConfig === undefined) throw new Error('missing temp config')
+    const file = join(tmpConfig, 'ops.json')
+    writeFileSync(file, JSON.stringify({
+      version: 1,
+      path: 'ops/system',
+      description: 'safe system inspection',
+      commands: [{
+        name: 'system-info',
+        description: 'read system information',
+        executable: '/usr/bin/uname',
+        argv: ['-a'],
+        effect: 'read',
+      }],
+    }))
+    const profiles = readCommandProfiles([file])
+    expect(buildExpose({ shell: false }, profiles)).toEqual({
+      nodes: [{
+        path: 'ops/system',
+        kind: 'tool',
+        description: 'safe system inspection',
+        cmds: [expect.objectContaining({
+          name: 'system-info',
+          effect: 'read',
+          inputSchema: expect.objectContaining({ additionalProperties: false }),
+        })],
+      }],
+    })
   })
 
-  it('一个周期内无入站帧 → 判定半开连接,主动 reconnect', () => {
-    vi.useFakeTimers()
-    try {
-      const socket = fakeSocket()
-      const hb = startHeartbeat(socket, 1000)
-      vi.advanceTimersByTime(1000) // 发 ping,无应答
-      vi.advanceTimersByTime(1000) // 死链 → reconnect
-      expect(socket.reconnect).toHaveBeenCalledTimes(1)
-      expect(socket.send).toHaveBeenCalledTimes(1)
-      hb.stop()
-    } finally {
-      vi.useRealTimers()
+  it('profile 与 shell/fs/另一 profile 的路径冲突 fail closed', () => {
+    if (tmpConfig === undefined) throw new Error('missing temp config')
+    const writeProfile = (name: string, path: string) => {
+      const file = join(tmpConfig!, name)
+      writeFileSync(file, JSON.stringify({
+        version: 1,
+        path,
+        description: path,
+        commands: [{
+          name: 'get',
+          description: 'get',
+          executable: '/usr/bin/true',
+          effect: 'read',
+        }],
+      }))
+      return file
     }
-  })
-
-  it('非 OPEN 状态不发 ping 也不判死链', () => {
-    vi.useFakeTimers()
-    try {
-      const socket = fakeSocket(0)
-      const hb = startHeartbeat(socket, 1000)
-      vi.advanceTimersByTime(3000)
-      expect(socket.send).not.toHaveBeenCalled()
-      expect(socket.reconnect).not.toHaveBeenCalled()
-      hb.stop()
-    } finally {
-      vi.useRealTimers()
-    }
+    expect(() => readCommandProfiles([writeProfile('shell.json', 'shell/status')]))
+      .toThrow('conflicts with reserved \'shell\'')
+    expect(() => readCommandProfiles([
+      writeProfile('parent.json', 'ops'),
+      writeProfile('child.json', 'ops/system'),
+    ])).toThrow('conflicts with \'ops\'')
   })
 })
 
 describe('tb device ls', () => {
+  const lastSeenAt = '2026-01-01T00:00:00.000Z'
+
   it('调用 system/registry list(prefix=device),只输出 online 字段存在的设备根', async () => {
     const fn = captureFetch({
       items: [
-        { path: 'device/d1', kind: 'directory', description: '设备 d1', online: true },
+        {
+          path: 'device/d1',
+          kind: 'directory',
+          description: '设备 d1',
+          online: true,
+          lastSeenAt,
+        },
         { path: 'device/d1/shell', kind: 'device', description: 'shell' },
         { path: 'device/d2', kind: 'directory', description: '设备 d2', online: false },
       ],
     })
     await runCli(['device', 'ls', '--base-url', 'https://gw', '--sk', 'tbk_x'])
     const [url, init] = fn.mock.calls[0] as [string, RequestInit]
-    expect(url).toBe('https://gw/system/registry')
-    expect(JSON.parse(init.body as string)).toEqual({
-      tool: 'list',
-      arguments: { prefix: 'device' },
-    })
+    expect(url).toBe('https://gw/system/registry/list')
+    expect(JSON.parse(init.body as string)).toEqual({ prefix: 'device' })
     const text = stdoutText()
     expect(text).toContain('d1')
     expect(text).toContain('yes')
     expect(text).toContain('d2')
     expect(text).toContain('no')
     expect(text).not.toContain('shell')
+  })
+
+  it('LAST_SEEN 列展示 lastSeenAt,缺省记为 -', async () => {
+    captureFetch({
+      items: [
+        { path: 'device/d1', kind: 'directory', online: true, lastSeenAt },
+        { path: 'device/d2', kind: 'directory', online: true },
+      ],
+    })
+    await runCli(['device', 'ls', '--base-url', 'https://gw', '--sk', 'tbk_x'])
+    const lines = stdoutText().split('\n')
+    expect(lines[0]).toContain('LAST_SEEN')
+    // 本地化渲染依赖时区,用同一转换求期望值而非硬编码字面量。
+    expect(lines[1]).toContain(new Date(lastSeenAt).toLocaleString())
+    expect(lines[2]).toContain('-')
   })
 })

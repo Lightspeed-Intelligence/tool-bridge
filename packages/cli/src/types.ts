@@ -1,60 +1,18 @@
+import type { RegistryNode } from '@tool-bridge/sdk/client'
 import type { Scope } from './scope'
 
-/**
- * 网关返回的线格式类型(CLI 本地镜像,只取渲染所需字段;未知字段透传忽略)。
- * HelpJson/TreeJson 为渲染所需的精确 schema,按网关契约建模。
- */
-
-export interface NodeSummary {
-  description?: string
-  kind: string
-  path: string
-}
-
-export interface HelpCmd {
-  /** arguments 的 JSON Schema(不含 {tool,arguments} 信封)。 */
-  inputSchema?: unknown
-  method?: string
-  name: string
-  path?: string
-  returns?: string
-  scope?: string
-}
-
-export interface HelpJson {
-  children?: NodeSummary[]
-  cmds: HelpCmd[]
-  htbp: string
-  node: NodeSummary
-}
-
-export interface TreeJson {
-  children?: TreeJson[]
-  description?: string
-  kind: string
-  online?: boolean
-  path: string
-  truncated?: boolean
-}
-
-export interface Page<T> {
-  cursor?: string
-  items: T[]
-}
-
-/** root `~search` 返回的虚拟化后 ToolSpec。 */
-export interface ToolSpec {
-  confirm?: boolean
-  description?: string
-  effect?: string
-  inputSchema?: unknown
-  name: string
-}
-
-export interface ToolSearchItem {
-  path: string
-  tool: ToolSpec
-}
+/** 固定 HTBP wire 类型来自 SDK public artifact，不再由 CLI 手抄。 */
+export type {
+  HelpCommand as HelpCmd,
+  HelpJson,
+  Page,
+  Presence,
+  PresenceState,
+  ToolSearchItem,
+  ToolSearchPage,
+  ToolSpec,
+  TreeJson,
+} from '@tool-bridge/sdk/client'
 
 /** SecretKey 投影(hash 永不出网关)。 */
 export interface SecretKeyView {
@@ -148,16 +106,13 @@ export type NodeConfig
     ttl?: number
   }
 
-/** Node 投影(NodeRegistry.List/Get 返回;CLI 只取渲染所需字段)。 */
-export interface Node {
+/**
+ * Node 投影(NodeRegistry.List/Get 返回;CLI 只取渲染所需字段)。
+ * 这是存储层形状:保留裸 `online`(连接建立/拆除的事件位),不是 `~tree` 的三态 presence。
+ */
+export interface Node extends Omit<RegistryNode, 'config' | 'description' | 'virtualize'> {
   config?: NodeConfig
-  createdAt?: string
   description?: string
-  kind: string
-  online?: boolean
-  path: string
-  registeredBy?: string
-  updatedAt?: string
   virtualize?: Virtualize
 }
 
@@ -176,11 +131,11 @@ export interface ContextEntry extends ContextEntryMeta {
   content: string | unknown
 }
 
-/** NodeInput = Omit<Node,'registeredBy'|'online'|'createdAt'|'updatedAt'>。 */
+/** NodeInput = Omit<Node,'registeredBy'|'online'|'lastSeenAt'|'createdAt'|'updatedAt'>。 */
 export interface NodeInput {
   config?: NodeConfig
   description: string
-  kind: string
+  kind: RegistryNode['kind']
   path: string
   virtualize?: Virtualize
 }

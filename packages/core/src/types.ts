@@ -121,7 +121,11 @@ export interface TreeNode {
   /** 一句话;上级 ~help 列子节点时展示。 */
   description: string
   kind: NodeKind
-  /** 仅 device:连接状态。 */
+  /** 仅 device:最近一次观察到设备存活(hello / 心跳 / 成功调用)的时刻。缺省表示从未观察或旧数据;
+   *  freshness 判定见 device/presence.ts。写路径专用,不经普通注册面。 */
+  lastSeenAt?: Timestamp
+  /** 仅 device:连接是否已建立(hello 落库 true,连接拆除 false)。是否"可立即路由"还须看
+   *  `lastSeenAt` 的新鲜度——投影时由 derivePresence 综合成三态 presence,不要直接把它当在线。 */
   online?: boolean
   /** 唯一键。 */
   path: TreePath
@@ -155,6 +159,15 @@ export interface HttpToolDef {
   pathTemplate: string
 }
 
+/**
+ * MCP 托管 OAuth 的预注册客户端。clientId 是可回显标识；机密只允许通过
+ * clientSecretRef 指向 SecretStore，不能直接进入节点 config。
+ */
+export interface McpOAuthClientConfig {
+  clientId: string
+  clientSecretRef?: string
+}
+
 export interface DeviceExpose {
   /** 挂 `<mountPath>/fs` context 节点(file provider);支持多根。 */
   fs?: { readOnly?: boolean, roots: string[] }
@@ -177,10 +190,11 @@ export interface DeviceNodeCmd {
   effect?: string
   inputSchema?: unknown
   name: string
+  outputSchema?: unknown
 }
 
 export type NodeConfig
-  /** auth:'oauth' 时凭证由网关托管 OAuth 流程获取(POST /<path>/~authorize 发起),authRef 忽略。 */
+  /** auth:'oauth' 时 grant 由网关托管 OAuth 流程获取(POST /<path>/~authorize 发起),authRef 忽略。 */
   = | {
     auth?: 'oauth'
     /** authRef 凭证注入的头名(默认 Authorization)。 */
@@ -193,6 +207,8 @@ export type NodeConfig
     /** 静态明文请求头(非机密,如上游要求的工具白名单头);authRef 头优先。 */
     headers?: Record<string, string>
     kind: 'mcp'
+    /** 缺省走 DCR；配置后使用预注册 public/confidential client，不尝试 DCR。 */
+    oauthClient?: McpOAuthClientConfig
     url: string
   }
   | {
@@ -240,7 +256,10 @@ export type NodeConfig
     ttl?: number
   }
 
-export type NodeInput = Omit<TreeNode, 'registeredBy' | 'online' | 'createdAt' | 'updatedAt'>
+export type NodeInput = Omit<
+  TreeNode,
+  'registeredBy' | 'online' | 'lastSeenAt' | 'createdAt' | 'updatedAt'
+>
 
 /** 自动物化中间 directory 的 registeredBy 标记。 */
 export const SYSTEM_AUTO = 'system:auto'

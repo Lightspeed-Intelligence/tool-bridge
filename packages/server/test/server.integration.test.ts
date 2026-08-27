@@ -5,6 +5,7 @@
  */
 
 import { afterEach, describe, expect, it } from 'vitest'
+import { request as httpRequest } from 'node:http'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -26,17 +27,61 @@ function tmpDataDir(): string {
   return dir
 }
 
-async function startServer(dataDir: string): Promise<{ baseUrl: string, server: TbServer }> {
+async function startServer(
+  dataDir: string,
+  extraEnv: NodeJS.ProcessEnv = {},
+): Promise<{ baseUrl: string, server: TbServer }> {
   const config = configFromEnv({
     TB_PORT: '0',
     TB_HOST: '127.0.0.1',
     TB_DATA_DIR: dataDir,
     TB_BOOTSTRAP_ADMIN_SK: ADMIN_SK,
     TB_SECRET_ENCRYPTION_KEY: ENCRYPTION_KEY,
+    ...extraEnv,
   })
   const server = createTbServer(config)
   const { port } = await server.start()
   return { server, baseUrl: `http://127.0.0.1:${port}` }
+}
+
+async function postJsonWithHost(
+  baseUrl: string,
+  path: string,
+  body: unknown,
+  host: string,
+  headers: Record<string, string> = {},
+): Promise<{ body: unknown, status: number }> {
+  const url = new URL(`${baseUrl}/${path}`)
+  const payload = JSON.stringify(body)
+  return await new Promise((resolve, reject) => {
+    const request = httpRequest({
+      hostname: url.hostname,
+      port: url.port,
+      path: url.pathname,
+      method: 'POST',
+      headers: {
+        'host': host,
+        'authorization': `Bearer ${ADMIN_SK}`,
+        'accept': 'application/json',
+        'content-type': 'application/json',
+        'content-length': Buffer.byteLength(payload),
+        ...headers,
+      },
+    }, (response) => {
+      const chunks: Buffer[] = []
+      response.on('data', chunk => chunks.push(Buffer.from(chunk)))
+      response.once('error', reject)
+      response.once('end', () => {
+        const text = Buffer.concat(chunks).toString('utf8')
+        resolve({
+          body: text === '' ? undefined : JSON.parse(text) as unknown,
+          status: response.statusCode ?? 0,
+        })
+      })
+    })
+    request.once('error', reject)
+    request.end(payload)
+  })
 }
 
 const admin = (extra: RequestInit = {}): RequestInit => ({
@@ -50,6 +95,7 @@ async function postJson(
   body: unknown,
   init: RequestInit = {},
 ): Promise<Response> {
+  // 数据面调用唯一形态:POST /<node>/<command>,body 即裸 arguments(无 {tool,arguments} 信封)。
   return fetch(`${baseUrl}/${path}`, {
     method: 'POST',
     ...init,
@@ -63,6 +109,26 @@ async function postJson(
 }
 
 describe('Node 宿主 HTTP 面', () => {
+  it('TLS 终止代理下用 canonical protocol + 本次 alias host 签 Store URL', async () => {
+    const { server, baseUrl } = await startServer(tmpDataDir(), {
+      TB_CANONICAL_ORIGIN: 'https://canonical.example',
+    })
+    cleanups.push(() => server.close())
+
+    // 真实明文 Node socket：@hono/node-server 会把内部 Request 组装成
+    // http://public-alias.example；X-Forwarded-Proto 不可信且不能参与判断。
+    const created = await postJsonWithHost(
+      baseUrl,
+      'system/store/create_upload',
+      { contentType: 'text/plain', size: 5 },
+      'public-alias.example',
+      { 'x-forwarded-proto': 'http' },
+    )
+    expect(created.status).toBe(200)
+    const grant = created.body as { url: string }
+    expect(new URL(grant.url).origin).toBe('https://public-alias.example')
+  })
+
   it('healthz 免认证;~help 无 SK 401、Admin SK 200(默认 markdown,text/plain 得 DSL)', async () => {
     const { server, baseUrl } = await startServer(tmpDataDir())
     cleanups.push(() => server.close())
@@ -94,6 +160,38 @@ describe('Node 宿主 HTTP 面', () => {
     expect(text).toContain('system')
   })
 
+  it('livez/readyz 免认证;draining 后 readyz 503 而 livez 仍 200(k8s 摘流量语义)', async () => {
+    const { server, baseUrl } = await startServer(tmpDataDir())
+    cleanups.push(() => server.close())
+
+    const live = await fetch(`${baseUrl}/livez`)
+    expect(live.status).toBe(200)
+    expect(await live.json()).toEqual({ live: true })
+
+    // SQLite 无长连接后端可断:checks 为空、ready true。
+    const ready = await fetch(`${baseUrl}/readyz`)
+    expect(ready.status).toBe(200)
+    expect(await ready.json()).toEqual({ checks: {}, ready: true })
+
+    server.startDraining()
+    const drainingReady = await fetch(`${baseUrl}/readyz`)
+    expect(drainingReady.status).toBe(503)
+    const body = (await drainingReady.json()) as {
+      checks: Record<string, { ok: boolean }>
+      ready: boolean
+    }
+    expect(body.ready).toBe(false)
+    expect(body.checks.draining?.ok).toBe(false)
+
+    // liveness 不受 draining 影响:进程还活着,编排器不该重启它。
+    const stillLive = await fetch(`${baseUrl}/livez`)
+    expect(stillLive.status).toBe(200)
+
+    // draining 期间既有 HTTP 面继续服务(摘流量 ≠ 拒服务)。
+    const help = await fetch(`${baseUrl}/~help`, admin())
+    expect(help.status).toBe(200)
+  })
+
   it('重启同 dataDir:注册的节点在新进程仍在(User Case #4)', async () => {
     const dataDir = tmpDataDir()
     const first = await startServer(dataDir)
@@ -123,11 +221,8 @@ describe('Node 宿主 HTTP 面', () => {
 
     const mint = await postJson(
       baseUrl,
-      'system/sk',
-      {
-        tool: 'write',
-        arguments: { owner: 'agent:probe', scopes: [{ pattern: '**', actions: ['read'] }] },
-      },
+      'system/sk/write',
+      { owner: 'agent:probe', scopes: [{ pattern: '**', actions: ['read'] }] },
       admin(),
     )
     expect(mint.status).toBe(200)
@@ -140,8 +235,8 @@ describe('Node 宿主 HTTP 面', () => {
 
     const del = await postJson(
       baseUrl,
-      'system/sk',
-      { tool: 'delete', arguments: { id: minted.key.id } },
+      'system/sk/delete',
+      { id: minted.key.id },
       admin(),
     )
     expect(del.status).toBe(200)
@@ -157,8 +252,8 @@ describe('Node 宿主 HTTP 面', () => {
     const first = await startServer(dataDir)
     const list1 = await postJson(
       first.baseUrl,
-      'system/sk',
-      { tool: 'list', arguments: {} },
+      'system/sk/list',
+      {},
       admin(),
     )
     expect(list1.status).toBe(200)
@@ -169,8 +264,8 @@ describe('Node 宿主 HTTP 面', () => {
     cleanups.push(() => second.server.close())
     const list2 = await postJson(
       second.baseUrl,
-      'system/sk',
-      { tool: 'list', arguments: {} },
+      'system/sk/list',
+      {},
       admin(),
     )
     expect(list2.status).toBe(200)
@@ -188,26 +283,41 @@ describe('Node 宿主 HTTP 面', () => {
       inputSchema: { type: 'object', properties: { day: { type: 'string' } } },
       effect: 'read',
     }
+    const hit = (
+      hitPath: string,
+      sourceTool: typeof tool,
+      matchedTermCount: number,
+    ) => ({
+      path: hitPath,
+      relevance: {
+        coverage: 1,
+        matchedTermCount,
+        rankingVersion: 'keyword-v2',
+        totalTermCount: matchedTermCount,
+      },
+      tool: {
+        name: sourceTool.name,
+        description: sourceTool.description,
+        effect: sourceTool.effect,
+      },
+    })
     const register = await postJson(
       first.baseUrl,
-      'system/registry',
+      'system/registry/write',
       {
-        tool: 'write',
-        arguments: {
-          path,
+        path,
+        kind: 'http',
+        description: 'SQLite search wire fixture',
+        config: {
           kind: 'http',
-          description: 'SQLite search wire fixture',
-          config: {
-            kind: 'http',
-            endpoint: 'https://calendar.example.test',
-            tools: [{
-              name: tool.name,
-              description: tool.description,
-              inputSchema: tool.inputSchema,
-              method: 'GET',
-              pathTemplate: '/calendar',
-            }],
-          },
+          endpoint: 'https://calendar.example.test',
+          tools: [{
+            name: tool.name,
+            description: tool.description,
+            inputSchema: tool.inputSchema,
+            method: 'GET',
+            pathTemplate: '/calendar',
+          }],
         },
       },
       admin(),
@@ -221,17 +331,17 @@ describe('Node 宿主 HTTP 面', () => {
     })
     const initial = await postJson(first.baseUrl, '~search', { query: 'calendar' }, admin())
     expect(initial.status).toBe(200)
-    await expect(initial.json()).resolves.toEqual({ items: [{ path, tool }] })
+    await expect(initial.json()).resolves.toEqual({ items: [hit(path, tool, 1)] })
     await first.server.close()
 
     const second = await startServer(dataDir)
     cleanups.push(() => second.server.close())
     const persisted = await postJson(second.baseUrl, '~search', { query: 'calendar' }, admin())
     expect(persisted.status).toBe(200)
-    await expect(persisted.json()).resolves.toEqual({ items: [{ path, tool }] })
+    await expect(persisted.json()).resolves.toEqual({ items: [hit(path, tool, 1)] })
     const short = await postJson(second.baseUrl, '~search', { query: '日程' }, admin())
     expect(short.status).toBe(200)
-    await expect(short.json()).resolves.toEqual({ items: [{ path, tool }] })
+    await expect(short.json()).resolves.toEqual({ items: [hit(path, tool, 1)] })
 
     const intent = await postJson(
       second.baseUrl,
@@ -240,7 +350,7 @@ describe('Node 宿主 HTTP 面', () => {
       admin(),
     )
     expect(intent.status).toBe(200)
-    await expect(intent.json()).resolves.toEqual({ items: [{ path, tool }] })
+    await expect(intent.json()).resolves.toEqual({ items: [hit(path, tool, 2)] })
 
     const hiddenPath = 'search/wire/sqlite-hidden'
     const hiddenTool = {
@@ -249,24 +359,21 @@ describe('Node 宿主 HTTP 面', () => {
     }
     const hiddenRegister = await postJson(
       second.baseUrl,
-      'system/registry',
+      'system/registry/write',
       {
-        tool: 'write',
-        arguments: {
-          path: hiddenPath,
+        path: hiddenPath,
+        kind: 'http',
+        description: 'Hidden SQLite search wire fixture',
+        config: {
           kind: 'http',
-          description: 'Hidden SQLite search wire fixture',
-          config: {
-            kind: 'http',
-            endpoint: 'https://hidden-calendar.example.test',
-            tools: [{
-              name: hiddenTool.name,
-              description: hiddenTool.description,
-              inputSchema: hiddenTool.inputSchema,
-              method: 'GET',
-              pathTemplate: '/calendar',
-            }],
-          },
+          endpoint: 'https://hidden-calendar.example.test',
+          tools: [{
+            name: hiddenTool.name,
+            description: hiddenTool.description,
+            inputSchema: hiddenTool.inputSchema,
+            method: 'GET',
+            pathTemplate: '/calendar',
+          }],
         },
       },
       admin(),
@@ -283,19 +390,16 @@ describe('Node 宿主 HTTP 面', () => {
     const adminControlBody = (await adminControl.json()) as { items: unknown[] }
     expect(adminControlBody.items).toHaveLength(2)
     expect(adminControlBody.items).toEqual(expect.arrayContaining([
-      { path, tool },
-      { path: hiddenPath, tool: hiddenTool },
+      hit(path, tool, 2),
+      hit(hiddenPath, hiddenTool, 2),
     ]))
 
     const mint = await postJson(
       second.baseUrl,
-      'system/sk',
+      'system/sk/write',
       {
-        tool: 'write',
-        arguments: {
-          owner: 'agent:search-e2e-c',
-          scopes: [{ pattern: path, actions: ['read', 'call'] }],
-        },
+        owner: 'agent:search-e2e-c',
+        scopes: [{ pattern: path, actions: ['read', 'call'] }],
       },
       admin(),
     )
@@ -308,6 +412,6 @@ describe('Node 宿主 HTTP 面', () => {
       { headers: { authorization: `Bearer ${narrowSk.secret}` } },
     )
     expect(narrowed.status).toBe(200)
-    await expect(narrowed.json()).resolves.toEqual({ items: [{ path, tool }] })
+    await expect(narrowed.json()).resolves.toEqual({ items: [hit(path, tool, 2)] })
   })
 })

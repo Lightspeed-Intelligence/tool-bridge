@@ -44,18 +44,34 @@ export interface TestAppOpts {
   device?: TbAppDeps['device']
   /** 缺省注入 MemoryObjectStore;传 null 则不注入(模拟宿主无对象存储)。 */
   objects?: ObjectStore | null
+  /** 自定义对象工厂；用于验证请求期失败与调用次数。给出时优先于 objects。 */
+  objectsFactory?: TbAppDeps['objects']
   pluginBindings?: PluginBindings
   /** 内置集成目录;缺省不注入 → `system/catalog` 回空页(未装内置插件的宿主)。 */
   pluginCatalog?: BuiltinCatalog
+  /** Provider OAuth 出站桩；缺省不注入，以覆盖生产 fail-closed 语义。 */
+  providerOAuthFetch?: typeof fetch
   refThresholdBytes?: number
   refTtlSec?: number
   remote?: Partial<RemoteSettings>
   search?: SearchIndex
+  storeCallAllowedContentTypes?: string[]
+  storeCallMaxBytes?: number
+  storeCallMaxObjectBytes?: number
+  storeCallMaxObjects?: number
+  storeMaxObjectBytes?: number
+  storeReadTtlSec?: number
+  storeRelayMaxBytes?: number
+  storeShareTtlSec?: number
+  storeTokenSecret?: string
+  storeUploadTtlSec?: number
   toolCacheTtlSec?: number
+  uploadGrantTtlSec?: number
 }
 
 export interface TestApp {
   app: ReturnType<typeof createTbApp>
+  deps: TbAppDeps
   objects: MemoryObjectStore | undefined
   /** `SELF.fetch` 的等价物:签名一致,直接打中立层 Hono app。 */
   request: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
@@ -80,20 +96,38 @@ export async function createTestApp(opts: TestAppOpts = {}): Promise<TestApp> {
     state,
     version: TEST_VERSION,
   }
-  if (objects !== undefined) deps.objects = () => objects
+  if (opts.objectsFactory !== undefined) deps.objects = opts.objectsFactory
+  else if (objects !== undefined) deps.objects = () => objects
   if (opts.assets !== undefined) deps.assets = opts.assets
   if (opts.canonicalOrigin !== undefined) deps.canonicalOrigin = opts.canonicalOrigin
   if (opts.device !== undefined) deps.device = opts.device
   if (opts.pluginBindings !== undefined) deps.pluginBindings = opts.pluginBindings
   if (opts.pluginCatalog !== undefined) deps.pluginCatalog = opts.pluginCatalog
+  if (opts.providerOAuthFetch !== undefined) deps.providerOAuthFetch = opts.providerOAuthFetch
   if (opts.refThresholdBytes !== undefined) deps.refThresholdBytes = opts.refThresholdBytes
   if (opts.refTtlSec !== undefined) deps.refTtlSec = opts.refTtlSec
   if (opts.search !== undefined) deps.search = opts.search
+  if (opts.storeCallAllowedContentTypes !== undefined) {
+    deps.storeCallAllowedContentTypes = opts.storeCallAllowedContentTypes
+  }
+  if (opts.storeCallMaxBytes !== undefined) deps.storeCallMaxBytes = opts.storeCallMaxBytes
+  if (opts.storeCallMaxObjectBytes !== undefined) {
+    deps.storeCallMaxObjectBytes = opts.storeCallMaxObjectBytes
+  }
+  if (opts.storeCallMaxObjects !== undefined) deps.storeCallMaxObjects = opts.storeCallMaxObjects
+  if (opts.storeMaxObjectBytes !== undefined) deps.storeMaxObjectBytes = opts.storeMaxObjectBytes
+  if (opts.storeReadTtlSec !== undefined) deps.storeReadTtlSec = opts.storeReadTtlSec
+  if (opts.storeRelayMaxBytes !== undefined) deps.storeRelayMaxBytes = opts.storeRelayMaxBytes
+  if (opts.storeShareTtlSec !== undefined) deps.storeShareTtlSec = opts.storeShareTtlSec
+  if (opts.storeTokenSecret !== undefined) deps.storeTokenSecret = opts.storeTokenSecret
+  if (opts.storeUploadTtlSec !== undefined) deps.storeUploadTtlSec = opts.storeUploadTtlSec
   if (opts.toolCacheTtlSec !== undefined) deps.toolCacheTtlSec = opts.toolCacheTtlSec
+  if (opts.uploadGrantTtlSec !== undefined) deps.uploadGrantTtlSec = opts.uploadGrantTtlSec
 
   const app = createTbApp(deps)
   return {
     app,
+    deps,
     objects: objects instanceof MemoryObjectStore ? objects : undefined,
     request: async (input, init) => await app.request(input as never, init),
     secrets,

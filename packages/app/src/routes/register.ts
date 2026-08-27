@@ -14,13 +14,18 @@ import {
   TBError,
   type TreeNode,
 } from '@tool-bridge/core'
+import {
+  oauthAuthorizeRequestSchema,
+  oauthAuthorizeResponseSchema,
+  registryNodeSchema,
+} from '@tool-bridge/core/protocol'
 import type { AppContext } from '../deps'
 import type { RouteEnv } from './env'
 import { assertToolConfig, refreshDynamicSearchNode, requirePluginExport } from '../toolNodes'
+import { assertMcpOAuthConfig, invalidateMcpOAuth, startMcpAuthorization } from '../oauth'
 import { invalidateProviderOAuth, startProviderAuthorization } from '../providerOAuth'
 import { assertRemoteConfigAllowed, resolveRemoteSettings } from '../federation'
 import { assertContextConfig, assertSkillhubConfig } from '../contextNodes'
-import { invalidateMcpOAuth, startMcpAuthorization } from '../oauth'
 import { assertRegisterPath, splitReserved } from '../paths'
 import { invalidateToolCache } from '../providers/toolCache'
 import { invalidateMcpEra } from '../providers/mcp'
@@ -62,14 +67,14 @@ async function authorizeToolNode(
     authRef: config.authRef,
     config: exported.oauth,
     encryptionKey,
-    fetcher: fetch,
+    fetcher: deps.providerOAuthFetch,
     nodePath: node.path,
     now: new Date(),
     origin: deps.canonicalOrigin ?? new URL(c.req.url).origin,
     secrets: deps.secrets,
     store: deps.state,
   })
-  return new Response(JSON.stringify(result), {
+  return new Response(JSON.stringify(oauthAuthorizeResponseSchema.parse(result)), {
     headers: { 'content-type': contentTypeFor('json') },
   })
 }
@@ -105,6 +110,8 @@ export async function handleRegister(c: AppContext, env: RouteEnv): Promise<Resp
   // Secret Reference 使用授权:绑定 authRef/skRef 须持 system/secret admin(注册路径
   // 判定之后、落库之前)。受限注册者不得引用平台已有 Secret(confused-deputy 合入阻断项)。
   assertSecretRefUse(ctx.scopes, body.config)
+  // 预注册 MCP OAuth client 只允许 clientId + SecretStore 引用；服务端权威拒绝明文 secret。
+  await assertMcpOAuthConfig(body.config, deps.secrets)
   // context 配置校验 + s3 连通探测:探测出站网络,须在权限判定之后。
   await assertContextConfig(body.config, deps)
   // skillhub 配置校验(provider r2/s3;s3 连通探测)。
@@ -129,7 +136,7 @@ export async function handleRegister(c: AppContext, env: RouteEnv): Promise<Resp
   await invalidateProviderOAuth(store, body.path)
   await searchSync?.reconcileNodeQuietly(body.path, { marker })
   if (await refreshDynamicSearchNode(node, ctx, deps)) await searchSync?.abort(marker)
-  return new Response(JSON.stringify(node), {
+  return new Response(JSON.stringify(registryNodeSchema.parse(node)), {
     headers: { 'content-type': contentTypeFor('json') },
   })
 }
@@ -158,6 +165,11 @@ export async function handleAuthorize(c: AppContext, env: RouteEnv): Promise<Res
   } catch {
     throw TBError.notFound('not found')
   }
+  const rawBody = await c.req.json().catch(() => ({}))
+  const body = oauthAuthorizeRequestSchema.safeParse(rawBody)
+  if (!body.success) {
+    throw new TBError('invalid_argument', 'body only accepts optional redirectUri string')
+  }
   // kind:'tool' 且 export 声明了 oauth → provider 型托管流程(与 mcp 那条是两套机制,
   // 见 providerOAuth.ts 头注)。
   if (node.kind === 'tool' && node.config?.kind === 'tool') {
@@ -170,18 +182,18 @@ export async function handleAuthorize(c: AppContext, env: RouteEnv): Promise<Res
     )
   }
   // 可选 body {redirectUri}:CLI 本地回调通道(严格上游只放行 loopback 回调时)。
-  const body = (await c.req.json().catch(() => null)) as { redirectUri?: unknown } | null
-  const redirectUri
-    = body !== null && typeof body.redirectUri === 'string' ? body.redirectUri : undefined
+  const redirectUri = body.data.redirectUri
   const result = await startMcpAuthorization({
     store,
     encryptionKey: encKey,
     nodePath: path,
     serverUrl: node.config.url,
+    secrets: deps.secrets,
     origin: deps.canonicalOrigin ?? new URL(c.req.url).origin,
+    ...(node.config.oauthClient !== undefined ? { oauthClient: node.config.oauthClient } : {}),
     ...(redirectUri !== undefined ? { redirectUri } : {}),
   })
-  return new Response(JSON.stringify(result), {
+  return new Response(JSON.stringify(oauthAuthorizeResponseSchema.parse(result)), {
     headers: { 'content-type': contentTypeFor('json') },
   })
 }

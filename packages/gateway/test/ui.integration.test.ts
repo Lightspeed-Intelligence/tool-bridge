@@ -85,8 +85,8 @@ describe('路由次序:Worker 逻辑不被 assets 吞', () => {
     expect(await res.text()).toContain('HTBP')
   })
 
-  it('POST /system/status 数据面正常(不被静态回退拦截)', async () => {
-    const res = await SELF.fetch('https://tb.test/system/status', {
+  it('POST /system/status/get 数据面正常(不被静态回退拦截)', async () => {
+    const res = await SELF.fetch('https://tb.test/system/status/get', {
       method: 'POST',
       ...admin(),
       headers: {
@@ -94,7 +94,7 @@ describe('路由次序:Worker 逻辑不被 assets 吞', () => {
         'content-type': 'application/json',
         'accept': 'application/json',
       },
-      body: JSON.stringify({ tool: 'get', arguments: {} }),
+      body: JSON.stringify({}),
     })
     expect(res.status).toBe(200)
     const body = (await res.json()) as { healthy: boolean }

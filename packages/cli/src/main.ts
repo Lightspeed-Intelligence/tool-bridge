@@ -1,7 +1,9 @@
-import type { Command, CommanderError } from 'commander'
+import { CommanderError, type CommandUnknownOpts } from 'commander'
 import { buildProgram } from './program'
+import { reportError } from './output'
+import { CliError } from './http'
 
-function overrideExits(cmd: Command): void {
+function overrideExits(cmd: CommandUnknownOpts): void {
   cmd.exitOverride()
   cmd.configureOutput({ writeErr: () => {} })
   for (const child of cmd.commands) overrideExits(child)
@@ -13,31 +15,51 @@ function overrideExits(cmd: Command): void {
  * 不能扫描裸 argv：`--json` 可能位于 `--` 之后，属于 positional value，
  * 此时即使其它参数触发解析错误，也不应切换成 JSON 错误输出。
  */
-function parsedJsonMode(cmd: Command): boolean {
+function parsedJsonMode(cmd: CommandUnknownOpts): boolean {
   if (cmd.getOptionValueSource('json') === 'cli' && cmd.getOptionValue('json') === true) {
     return true
   }
   return cmd.commands.some(parsedJsonMode)
 }
 
-/** 生产 CLI 入口：把 Commander 解析错误也纳入统一的 JSON/人类输出契约。 */
-export async function runMain(argv: string[]): Promise<void> {
+export interface RunMainOptions {
+  /** 测试只改变 argv 形状，仍必须经过生产 catch/reportError。 */
+  from?: 'node' | 'user'
+}
+
+export type RunMainResult
+  = | { ok: true }
+    | { code?: string, kind: 'action' | 'commander', ok: false }
+
+/** 生产 CLI 唯一错误边界：action 必须自然 reject 到这里。 */
+export async function runMain(
+  argv: string[],
+  options: RunMainOptions = {},
+): Promise<RunMainResult> {
   const program = buildProgram()
   overrideExits(program)
   try {
-    await program.parseAsync(argv)
+    await program.parseAsync(argv, { from: options.from ?? 'node' })
+    return { ok: true }
   } catch (error) {
-    const err = error as CommanderError
-    if (err.code === 'commander.helpDisplayed' || err.code === 'commander.version') {
-      process.exitCode = 0
-      return
+    if (error instanceof CommanderError) {
+      if (error.code === 'commander.helpDisplayed' || error.code === 'commander.version') {
+        process.exitCode = 0
+        return { ok: true }
+      }
+      const message = error.message.replace(/^error:\s*/, '')
+      reportError(
+        parsedJsonMode(program),
+        new CliError(message, error.code),
+        error.exitCode,
+      )
+      return { ok: false, kind: 'commander', code: error.code }
     }
-    const message = String(err.message ?? error).replace(/^error:\s*/, '')
-    if (parsedJsonMode(program)) {
-      process.stdout.write(`${JSON.stringify({ ok: false, error: message, code: err.code })}\n`)
-    } else {
-      process.stderr.write(`error: ${message}\n`)
+    reportError(parsedJsonMode(program), error)
+    return {
+      ok: false,
+      kind: 'action',
+      ...(error instanceof CliError && error.code !== undefined ? { code: error.code } : {}),
     }
-    process.exitCode = typeof err.exitCode === 'number' && err.exitCode !== 0 ? err.exitCode : 1
   }
 }

@@ -2,6 +2,7 @@ import {
   Boxes,
   Cpu,
   Globe,
+  HardDrive,
   KeyRound,
   KeySquare,
   type LucideIcon,
@@ -18,6 +19,7 @@ export interface ManageLink {
 
 /** 固定在 ActivityRail / 移动管理面板的控制面入口，不再随长树一起滚动。 */
 export const MANAGE_LINKS: readonly ManageLink[] = [
+  { to: '/manage/store', label: '对象存储', shortLabel: 'Store', icon: HardDrive },
   { to: '/manage/registry', label: '节点注册', shortLabel: '节点', icon: Boxes },
   { to: '/manage/sk', label: 'Secret Key', shortLabel: '密钥', icon: KeySquare },
   { to: '/manage/secrets', label: '凭证保管', shortLabel: '凭证', icon: ShieldEllipsis },

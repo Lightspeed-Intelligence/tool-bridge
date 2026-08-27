@@ -1,4 +1,4 @@
-import { Command } from 'commander'
+import { Command, type CommandUnknownOpts } from 'commander'
 import { integrationCommand } from './commands/integration'
 import { federationCommand } from './commands/federation'
 import pkg from '../package.json' with { type: 'json' }
@@ -15,6 +15,7 @@ import { statusCommand } from './commands/status'
 import { whoamiCommand } from './commands/whoami'
 import { loginCommand } from './commands/login'
 import { mountCommand } from './commands/mount'
+import { storeCommand } from './commands/store'
 import { callCommand } from './commands/call'
 import { helpCommand } from './commands/help'
 import { noteCommand } from './commands/note'
@@ -28,7 +29,7 @@ import { lsCommand } from './commands/ls'
 import { skCommand } from './commands/sk'
 
 /** Prepared commands added with addCommand do not inherit Commander help settings. */
-function showGlobalOptionsInHelp(command: Command): void {
+function showGlobalOptionsInHelp(command: CommandUnknownOpts): void {
   const declaresGlobals = command.options.some(option =>
     ['--json', '--base-url', '--sk', '--timeout'].includes(option.long ?? ''),
   )
@@ -48,7 +49,8 @@ function showGlobalOptionsInHelp(command: Command): void {
  * - note ls/get/set/rm:Path 补充说明(展示在 ~help;set/rm 需 admin)。
  * - feedback ls/get/submit/vote/rm:Agent 使用反馈(头部条目进 ~help)。
  * - tool mount/rm、server add/ls/rm、call:挂载工具源与数据面调用。
- * - ctx ls/cat/put/patch/rm/search/mount/unmount:Context Layer。
+ * - ctx ls/cat/put/upload/patch/rm/search/mount/unmount:Context Layer authoring。
+ * - store upload/stat/get/share/revoke-share/rm/list:部署级默认对象存储。
  * - skill ls/get/search/publish/rm/mount/unmount:skillhub(Agent Skill 仓库)。
  * - connect、daemon、device ls、mount fs:设备反向注册与本机守护。
  * - plugin register/list/get/update/health/rm:插件注册表。
@@ -57,7 +59,7 @@ function showGlobalOptionsInHelp(command: Command): void {
  * 不静默吞掉(曾因 citty 把拼错的 `--alows` 当 positional 吞掉引发权限误配)。
  * `.helpCommand(false)`:`tb help [path]` 是业务命令(节点 ~help),须让位。
  */
-export function buildProgram(): Command {
+export function buildProgram() {
   const program = configureGlobalOpts(new Command('tb'))
     .version(pkg.version)
     .description(
@@ -91,6 +93,7 @@ Agent feedback — every path carries experience from other agents:
   program.addCommand(serverCommand())
   program.addCommand(callCommand())
   program.addCommand(ctxCommand())
+  program.addCommand(storeCommand())
   program.addCommand(skillCommand())
   program.addCommand(connectCommand())
   program.addCommand(daemonCommand())

@@ -42,6 +42,8 @@ export interface ObjectPutOptions {
   contentType?: string
   /** 与现存对象 etag 不符(含对象不存在)→ TBError conflict。 */
   ifMatchEtag?: string
+  /** `*` 表示仅当对象不存在时创建；命中现存对象 → TBError conflict。 */
+  ifNoneMatch?: '*'
   metadata?: Record<string, string>
 }
 
@@ -58,7 +60,33 @@ export interface ObjectListResult {
   items: Array<ObjectMeta | { prefix: string }>
 }
 
+export interface ObjectPresignedPut {
+  /** 上传时必须原样携带的请求头。 */
+  headers: Record<string, string>
+  method: 'PUT'
+  url: string
+}
+
+export interface ObjectPresignPutOptions {
+  contentType: string
+  /** `*` 表示仅当对象不存在时写入；必须随 PUT 一同签名并发送。 */
+  ifNoneMatch?: '*'
+}
+
+/**
+ * 定长直传契约：实现必须把 Content-Length 纳入签名，让存储端拒绝
+ * 任何与声明字节数不同的请求。普通 `presignPut` 没有这个安全保证。
+ */
+export interface ObjectPresignPutExactOptions extends ObjectPresignPutOptions {
+  contentLength: number
+}
+
 export interface ObjectStore {
+  /**
+   * 可选宿主钩子：清理 prefix 下早于 olderThan 的未落位 staging 临时文件。
+   * staging 不进入 list，且命名/mtime 属于 driver 私有实现；返回实际删除数量。
+   */
+  cleanupStaging?(prefix: string, olderThan: string): Promise<number>
   /** 幂等:不存在静默。 */
   delete(key: string): Promise<void>
   get(key: string): Promise<{ body: ObjectBodyStream, meta: ObjectMeta } | null>
@@ -66,6 +94,18 @@ export interface ObjectStore {
   list(prefix: string, opts?: ObjectListOptions): Promise<ObjectListResult>
   /** 生成限时直连 URL;后端不支持则缺省(provider 退化到 relayRefUrl)。 */
   presign?(key: string, ttlSec: number): Promise<string>
+  /** 生成限时、定路径的直传 PUT 请求；后端或凭证不支持时缺省。 */
+  presignPut?(
+    key: string,
+    ttlSec: number,
+    opts: ObjectPresignPutOptions,
+  ): Promise<ObjectPresignedPut>
+  /** 仅当 backend 能在签名中强制精确 Content-Length 时提供。 */
+  presignPutExact?(
+    key: string,
+    ttlSec: number,
+    opts: ObjectPresignPutExactOptions,
+  ): Promise<ObjectPresignedPut>
   put(key: string, body: ObjectBody, opts?: ObjectPutOptions): Promise<ObjectMeta>
 }
 
@@ -165,8 +205,14 @@ export class MemoryObjectStore implements ObjectStore {
 
   async put(key: string, body: ObjectBody, opts?: ObjectPutOptions): Promise<ObjectMeta> {
     const existing = this.m.get(key)
+    if (opts?.ifMatchEtag !== undefined && opts.ifNoneMatch !== undefined) {
+      throw new TBError('invalid_argument', 'ifMatchEtag 与 ifNoneMatch 不能同时使用')
+    }
     if (opts?.ifMatchEtag !== undefined && opts.ifMatchEtag !== existing?.meta.etag) {
       throw new TBError('conflict', `etag 不匹配:'${key}'`)
+    }
+    if (opts?.ifNoneMatch === '*' && existing !== undefined) {
+      throw new TBError('conflict', `对象已存在:'${key}'`)
     }
     const bytes = await objectBodyToBytes(body)
     const meta: ObjectMeta = {

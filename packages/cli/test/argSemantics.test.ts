@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import pkg from '../package.json' with { type: 'json' }
 import { resetFetch, setFetch } from '../src/http'
 import { runMain } from '../src/main'
 import { runCli } from './cliHarness'
@@ -69,7 +70,7 @@ describe('真正的全局参数', () => {
   ])('%s也会传入叶子 action', async (_label, argv) => {
     const fn = jsonFetch({ items: [] })
     await runCli(argv)
-    expect(String(fn.mock.calls[0]?.[0])).toBe('https://gw/system/sk')
+    expect(String(fn.mock.calls[0]?.[0])).toBe('https://gw/system/sk/list')
     expect(JSON.parse(stdoutText())).toEqual({ items: [] })
   })
 
@@ -93,6 +94,66 @@ describe('真正的全局参数', () => {
     expect(write.mock.calls.map(c => String(c[0])).join('')).toContain('--bogus')
     expect(process.exitCode).toBe(1)
   })
+
+  it.each([
+    ['root', ['--help']],
+    ['group', ['sk', '--help']],
+    ['leaf', ['sk', 'list', '--help']],
+  ])('%s help 经生产 catch 正常输出并保持退出码 0', async (_label, argv) => {
+    process.exitCode = 1
+    await runCli(argv)
+    expect(stdoutText()).toContain('Usage:')
+    expect(process.exitCode).toBe(0)
+  })
+
+  it('version 经生产 catch 正常输出并保持退出码 0', async () => {
+    process.exitCode = 1
+    await runCli(['--version'])
+    expect(stdoutText().trim()).toBe(pkg.version)
+    expect(process.exitCode).toBe(0)
+  })
+
+  it('未知 action Error 也只由 runMain 统一落地', async () => {
+    const { runDeviceConnection } = await import('../src/deviceRuntime')
+    vi.mocked(runDeviceConnection).mockRejectedValueOnce(new Error('adapter exploded'))
+
+    await runCli([
+      'connect',
+      '--base-url',
+      'https://gw',
+      '--sk',
+      'tbk_x',
+      '--device-id',
+      'd-error',
+      '--json',
+    ])
+
+    expect(JSON.parse(stdoutText())).toEqual({ ok: false, error: 'adapter exploded' })
+    expect(process.exitCode).toBe(1)
+    vi.mocked(runDeviceConnection).mockClear()
+  })
+
+  it('status transport 错误也 reject 到 runMain 根边界', async () => {
+    setFetch(vi.fn(async () => {
+      throw new Error('transport details must not escape')
+    }) as unknown as typeof fetch)
+
+    const result = await runMain([
+      'status',
+      '--base-url',
+      'https://gw',
+      '--json',
+    ], { from: 'user' })
+
+    expect(result).toMatchObject({ ok: false, kind: 'action', code: 'unavailable' })
+    expect(JSON.parse(stdoutText())).toMatchObject({
+      ok: false,
+      code: 'unavailable',
+      error: 'request failed: gateway unavailable',
+    })
+    expect(stdoutText()).not.toContain('transport details')
+    expect(process.exitCode).toBe(1)
+  })
 })
 
 describe('SK 参数与能力对齐', () => {
@@ -107,7 +168,7 @@ describe('SK 参数与能力对齐', () => {
     clearStdout()
     await runCli([...base, '--expires', '2026-07-23T08:00:00+08:00', '--json'])
     const payload = JSON.parse((fn.mock.calls[0]?.[1] as RequestInit).body as string)
-    expect(payload.arguments.expiresAt).toBe('2026-07-23T00:00:00.000Z')
+    expect(payload.expiresAt).toBe('2026-07-23T00:00:00.000Z')
   })
 
   it('get/update/disable 映射到已有 SKRegistry 动词', async () => {
@@ -116,26 +177,17 @@ describe('SK 参数与能力对齐', () => {
     const gw = ['--base-url', 'https://gw', '--sk', 'admin', '--json']
 
     await runCli(['sk', 'get', 'k1', ...gw])
-    expect(JSON.parse((fn.mock.calls[0]?.[1] as RequestInit).body as string)).toEqual({
-      tool: 'get',
-      arguments: { id: 'k1' },
-    })
+    expect(JSON.parse((fn.mock.calls[0]?.[1] as RequestInit).body as string)).toEqual({ id: 'k1' })
     await runCli(['sk', 'update', 'k1', '--description', 'build key', '--scope', 'ci/**:call', ...gw])
     expect(JSON.parse((fn.mock.calls[1]?.[1] as RequestInit).body as string)).toEqual({
-      tool: 'update',
-      arguments: {
-        id: 'k1',
-        patch: {
-          description: 'build key',
-          scopes: [{ pattern: 'ci/**', actions: ['call'] }],
-        },
+      id: 'k1',
+      patch: {
+        description: 'build key',
+        scopes: [{ pattern: 'ci/**', actions: ['call'] }],
       },
     })
     await runCli(['sk', 'disable', 'k1', ...gw])
-    expect(JSON.parse((fn.mock.calls[2]?.[1] as RequestInit).body as string)).toEqual({
-      tool: 'update',
-      arguments: { id: 'k1', patch: { disabled: true } },
-    })
+    expect(JSON.parse((fn.mock.calls[2]?.[1] as RequestInit).body as string)).toEqual({ id: 'k1', patch: { disabled: true } })
   })
 })
 
@@ -158,8 +210,8 @@ describe('分页参数', () => {
       'admin',
       '--json',
     ])
-    expect(String(fn.mock.calls[0]?.[0])).toBe(`https://gw${path}`)
-    expect(JSON.parse((fn.mock.calls[0]?.[1] as RequestInit).body as string).arguments).toEqual({
+    expect(String(fn.mock.calls[0]?.[0])).toBe(`https://gw${path}/list`)
+    expect(JSON.parse((fn.mock.calls[0]?.[1] as RequestInit).body as string)).toEqual({
       opts: { limit: 10, cursor: 'c1' },
     })
   })
@@ -185,12 +237,12 @@ describe('分页参数', () => {
     const fn = jsonFetch({ items: [] })
     const gw = ['--base-url', 'https://gw', '--sk', 'admin', '--json']
     await runCli(['ctx', 'search', 'ctx/docs', 'q', '--cursor', 'ctx-c', ...gw])
-    expect(JSON.parse((fn.mock.calls[0]?.[1] as RequestInit).body as string).arguments).toEqual({
+    expect(JSON.parse((fn.mock.calls[0]?.[1] as RequestInit).body as string)).toEqual({
       query: 'q',
       opts: { cursor: 'ctx-c' },
     })
     await runCli(['skill', 'search', 'skills/team', 'q', '--cursor', 'skill-c', ...gw])
-    expect(JSON.parse((fn.mock.calls[1]?.[1] as RequestInit).body as string).arguments).toEqual({
+    expect(JSON.parse((fn.mock.calls[1]?.[1] as RequestInit).body as string)).toEqual({
       query: 'q',
       opts: { cursor: 'skill-c' },
     })
@@ -203,7 +255,7 @@ describe('分页参数', () => {
     })
     const gw = ['--base-url', 'https://gw', '--sk', 'admin', '--json']
     await runCli(['device', 'ls', '--limit', '10', '--cursor', 'd0', ...gw])
-    expect(JSON.parse((fn.mock.calls[0]?.[1] as RequestInit).body as string).arguments).toEqual({
+    expect(JSON.parse((fn.mock.calls[0]?.[1] as RequestInit).body as string)).toEqual({
       prefix: 'device',
       opts: { limit: 10, cursor: 'd0' },
     })
@@ -221,7 +273,7 @@ describe('分页参数', () => {
       ),
     )
     await runCli(['server', 'ls', '--limit', '20', '--cursor', 's0', ...gw])
-    expect(JSON.parse((fn.mock.calls[0]?.[1] as RequestInit).body as string).arguments).toEqual({
+    expect(JSON.parse((fn.mock.calls[0]?.[1] as RequestInit).body as string)).toEqual({
       opts: { limit: 20, cursor: 's0' },
     })
     expect(JSON.parse(stdoutText()).cursor).toBe('server-next')
@@ -323,10 +375,7 @@ describe('条件参数与挂载语义', () => {
 
     process.exitCode = 0
     await runCli(['ctx', 'rm', 'ctx/docs', 'a', ...gw])
-    expect(JSON.parse((fn.mock.calls[0]?.[1] as RequestInit).body as string)).toEqual({
-      tool: 'Delete',
-      arguments: { path: 'a' },
-    })
+    expect(JSON.parse((fn.mock.calls[0]?.[1] as RequestInit).body as string)).toEqual({ path: 'a' })
   })
 
   it('connect 的重复 URL、无效 shell/fs 组合会提前失败', async () => {

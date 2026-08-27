@@ -6,14 +6,15 @@ import { readFileSync, writeFileSync } from 'node:fs'
  * Node/Docker 自部署(`@tool-bridge/server`)与 SDK 内嵌都不需要它——那两条路径没有
  * 需要预先创建的云资源,数据落在 `TB_DATA_DIR`。
  *
- * 做两件事:
- * 1. 创建 KV namespace / R2 bucket / D1 search database(存在即跳过),名称从 TB_NAME_PREFIX 派生;
+ * 缺省做两件事:
+ * 1. 创建 R2 bucket / 一个 D1 database(state 与 search 同库;存在即跳过),名称从 TB_NAME_PREFIX 派生;
  * 2. 把**账户特定配置**从 .env 回填进 packages/gateway/wrangler.jsonc——account_id、
  *    custom domain 路由、TB_CANONICAL_ORIGIN、R2 S3 端点与前缀派生的资源名/新建资源 id。
  *    仓库里那份 wrangler.jsonc 因此保持中立(无账户 id、无域名),谁 clone 都能直接用。
  *
  * 用成熟 CLI(wrangler)完成,不手写 CF API 调用。凭据走 wrangler OAuth
- * 或 CLOUDFLARE_API_TOKEN(见 .env)。**本脚本由主协调者在部署前执行,worker 不运行它。**
+ * 或 CLOUDFLARE_API_TOKEN(见 .env)。CI 对已经 provision 的 production 设置
+ * TB_PROVISION_CONFIG_ONLY=true + TB_PROVISION_D1_DATABASE_ID,只回填中立配置,不再管理资源。
  */
 import { execFileSync } from 'node:child_process'
 import { join, resolve } from 'node:path'
@@ -34,13 +35,19 @@ const accountId = env.CLOUDFLARE_ACCOUNT_ID || process.env.CLOUDFLARE_ACCOUNT_ID
 const apiToken = env.CLOUDFLARE_API_TOKEN || process.env.CLOUDFLARE_API_TOKEN
 const domain = env.TB_DOMAIN || process.env.TB_DOMAIN
 const baseUrl = env.TB_BASE_URL || process.env.TB_BASE_URL
+const configOnly = (env.TB_PROVISION_CONFIG_ONLY || process.env.TB_PROVISION_CONFIG_ONLY) === 'true'
+const provisionedD1Id = env.TB_PROVISION_D1_DATABASE_ID
+  || process.env.TB_PROVISION_D1_DATABASE_ID
 
-// 资源名默认从 prefix 派生;但存量部署的库名可能与该约定不符(如本仓生产 KV 实为
-// "TENANTS"),故允许 TB_KV_TITLE / TB_R2_BUCKET_NAME / TB_D1_NAME 显式覆盖,让 provision
-// 按真实名查到现有资源而非新建空库。缺省回落 `${prefix}-*`。
-const kvTitle = env.TB_KV_TITLE || process.env.TB_KV_TITLE || `${prefix}-kv`
+// ADR-001:权威状态与搜索索引同在一个 D1 库(KV 已从 Cloudflare 宿主撤出)。
+// TB_STATE / TB_SEARCH 两个 binding 指向同一库——binding 表达用途,库表达存储位置。
+//
+// 资源名默认从 prefix 派生;但存量部署的资源名可能与该约定不符,故保留
+// TB_R2_BUCKET_NAME / TB_D1_NAME 显式覆盖,让 provision 按真实名查到现有资源而非
+// 新建空库(2026-08-19 教训:provision 按 `${prefix}-kv` 找不到生产实名 "TENANTS"
+// 的 KV,新建空库致网关连错库)。缺省回落 `${prefix}-*`。
 const r2Bucket = env.TB_R2_BUCKET_NAME || process.env.TB_R2_BUCKET_NAME || `${prefix}-r2`
-const d1Name = env.TB_D1_NAME || process.env.TB_D1_NAME || `${prefix}-search`
+const d1Name = env.TB_D1_NAME || process.env.TB_D1_NAME || `${prefix}-db`
 const wranglerPath = resolve(
   root,
   process.env.TB_PROVISION_WRANGLER_CONFIG ?? join('packages', 'gateway', 'wrangler.jsonc'),
@@ -105,45 +112,13 @@ function backfillId(arrayKey, binding, idKey, id, label) {
   }
 }
 
-function backfillKvId(id) {
-  backfillId('kv_namespaces', 'TB_KV', 'id', id, 'TB_KV.id')
+function backfillD1Id(binding, id) {
+  backfillId('d1_databases', binding, 'database_id', id, `${binding}.database_id`)
 }
 
-function backfillD1Id(id) {
-  backfillId('d1_databases', 'TB_SEARCH', 'database_id', id, 'TB_SEARCH.database_id')
-}
-
-function ensureKv() {
-  const out = wrangler(['kv', 'namespace', 'list'], { capture: true })
-  let list = []
-  try {
-    list = JSON.parse(out)
-  } catch {
-    console.warn('warn: could not parse `kv namespace list` output; attempting create anyway')
-  }
-  const existing = list.find(ns => ns.title === kvTitle)
-  if (existing) {
-    backfillKvId(existing.id)
-    console.log(`KV namespace '${kvTitle}' exists (id=${existing.id}) — skip`)
-    return existing.id
-  }
-  console.log(`creating KV namespace '${kvTitle}'...`)
-  wrangler(['kv', 'namespace', 'create', kvTitle])
-  // create 不回吐 id,重新 list 取新建 namespace 的 id 并回填(干净环境 deploy:all 不断链)。
-  const after = wrangler(['kv', 'namespace', 'list'], { capture: true })
-  let created
-  try {
-    created = JSON.parse(after).find(ns => ns.title === kvTitle)
-  } catch {
-    // 解析失败走下方手动提示
-  }
-  if (created) {
-    backfillKvId(created.id)
-    return created.id
-  }
-  console.log(
-    `created KV '${kvTitle}' but could not read its new id — copy it into packages/gateway/wrangler.jsonc TB_KV.id`,
-  )
+function backfillBothD1Ids(id) {
+  backfillD1Id('TB_STATE', id)
+  backfillD1Id('TB_SEARCH', id)
 }
 
 function ensureR2() {
@@ -172,7 +147,7 @@ function ensureD1() {
   const list = listD1()
   const existing = list.find(db => db?.name === d1Name && typeof db?.uuid === 'string')
   if (existing) {
-    backfillD1Id(existing.uuid)
+    backfillBothD1Ids(existing.uuid)
     console.log(`D1 database '${d1Name}' exists (id=${existing.uuid}) — skip`)
     return existing.uuid
   }
@@ -183,7 +158,7 @@ function ensureD1() {
   if (!created) {
     throw new Error(`created D1 '${d1Name}' but could not read its new id`)
   }
-  backfillD1Id(created.uuid)
+  backfillBothD1Ids(created.uuid)
   return created.uuid
 }
 
@@ -221,12 +196,25 @@ function applyDeployTargets() {
   // 前缀派生的资源名:provision 按前缀创建,配置里的名字必须跟着走,否则 deploy 绑到不存在的资源。
   setConfigPath(['vars', 'TB_R2_BUCKET'], r2Bucket, 'vars.TB_R2_BUCKET')
   setBindingField('r2_buckets', 'TB_R2', 'bucket_name', r2Bucket, 'TB_R2.bucket_name')
+  setBindingField('d1_databases', 'TB_STATE', 'database_name', d1Name, 'TB_STATE.database_name')
   setBindingField('d1_databases', 'TB_SEARCH', 'database_name', d1Name, 'TB_SEARCH.database_name')
 }
 
 console.log(`provisioning with prefix '${prefix}'${accountId ? ` (account ${accountId})` : ''}`)
 applyDeployTargets()
-ensureKv()
-ensureR2()
-ensureD1()
+if (configOnly) {
+  if (!accountId) throw new Error('TB_PROVISION_CONFIG_ONLY=true requires CLOUDFLARE_ACCOUNT_ID')
+  if (!provisionedD1Id) {
+    throw new Error('TB_PROVISION_CONFIG_ONLY=true requires TB_PROVISION_D1_DATABASE_ID')
+  }
+  backfillBothD1Ids(provisionedD1Id)
+  console.log('config-only mode: existing R2/D1 targets backfilled; resource API calls skipped')
+} else {
+  ensureR2()
+  ensureD1()
+  console.log(
+    `performance: enable D1 Read Replication for '${d1Name}' in Cloudflare Dashboard → D1 → Settings; `
+    + 'the gateway already uses request-scoped Sessions API and remains correct before replicas are enabled.',
+  )
+}
 console.log('provision done.')
