@@ -25,6 +25,19 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * 「这个面对当前身份不可见」的判据 —— 用来区分**预期的没权限**与真故障。
+ *
+ * 节点读权限门槛把无权访问伪装成 404(连存在性都不泄露),所以 404 与 401/403 都算。
+ * 用它探测 admin 面时:命中 → 静默隐藏(那是预期结果,不是错误);不命中(网络 / 5xx)
+ * → 照常渲染错误态,不能一并吞掉。
+ */
+export function isAccessDenied(error: unknown): boolean {
+  if (!(error instanceof ApiError)) return false
+  if (error.status === 401 || error.status === 403 || error.status === 404) return true
+  return error.code === 'not_found' || error.code === 'permission_denied'
+}
+
 export interface Connection {
   /** 网关 BaseURL;'' = 同源(生产形态:Dashboard 与 gateway 同 Worker)。 */
   baseUrl: string

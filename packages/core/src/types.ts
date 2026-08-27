@@ -70,7 +70,7 @@ export interface SecretKey {
   disabled?: boolean
   /** 过期视同 disabled。 */
   expiresAt?: Timestamp
-  /** sha256(明文);明文仅在签发响应中出现一次。 */
+  /** sha256(明文);鉴权只用它。 */
   hash: string
   /** key id(可公开,审计用)。 */
   id: string
@@ -79,6 +79,18 @@ export interface SecretKey {
   registerPaths?: TreePath[]
   /** 空数组 = 无任何权限。 */
   scopes: Scope[]
+  /**
+   * AES-256-GCM 加密的明文 key(base64url,格式同 SecretStore 的密文封装)。
+   *
+   * **仅登录用户自助面用**:让本人能在 Dashboard 反复复制自己的 key,而不是只在签发
+   * 那一刻看一次。签发时不写此字段的 key(agent / plugin / device 等由脚本签发的)
+   * 永远只有 hash —— 它们不需要人来复制,存明文只是白增暴露面。
+   *
+   * ⚠️ 安全取舍(2026-08-26 明确选定):存了明文后 `TB_SECRET_ENCRYPTION_KEY` 成为
+   * 单点 —— 它泄漏等于所有带此字段的 SK 泄漏。鉴权路径**永不读它**(仍只比对 hash);
+   * 它只经本人 owner 校验后的自助面解密返回,admin 面不暴露(admin 也读不到他人明文)。
+   */
+  secretEnc?: string
 }
 
 export interface SecretKeyInput {
@@ -87,6 +99,11 @@ export interface SecretKeyInput {
   owner: OwnerRef
   registerPaths?: TreePath[]
   scopes: Scope[]
+  /**
+   * 是否随记录保存可解密的明文(默认 false)。
+   * 只有飞书登录签发的用户 key 传 true —— 见 {@link SecretKey.secretEnc}。
+   */
+  storePlaintext?: boolean
 }
 
 // ---------- Tree ----------

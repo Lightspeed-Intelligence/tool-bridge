@@ -32,7 +32,8 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { useInvalidate, useInvoke, useSkList } from '@/lib/queries'
+import { useInvalidate, useInvoke, useIsAdmin, useSkList } from '@/lib/queries'
+import { formatSkDate, getSkStatus, type SkStatus } from '@/lib/skStatus'
 import { PaginationFooter } from '@/components/PaginationFooter'
 import { type Scope, type SecretKeyInfo } from '@/lib/types'
 import { ConfirmAction } from '@/components/ConfirmAction'
@@ -49,8 +50,8 @@ import {
   type SkFormState,
 } from './forms/skConfig'
 import { SkFormFields } from './forms/SkFormFields'
+import { MyKeysSection } from './MyKeysSection'
 
-type SkStatus = 'active' | 'disabled' | 'expired'
 type StatusFilter = 'all' | SkStatus
 
 const STATUS_FILTERS: Array<{ label: string, value: StatusFilter }> = [
@@ -59,18 +60,6 @@ const STATUS_FILTERS: Array<{ label: string, value: StatusFilter }> = [
   { value: 'disabled', label: '已禁用' },
   { value: 'expired', label: '已过期' },
 ]
-
-function getSkStatus(sk: SecretKeyInfo, now: number): SkStatus {
-  if (sk.disabled) return 'disabled'
-  if (sk.expiresAt && Date.parse(sk.expiresAt) <= now) return 'expired'
-  return 'active'
-}
-
-function formatDate(value: string) {
-  const date = new Date(value)
-  if (Number.isNaN(date.getTime())) return value
-  return date.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })
-}
 
 function StatusMetric({
   icon: Icon,
@@ -189,7 +178,7 @@ function Lifecycle({ sk, status }: { sk: SecretKeyInfo, status: SkStatus }) {
       <div className="flex items-center justify-between gap-2">
         <span className="text-muted-foreground">签发</span>
         <time className="font-mono" dateTime={sk.createdAt}>
-          {sk.createdAt ? formatDate(sk.createdAt) : '未知'}
+          {sk.createdAt ? formatSkDate(sk.createdAt) : '未知'}
         </time>
       </div>
       <div className="flex items-center justify-between gap-2">
@@ -201,7 +190,7 @@ function Lifecycle({ sk, status }: { sk: SecretKeyInfo, status: SkStatus }) {
                 dateTime={sk.expiresAt}
                 title={new Date(sk.expiresAt).toLocaleString()}
               >
-                {formatDate(sk.expiresAt)}
+                {formatSkDate(sk.expiresAt)}
               </time>
             )
           : (
@@ -347,8 +336,12 @@ function CreateSkDialog({
   )
 }
 
-/** Secret Key 管理：签发、scope 约束、禁用与吊销。 */
-export function SkPage() {
+/**
+ * 全量 SK 管理区域(`system/sk`,需 admin):签发、scope 约束、禁用与吊销。
+ *
+ * **只在探测到 admin 后渲染** —— 非 admin 调 `system/sk/list` 拿 404,这里不该被挂载。
+ */
+function AdminSkSection() {
   const list = useSkList()
   const invoke = useInvoke()
   const invalidate = useInvalidate()
@@ -403,22 +396,28 @@ export function SkPage() {
   const hasFilters = needle !== '' || statusFilter !== 'all'
 
   return (
-    <div className="mx-auto max-w-7xl px-4 py-5 sm:px-6 sm:py-6 lg:px-8 lg:py-8">
-      <PageHeader
-        actions={<CreateSkDialog onIssued={setIssued} />}
-        description={(
-          <>
-            以身份、路径与动作组合最小权限；签发和吊销能力对等
-            {' '}
-            <code className="font-mono text-xs">tb sk</code>
-            。
-          </>
-        )}
-        eyebrow="AUTH / ACCESS CONTROL"
-        title="Secret Key"
-      />
+    <>
+      <div className="flex flex-col gap-3 rounded-xl border border-primary/20 bg-primary/[0.03] px-4 py-3.5 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex min-w-0 items-center gap-3">
+          <span className="grid size-9 shrink-0 place-items-center rounded-lg border border-primary/25 bg-primary/8 text-primary">
+            <ShieldCheck aria-hidden="true" className="size-4" />
+          </span>
+          <div className="min-w-0">
+            <h2 className="text-sm font-medium">全部 Secret Key（管理员）</h2>
+            <p className="text-xs text-muted-foreground">
+              以身份、路径与动作组合最小权限；签发和吊销能力对等
+              {' '}
+              <code className="font-mono">tb sk</code>
+              。
+            </p>
+          </div>
+        </div>
+        <div className="shrink-0">
+          <CreateSkDialog onIssued={setIssued} />
+        </div>
+      </div>
 
-      <section aria-label="Secret Key 状态概览" className="mt-6 grid gap-3 sm:grid-cols-3">
+      <section aria-label="Secret Key 状态概览" className="mt-4 grid gap-3 sm:grid-cols-3">
         <StatusMetric
           description="可通过 scope 授权"
           icon={ShieldCheck}
@@ -442,7 +441,7 @@ export function SkPage() {
         />
       </section>
 
-      <section aria-label="SK 列表" className="mt-6 overflow-hidden rounded-xl border bg-card/70">
+      <section aria-label="SK 列表" className="mt-4 overflow-hidden rounded-xl border bg-card/70">
         <div className="flex flex-col gap-3 border-b bg-muted/10 px-4 py-3.5 xl:flex-row xl:items-center xl:justify-between">
           <div className="flex min-w-0 items-center gap-3">
             <div className="grid size-8 shrink-0 place-items-center rounded-md border bg-background text-primary">
@@ -708,6 +707,48 @@ export function SkPage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+    </>
+  )
+}
+
+/**
+ * Secret Key 页:所有登录用户的「我的 key」自助面 + admin 才可见的全量管理面。
+ *
+ * **admin 判定靠试探而非身份字段**:Dashboard 侧没有 whoami(session 只有
+ * {baseUrl,id,name,sk}),而非 admin 读 `system/sk/list` 会拿 404。于是 `useIsAdmin`
+ * 直接把「能不能读 admin 面」当判据 —— 它恰好就是要用它决定渲染什么的那个能力。
+ *
+ * 拒绝是**预期结果、不是错误**:探测被拒时静默不渲染 admin 区域,不显示任何报错;
+ * 只有网络 / 5xx 这类真故障才落进 `isError`,那时才提示一行(自助面照常可用)。
+ */
+export function SkPage() {
+  const isAdmin = useIsAdmin()
+
+  return (
+    <div className="mx-auto max-w-7xl px-4 py-5 sm:px-6 sm:py-6 lg:px-8 lg:py-8">
+      <PageHeader
+        description="签发给自己的 key 用于 tb CLI 或其它客户端接入；权限与你的登录权限一致。"
+        eyebrow="AUTH / ACCESS CONTROL"
+        title="Secret Key"
+      />
+
+      <div className="mt-6">
+        <MyKeysSection />
+      </div>
+
+      {isAdmin.data === true && (
+        <div className="mt-8 border-t pt-8">
+          <AdminSkSection />
+        </div>
+      )}
+
+      {isAdmin.isError && (
+        <p className="mt-6 text-xs text-muted-foreground" role="status">
+          暂时无法确认你的管理员权限（
+          {isAdmin.error.message}
+          ）。若你是管理员，请稍后重试。
+        </p>
+      )}
     </div>
   )
 }

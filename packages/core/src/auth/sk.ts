@@ -85,9 +85,15 @@ export async function mintKey(
   return { key, secret }
 }
 
-/** 投影:剥离 hash(hash 永不出网关)。 */
-export function projectKey(key: SecretKey): Omit<SecretKey, 'hash'> {
-  return omit(key, 'hash')
+/**
+ * 投影:剥离 hash 与 secretEnc(两者永不出网关的常规读取路径)。
+ *
+ * `secretEnc` 必须在这里剥掉 —— 否则它会随 `system/sk/list|get|update` 的响应
+ * 流给 admin,等于任何 admin 都能拿到他人 key 的密文(离线爆破 / 拿到主密钥即解)。
+ * 本人取自己明文走自助面的独立路径(读原始记录 + owner 校验 + 解密),不经此投影。
+ */
+export function projectKey(key: SecretKey): Omit<SecretKey, 'hash' | 'secretEnc'> {
+  return omit(omit(key, 'hash'), 'secretEnc')
 }
 
 /** Admin SK 引导输入(Case 1):owner user:admin,全动作 ** scope。 */
@@ -116,7 +122,15 @@ function clampLimit(limit?: number): number {
 }
 
 /** SKRegistry 更新补丁:SecretKeyInput 的部分字段 + 认证层 disabled。 */
-export type SKUpdatePatch = Partial<SecretKeyInput> & { disabled?: boolean }
+/**
+ * patch 语义:字段缺省 = 不改动。
+ * `expiresAt: null` 是唯一的**显式清除**信号(改成永久有效)——`undefined` 不能表达它,
+ * 因为那与"不改动"无法区分。
+ */
+export type SKUpdatePatch = Partial<SecretKeyInput> & {
+  disabled?: boolean
+  expiresAt?: Timestamp | null
+}
 
 /**
  * SKRegistry 存储实现(挂载为 builtin 节点 system/sk,需 admin 动作)。
@@ -131,6 +145,17 @@ export class SKRegistryStore {
     if (typeof hash !== 'string') return null
     const rec = await this.store.get(KEY_SK_HASH + hash)
     return rec ? (rec as SecretKey) : null
+  }
+
+  /**
+   * 取**未投影**的记录本体(含 hash 与 secretEnc)。
+   *
+   * 仅给 `system/my-keys` 自助面用:它要读 `secretEnc` 解密出本人明文,而 `get()` 经
+   * projectKey 已把该字段剥掉。调用方**必须自己校验 `rec.owner === ctx.owner`**——
+   * 本方法不做任何授权判断,拿到的是完整记录。切勿把返回值直接送上网关响应。
+   */
+  async rawById(id: string): Promise<SecretKey | null> {
+    return await this.recordById(id)
   }
 
   async list(opts?: ListOptions): Promise<Page<Omit<SecretKey, 'hash'>>> {
@@ -153,14 +178,24 @@ export class SKRegistryStore {
   }
 
   /** 签发:写入 sk:h 与 sk:i 两条,返回无 hash 的 key + 一次性明文 secret。 */
+  /**
+   * 签发。`encryptSecret` 出现时,用它把明文加密后随记录存下(SecretKey.secretEnc),
+   * 让本人此后能反复取回明文;不传则记录里只有 hash(历史行为,agent/plugin/device 用)。
+   *
+   * 加密由调用方注入而非本类持有:本类只依赖 StateStore,不该被迫知道主密钥。
+   */
   async write(
     input: SecretKeyInput,
     now: Timestamp,
-  ): Promise<{ key: Omit<SecretKey, 'hash'>, secret: string }> {
+    encryptSecret?: (plaintext: string) => Promise<string>,
+  ): Promise<{ key: Omit<SecretKey, 'hash' | 'secretEnc'>, secret: string }> {
     const { key, secret } = await mintKey(input, now)
-    await this.store.put(KEY_SK_HASH + key.hash, key)
-    await this.store.put(KEY_SK_ID + key.id, key.hash)
-    return { key: projectKey(key), secret }
+    const stored: SecretKey = encryptSecret === undefined
+      ? key
+      : { ...key, secretEnc: await encryptSecret(secret) }
+    await this.store.put(KEY_SK_HASH + stored.hash, stored)
+    await this.store.put(KEY_SK_ID + stored.id, stored.hash)
+    return { key: projectKey(stored), secret }
   }
 
   /** 部分更新(patch);hash / id / createdAt 不可变。不存在 → not_found。 */
@@ -172,7 +207,9 @@ export class SKRegistryStore {
     if (patch.description !== undefined) updated.description = patch.description
     if (patch.scopes !== undefined) updated.scopes = patch.scopes
     if (patch.registerPaths !== undefined) updated.registerPaths = patch.registerPaths
-    if (patch.expiresAt !== undefined) updated.expiresAt = normalizeExpiresAt(patch.expiresAt)
+    // null = 显式清除(永久有效);undefined = 不改动。
+    if (patch.expiresAt === null) delete updated.expiresAt
+    else if (patch.expiresAt !== undefined) updated.expiresAt = normalizeExpiresAt(patch.expiresAt)
     if (patch.disabled !== undefined) updated.disabled = patch.disabled
     await this.store.put(KEY_SK_HASH + rec.hash, updated)
     return projectKey(updated)

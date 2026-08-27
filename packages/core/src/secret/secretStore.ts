@@ -152,6 +152,54 @@ export class SecretStoreImpl {
   }
 
   /**
+   * 用同一把主密钥加密任意字符串,返回自包含的 base64url 封装(`<iv>.<ciphertext>`)。
+   *
+   * 给 `secret:<name>` 之外的场景复用主密钥,当前唯一用途是登录用户 SK 的可复制明文
+   * (见 SecretKey.secretEnc):它存在 SK 记录里、不占 secret 命名空间,所以不能走
+   * set/resolve,但必须用同一把密钥、同样的 AES-256-GCM 参数,不另造一套加密。
+   */
+  async encryptString(value: string): Promise<string> {
+    if (this.keyBytes === undefined) {
+      throw new TBError('unavailable', 'secret store unavailable: master key not configured', {
+        retryable: false,
+      })
+    }
+    const iv = crypto.getRandomValues(new Uint8Array(AES_GCM_IV_BYTES))
+    const ciphertext = await crypto.subtle.encrypt(
+      { name: 'AES-GCM', iv },
+      await this.key(),
+      new TextEncoder().encode(value),
+    )
+    return `${base64urlEncode(iv)}.${base64urlEncode(new Uint8Array(ciphertext))}`
+  }
+
+  /**
+   * 解开 {@link encryptString} 的封装。密钥缺失 → unavailable;封装畸形或
+   * GCM 校验失败 → invalid_argument(不区分,避免成为判别 oracle)。
+   */
+  async decryptString(packed: string): Promise<string> {
+    if (this.keyBytes === undefined) {
+      throw new TBError('unavailable', 'secret store unavailable: master key not configured', {
+        retryable: false,
+      })
+    }
+    const at = packed.indexOf('.')
+    if (at <= 0 || at === packed.length - 1) {
+      throw new TBError('invalid_argument', 'malformed encrypted payload')
+    }
+    try {
+      const plaintext = await crypto.subtle.decrypt(
+        { name: 'AES-GCM', iv: base64urlDecode(packed.slice(0, at)) },
+        await this.key(),
+        base64urlDecode(packed.slice(at + 1)),
+      )
+      return new TextDecoder().decode(plaintext)
+    } catch {
+      throw new TBError('invalid_argument', 'malformed encrypted payload')
+    }
+  }
+
+  /**
    * 写入 / 替换 secret;明文仅在此请求中出现。
    * unavailable 态 → 抛 unavailable(retryable:false):主密钥缺失时 Set 不可用。
    */

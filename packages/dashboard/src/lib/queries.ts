@@ -6,6 +6,7 @@ import type {
   ContextEntryMeta,
   CredentialDomainState,
   FederationHost,
+  MyKeyInfo,
   Page,
   PluginManifest,
   RegistryNode,
@@ -25,6 +26,7 @@ import {
   getTree,
   invoke,
   type InvokeResult,
+  isAccessDenied,
   searchTools,
   startOAuthAuthorize,
   uploadContextObject,
@@ -248,6 +250,56 @@ function usePagedBuiltin<T>(key: string, path: string, args: Record<string, unkn
 
 export function useSkList() {
   return usePagedBuiltin<SecretKeyInfo>('sk-list', 'system/sk')
+}
+
+/**
+ * 「我的 key」自助面(`system/my-keys`;所有登录用户都能成功)。
+ *
+ * 不走 usePagedBuiltin:该命令一次返回本人全部 key(服务端已翻完页),没有 cursor。
+ */
+export function useMyKeys() {
+  const conn = useConn()
+  const base = useKeyBase()
+  return useQuery({
+    queryKey: [...base, 'my-keys'],
+    queryFn: async () => {
+      const r = await invoke(conn, 'system/my-keys/list', {})
+      return (r.json as { items?: MyKeyInfo[] }).items ?? []
+    },
+  })
+}
+
+/**
+ * 当前身份是不是 admin —— **靠试探 admin 面,而非读什么身份字段**。
+ *
+ * Dashboard 侧没有 whoami:session 只有 {baseUrl,id,name,sk}。而非 admin 调
+ * `system/sk/list` 会拿到 404(节点读权限门槛连存在性都隐藏)。于是直接把"能不能读
+ * admin 面"当作判据 —— 它恰好就是我们要用它决定渲染什么的那个能力,比任何间接的角色
+ * 标记都准。
+ *
+ * 关键取舍:**权限不足不是错误**。
+ * - `retry: false` —— 预期的拒绝不该重试三次。
+ * - 拒绝时 resolve 成 `false` 而不是 reject,页面据此静默隐藏 admin 区域;
+ *   只有网络 / 5xx 这类真故障才落到 `isError`,那时才该显示报错。
+ */
+export function useIsAdmin() {
+  const conn = useConn()
+  const base = useKeyBase()
+  return useQuery({
+    queryKey: [...base, 'is-admin'],
+    queryFn: async () => {
+      try {
+        await invoke(conn, 'system/sk/list', { opts: { limit: 1 } })
+        return true
+      } catch (error) {
+        if (isAccessDenied(error)) return false
+        throw error
+      }
+    },
+    retry: false,
+    // 同一身份的 admin 与否在会话内不会变;别为每次进页面再探一次。
+    staleTime: 5 * 60 * 1000,
+  })
 }
 
 export function useSecretList() {

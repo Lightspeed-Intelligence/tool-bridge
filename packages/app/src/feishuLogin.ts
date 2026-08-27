@@ -14,15 +14,14 @@
  * state 加密:AES-256-GCM,密钥派生自 TB_SECRET_ENCRYPTION_KEY(域前缀区隔 mcp-oauth)。
  */
 
-import {
-  base64urlDecode,
+import { base64urlDecode,
   base64urlEncode,
   type Scope,
   type SecretKeyInput,
+  type SecretStoreImpl,
   type SKRegistryStore,
   TBError,
-  type Timestamp,
-} from '@tool-bridge/core'
+  type Timestamp } from '@tool-bridge/core'
 
 /** 飞书开放平台 base(私有化部署可 override,当前固定公网)。 */
 export const FEISHU_BASE = 'https://open.feishu.cn'
@@ -68,6 +67,10 @@ export function defaultLoginScopes(): Scope[] {
     // read 看自己已配的域、call 执行 set/list/delete。隔离靠 dispatch 内 ctx.owner 硬圈定,
     // 不波及 system/sk、system/secret 等 admin 面。
     { pattern: 'system/usercred', actions: ['read', 'call'] },
+    // SK 自助面(system/my-keys):本人签发 / 复制 / 撤销自己的 key。
+    // 同样靠 dispatch 内 ctx.owner 硬圈定;签发的 scope 由服务端钉死成本函数的返回值,
+    // 所以它**不是**提权路径 —— 用户拿不到比这里更大的权限。
+    { pattern: 'system/my-keys', actions: ['read', 'call'] },
   ]
 }
 
@@ -414,40 +417,63 @@ export function loginOwner(openId: string): string {
 }
 
 /**
- * rotate 签发:删除同 owner 且由本流程签发(description 带 LOGIN_KEY_TAG)的旧 key,
- * 再签一把新 key。明文 secret 只在返回值里出现一次。
- * @returns { keyId, secret }
+ * 取得登录 key:**已有则复用,没有才签发**,签出来的 key 永久有效。
+ *
+ * 2026-08-26 改:原实现是 rotate(每次登录删旧签新 + 90 天 TTL),导致同一人反复登录
+ * 不断换 key、且旧 key 到期即失效。现在改成:
+ *
+ * - 同 owner 已有本流程签发(description 带 LOGIN_KEY_TAG)且**存了可解密明文**的 key
+ *   → 解出明文直接复用,不签新的、不删旧的。一个账号因此稳定只有一把登录 key。
+ * - 没有(首次登录),或历史 key 只有 hash(旧版签发,明文取不回)
+ *   → 签一把新的:**不设 expiresAt**(永久)、并把明文加密存进记录(SecretKey.secretEnc),
+ *     此后本人可在 Dashboard 反复复制。历史那把不删 —— 它仍然有效,用户手上可能正在用;
+ *     要清理由用户在自助面自己撤销。
+ *
+ * @returns { keyId, secret, reused } reused=true 表示复用了既有 key(未签发新的)
  */
-export async function rotateLoginKey(
+export async function ensureLoginKey(
   sk: SKRegistryStore,
+  secrets: SecretStoreImpl,
   openId: string,
   now: Timestamp,
-  opts?: { scopes?: Scope[], ttlSec?: number },
-): Promise<{ keyId: string, secret: string }> {
+  opts?: { scopes?: Scope[] },
+): Promise<{ keyId: string, reused: boolean, secret: string }> {
   const owner = loginOwner(openId)
-  // 删旧:遍历 list 找同 owner + 本流程标记的 key(key 量小,可接受;无 owner 索引)。
-  // 分页遍历直至游标耗尽。
+
+  // 找同 owner 的本流程 key(key 量小,分页遍历可接受;store 无 owner 索引)。
   let cursor: string | undefined
   do {
     const page = await sk.list(cursor !== undefined ? { limit: 200, cursor } : { limit: 200 })
     for (const k of page.items) {
-      if (k.owner === owner && (k.description ?? '').startsWith(LOGIN_KEY_TAG)) {
-        await sk.delete(k.id)
+      if (k.owner !== owner || !(k.description ?? '').startsWith(LOGIN_KEY_TAG)) continue
+      // 只复用「还有效」且「明文取得回」的:失效的复用了也不能用,
+      // 没 secretEnc 的(旧版签发)解不出明文,只能签新的。
+      if (k.disabled === true) continue
+      if (k.expiresAt !== undefined && Date.parse(k.expiresAt) <= Date.parse(now)) continue
+      const raw = await sk.rawById(k.id)
+      if (raw?.secretEnc === undefined) continue
+      try {
+        return { keyId: k.id, secret: await secrets.decryptString(raw.secretEnc), reused: true }
+      } catch {
+        // 密文解不开(主密钥轮换过等)→ 当作没有,往下签新的。
+        continue
       }
     }
     cursor = page.cursor
   } while (cursor !== undefined)
 
-  const ttlSec = opts?.ttlSec ?? DEFAULT_KEY_TTL_SEC
-  const expiresAt = new Date(Date.parse(now) + ttlSec * 1000).toISOString()
   const input: SecretKeyInput = {
     owner,
     description: `${LOGIN_KEY_TAG} @ ${now}`,
     scopes: opts?.scopes ?? defaultLoginScopes(),
-    expiresAt,
+    // 不设 expiresAt:登录 key 永久有效(用户可在自助面自行撤销)。
   }
-  const { key, secret } = await sk.write(input, now)
-  return { keyId: key.id, secret }
+  const { key, secret } = await sk.write(
+    input,
+    now,
+    async plaintext => await secrets.encryptString(plaintext),
+  )
+  return { keyId: key.id, secret, reused: false }
 }
 
 // ---------- meego 自动绑定(open_id → union_id → user_key) ----------
@@ -669,7 +695,7 @@ pre{padding:.8rem 1rem;overflow-x:auto;user-select:all}.k{font-weight:600}
 <p>命令行接入:</p>
 <pre>tb login --base-url ${baseUrl} --sk ${secret}</pre>
 ${meego}
-<p class="warn">此 Key 可调用 mcp / plugins / skills(读+调用+写),90 天后过期,重新登录即自动换发。</p>
+<p class="warn">此 Key 可调用 mcp / plugins / skills(读+调用+写),长期有效。忘了也不要紧 —— 登录 Dashboard 后可在「Secret Key」页随时复制或撤销。</p>
 </main></body></html>`
   return new Response(body, {
     status: 200,

@@ -20,7 +20,7 @@ const AUTHORIZATION_CODE_PREFIX = 'tbc_'
 const REFRESH_TOKEN_PREFIX = 'tbr_'
 const AUTHORIZATION_CODE_KEY_PREFIX = 'oauth:code:'
 const REFRESH_TOKEN_KEY_PREFIX = 'oauth:refresh:'
-const ACCESS_KEY_DESCRIPTION_PREFIX = 'oauth-access:'
+export const ACCESS_KEY_DESCRIPTION_PREFIX = 'oauth-access:'
 
 const CLIENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{1,63}$/u
 const GRANT_NAME_PATTERN = /^[a-z][a-z0-9_:.]{1,63}$/u
@@ -543,4 +543,39 @@ export function requireOAuthConfiguration(
   if (encryptionKey === undefined || feishuLoginSecretRef === undefined) {
     throw new TBError('unavailable', 'OAuth delegation is not configured', { retryable: false })
   }
+}
+
+/**
+ * 清掉某人授予某 client 的全部 refresh token。
+ *
+ * 给 `system/my-keys` 的自助撤销用:用户在页面撤销一个委托 access key 时,若不同时清掉
+ * refresh token,第三方应用可用它换一把新 access key —— 撤销被绕过。官方 revoke 端点
+ * (revokeDelegatedToken)对单个 token 两者都清;这里按 (clientId, subject) 扫全量清。
+ *
+ * @param description 被撤销 key 的原始 description(`oauth-access:<clientId>`)。
+ */
+export async function revokeDelegationGrantsFor(
+  store: StateStore,
+  owner: string,
+  description: string,
+): Promise<void> {
+  if (!description.startsWith(ACCESS_KEY_DESCRIPTION_PREFIX)) return
+  const clientId = description.slice(ACCESS_KEY_DESCRIPTION_PREFIX.length).trim()
+  if (clientId === '') return
+
+  let cursor: string | undefined
+  do {
+    const page = await store.list(
+      REFRESH_TOKEN_KEY_PREFIX,
+      cursor !== undefined ? { limit: 200, cursor } : { limit: 200 },
+    )
+    for (const item of page.items) {
+      const parsed = RefreshGrantRecordSchema.safeParse(item.value)
+      // subject 即 owner;两者都匹配才删,避免误删他人或其他 client 的授权。
+      if (!parsed.success) continue
+      if (parsed.data.clientId !== clientId || parsed.data.subject !== owner) continue
+      await store.delete(item.key)
+    }
+    cursor = page.cursor
+  } while (cursor !== undefined)
 }

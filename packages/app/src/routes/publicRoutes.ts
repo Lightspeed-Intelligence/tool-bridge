@@ -26,7 +26,7 @@ import type { RouteEnv } from './env'
 import {
   bindMeegoIdentity,
   buildAuthorizeUrl,
-  DEFAULT_KEY_TTL_SEC,
+  ensureLoginKey,
   exchangeUserToken,
   FEISHU_CALLBACK_PATH,
   FEISHU_DASHBOARD_PATH,
@@ -47,7 +47,6 @@ import {
   queryMeegoUserKeyByUnionId,
   renderLoginFailedHtml,
   renderLoginSuccessHtml,
-  rotateLoginKey,
 } from '../feishuLogin'
 import {
   assertRegisteredAuthorizationRequest,
@@ -570,9 +569,8 @@ export function registerPublicRoutes(app: TbHono, env: RouteEnv): void {
       }
       const now = new Date().toISOString()
       const sk = new SKRegistryStore(deps.state)
-      const { keyId, secret } = await rotateLoginKey(sk, openId, now, {
-        ttlSec: deps.feishuLoginKeyTtlSec ?? DEFAULT_KEY_TTL_SEC,
-      })
+      // 已有登录 key 则复用(永久有效),没有才签发 —— 同一账号稳定只有一把。
+      const { keyId, secret } = await ensureLoginKey(sk, deps.secrets, openId, now)
       // meego 自动绑定(best-effort;projectKey 未配则跳过)。
       let meegoNote: string | undefined
       const bindDeps = meegoBindDepsFor(deps)

@@ -41,6 +41,30 @@ export interface SecretKeyInfo {
   scopes: Scope[]
 }
 
+/**
+ * key 的来源(system/my-keys list 的 `origin`)。
+ *
+ * 服务端判定好后结构化给出,前端只做徽标映射 —— 来源本来编码在 description 前缀里,
+ * 但那是存储层细节(常量散落在 core/app),前端解析等于把它变成隐式契约。
+ */
+export type MyKeyOrigin = 'delegation' | 'login' | 'other' | 'self'
+
+/**
+ * system/my-keys list 的一行:本人的 SK。
+ *
+ * 与 admin 面的 {@link SecretKeyInfo} 同一投影(无 hash / 无明文),额外带两个字段:
+ * - `copyable`:只有签发时随记录存了可解密明文的 key 才能再取回明文。历史签发的老 key
+ *   只有 hash,永远取不回 —— 前端据此禁用复制,而不是让用户点了才报错。
+ * - `origin`:key 从哪来(自助签发 / 登录会话 / OAuth 委托)。
+ *
+ * `description` 在这个面上**只含用户自己写的那段**(来源前缀已由服务端剥掉);
+ * 登录会话 key 没有用户描述,故为 undefined。
+ */
+export interface MyKeyInfo extends SecretKeyInfo {
+  copyable: boolean
+  origin: MyKeyOrigin
+}
+
 /** system/federation list 的一行:remote 联邦 host 白名单合并视图。 */
 export interface FederationHost {
   host: string

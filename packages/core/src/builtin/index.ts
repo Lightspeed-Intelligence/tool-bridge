@@ -12,16 +12,17 @@ import type { NodeRegistryStore } from '../tree/registry'
 import type { ScopeChecker } from '../tree/visibility'
 import type { SKRegistryStore } from '../auth/sk'
 import type { BuiltinModule } from './types'
+import { createMyKeysModule, type OriginTags, type RevokeDelegationGrants } from './myKeys'
 import { createUserCredModule, type CredentialDomainInfo } from './usercred'
 import { type CatalogModuleDeps, createCatalogModule } from './catalog'
 import { createPluginModule, type PluginModuleDeps } from './plugin'
 import { createStoreModule, type StoreModuleDeps } from './store'
+import { LIST_LIMIT_MAX, type Scope } from '../types'
 import { createAnnotationModule } from './annotation'
 import { createFederationModule } from './federation'
 import { createRegistryModule } from './registry'
 import { createSecretModule } from './secret'
 import { createStatusModule } from './status'
-import { LIST_LIMIT_MAX } from '../types'
 import { createSkModule } from './sk'
 
 export interface BuiltinDeps {
@@ -45,7 +46,23 @@ export interface BuiltinDeps {
    */
   plugin?: Omit<PluginModuleDeps, 'sk' | 'secrets' | 'now'>
   registry: NodeRegistryStore
+  /**
+   * 自助撤销 OAuth 委托 key 时的连带清理(宿主注入;缺省则只删 SK)。
+   * 不清 refresh token 的话撤销可被 refresh 绕过 —— 见 myKeys.RevokeDelegationGrants。
+   */
+  revokeDelegationGrants?: RevokeDelegationGrants
   secret: SecretStoreImpl
+  /**
+   * my-keys 的来源前缀(宿主注入):登录会话 key 与 OAuth 委托 key 的 description 前缀
+   * 定义在 app 层,core 判定 origin 时需要它们。缺省则这两类都归为 'other'。
+   */
+  selfKeyOriginTags?: OriginTags
+  /**
+   * my-keys 模块装配:登录用户自助签发 SK 时**服务端钉死**的 scope 模板
+   * (宿主传入登录默认那套)。缺省不装配 system/my-keys —— 没有登录体系的宿主
+   * 不该多出一个能签发 key 的面。
+   */
+  selfKeyScopes?: () => Scope[]
   sk: SKRegistryStore
   /** 部署级 default Store；正式宿主应注入，纯 core 旧单测可缺省。 */
   store?: StoreModuleDeps
@@ -116,6 +133,21 @@ export function createBuiltins(deps: BuiltinDeps): Map<string, BuiltinModule> {
   // 个人凭证自助面:复用 secret 存储(SecretStoreImpl),名字空间 usercred:<owner>:<domain>。
   // domains cmd 需发现「哪些节点声明了 credentialDomain」——从 registry 扫描聚合。
   modules.set('usercred', createUserCredModule(deps.secret, now, () => listCredentialDomains(deps.registry)))
+  // SK 自助面:登录用户自己签发 / 复制 / 撤销自己的 key。scope 模板由宿主钉死,
+  // 模块内不接受调用方传 scopes/owner(否则等于让任何登录用户提权)。
+  if (deps.selfKeyScopes !== undefined) {
+    modules.set(
+      'my-keys',
+      createMyKeysModule(
+        deps.sk,
+        deps.secret,
+        now,
+        deps.selfKeyScopes,
+        deps.selfKeyOriginTags ?? {},
+        deps.revokeDelegationGrants,
+      ),
+    )
+  }
   modules.set('registry', createRegistryModule(deps.registry, now, deps.visibility))
   modules.set(
     'status',

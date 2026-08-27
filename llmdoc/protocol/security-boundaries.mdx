@@ -7,6 +7,8 @@ relations:
 code:
   paths:
     - packages/core/src/auth/**
+    - packages/core/src/builtin/myKeys.ts
+    - packages/core/src/builtin/usercred.ts
     - packages/core/src/context/objectProvider.ts
     - packages/core/src/objectStoreService/**
     - packages/sdk/src/device/**
@@ -17,9 +19,22 @@ code:
 
 ## 身份与可见性
 
-- SK 明文只在签发时出现一次,持久层只存 hash;disabled、delete、expiry 都视为失效。三宿主权威状态均为强一致 SQL 后端,吊销即时生效。
+- 鉴权只比对 hash;disabled、delete、expiry 都视为失效。三宿主权威状态均为强一致 SQL 后端,吊销即时生效。
+- SK 明文缺省只在签发时出现一次。**例外**:登录用户的 key 额外存一份主密钥加密的明文
+  (`SecretKey.secretEnc`),让本人能在 Dashboard 反复复制。这是一次显式取舍 —— 代价是
+  `TB_SECRET_ENCRYPTION_KEY` 成为单点(泄漏即所有带该字段的 SK 泄漏)。约束:鉴权路径永不读它;
+  `projectKey` 把它与 hash 一并剥离,故 `system/sk` 等 admin 面读不到他人明文;只有
+  `system/my-keys/reveal` 在 owner 校验通过后解密返回。脚本签发的 key(agent/plugin/device)
+  不传 `storePlaintext`,永远只有 hash。
 - scope 按路径和 action 判断,deny 优先。无权看到的路径返回 404,避免通过 403 枚举树结构。
 - `registerPaths` 限制设备/反向注册位置;异步认证后必须复核 active connection generation,防旧连接越权完成调用。
+- 自助面(`system/my-keys`、`system/usercred`)的隔离**不靠 scope 粒度**,靠 owner 一律取自
+  `ctx.owner`、请求体没有 owner 字段;签发用的 scopes 也由服务端钉死,请求体传入无效。
+  否则放宽 admin 门槛等于让登录用户签发 admin key。操作他人资源一律回 `not_found`
+  (而非 `permission_denied`),避免存在性探测,也避免删他人 key 变成拒绝服务手段。
+- **撤销必须清掉一份授权的全部状态**。OAuth 委托由 access key(SK 记录)与 refresh token
+  (`oauth:refresh:*`)两份状态构成:只删前者,第三方能用 refresh token 换一把新 access key,
+  撤销被绕过。任何新增的撤销入口(如自助撤销)都要与官方 revoke 端点等价地清两者。
 
 ## 凭证
 

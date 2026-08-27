@@ -19,6 +19,8 @@ import {
   TBError,
 } from '@tool-bridge/core'
 import { fetchPluginContract, type PluginBindings, probePlugin } from './providers/pluginClient'
+import { ACCESS_KEY_DESCRIPTION_PREFIX, revokeDelegationGrantsFor } from './oauthDelegation'
+import { defaultLoginScopes, LOGIN_KEY_TAG } from './feishuLogin'
 
 interface BootstrapEnv {
   TB_BOOTSTRAP_ADMIN_SK?: string
@@ -48,19 +50,21 @@ const BUILTIN_MODULES = [
   'annotation',
   'store',
   'usercred',
+  'my-keys',
 ] as const
 
 const BUILTIN_DESCRIPTIONS: Record<string, string> = {
-  sk: 'SecretKey registry',
-  secret: 'Upstream credential store',
-  registry: 'Node registry',
-  status: 'Gateway health and summary',
-  plugin: 'Plugin registry (external plugins)',
-  catalog: 'Built-in integration catalog (read-only)',
-  federation: 'Remote federation host allowlist',
-  annotation: 'Admin notes shown in ~help of any path',
-  store: 'Deployment-level private object Store',
-  usercred: 'Your personal upstream credentials (per-user, write-only)',
+  'sk': 'SecretKey registry',
+  'secret': 'Upstream credential store',
+  'registry': 'Node registry',
+  'status': 'Gateway health and summary',
+  'plugin': 'Plugin registry (external plugins)',
+  'catalog': 'Built-in integration catalog (read-only)',
+  'federation': 'Remote federation host allowlist',
+  'annotation': 'Admin notes shown in ~help of any path',
+  'store': 'Deployment-level private object Store',
+  'usercred': 'Your personal upstream credentials (per-user, write-only)',
+  'my-keys': 'Your own secret keys (issue / copy / revoke, standard login permissions)',
 }
 
 let bootstrapOnce: Promise<void> | undefined
@@ -212,6 +216,18 @@ export function buildDeps(opts: BuiltinAssemblyOpts): BuiltinDeps {
     secret: opts.secrets,
     registry: new NodeRegistryStore(opts.store),
     version: () => opts.version,
+    // my-keys 自助面:签发权限恒等于登录默认那套 —— 单一真源就是登录用的
+    // defaultLoginScopes(),避免两处各写一份 scope 而漂移。
+    selfKeyScopes: defaultLoginScopes,
+    // 来源前缀在本层(app),注入给 core 判定 origin —— 前端因此拿到结构化 origin,
+    // 不必去 split description(那会把这些常量变成隐式跨层契约)。
+    selfKeyOriginTags: {
+      loginPrefix: LOGIN_KEY_TAG,
+      delegationPrefix: ACCESS_KEY_DESCRIPTION_PREFIX,
+    },
+    // 自助撤销委托 key 时连带清 refresh token(否则第三方可用它换新 key 绕过撤销)。
+    revokeDelegationGrants: async (owner, description) =>
+      await revokeDelegationGrantsFor(opts.store, owner, description),
     // registry 管理通道也走可见性裁剪(list 裁剪 / get→not_found)。
     visibility: checkScopes,
     // plugin 模块:探活/契约抓取的 I/O 回调在此注入,core 保持无 I/O。
