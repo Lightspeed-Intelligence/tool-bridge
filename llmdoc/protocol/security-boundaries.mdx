@@ -1,0 +1,90 @@
+---
+description: 认证可见性、凭证分槽、出站边界与日志脱敏的安全不变量,以及安全评审的 fail-closed 规则。
+kind: architecture
+relations:
+  requires:
+    - protocol/htbp-contract.mdx
+code:
+  paths:
+    - packages/core/src/auth/**
+    - packages/core/src/context/objectProvider.ts
+    - packages/core/src/objectStoreService/**
+    - packages/sdk/src/device/**
+    - packages/plugin-sdk/**
+---
+
+# 安全边界
+
+## 身份与可见性
+
+- SK 明文只在签发时出现一次,持久层只存 hash;disabled、delete、expiry 都视为失效。三宿主权威状态均为强一致 SQL 后端,吊销即时生效。
+- scope 按路径和 action 判断,deny 优先。无权看到的路径返回 404,避免通过 403 枚举树结构。
+- `registerPaths` 限制设备/反向注册位置;异步认证后必须复核 active connection generation,防旧连接越权完成调用。
+
+## 凭证
+
+- 上游密钥只进入 SecretStore；节点记录只含 `authRef` / `skRef` / `oauthClient.clientSecretRef` 等引用。
+  `providerConfig` 与 `oauthClient.clientId` 是可回显配置，不得存密钥；MCP OAuth 不得用 bearer `authRef`
+  承载 client secret，也不得接受 inline `clientSecret`。
+- MCP OAuth 的预注册 client 配置、DCR client 记录、access/refresh grant 分槽处理：预注册 confidential client 每次
+  token 兑换/refresh 都从 SecretStore 解析 secret，public client 无 secret 且必须走 S256 PKCE；静态 client
+  information 不写 OAuth StateStore。grant 绑定 authorization-server issuer、client id 与实际 redirect URI，任一变化
+  都使旧 grant 失效；旧 DCR grant 只有在已存 DCR client 的唯一 redirect URI 可证明时才补 binding。
+- 节点写入口对嵌套 `oauthClient.clientSecretRef` 执行与其它 secret ref 相同的 `system/secret admin` 使用授权，再验证
+  引用可解析；顺序不能反，避免 SecretStore existence oracle。挂载、授权和调用各自验证所需状态。
+- 首次 bootstrap 默认要求部署者提供 Admin SK。Workers 和 SDK fail closed;Node 仅保留显式 `TB_ALLOW_INSECURE_BOOTSTRAP=true` 的本地开发逃生口。
+- Linux structured command 的 child 缺省只继承基础环境白名单;显式 `inheritEnv` 只是按名称复制本机 daemon 环境,不是 SecretStore 引用解析,也不提供输出 secret redaction、执行后清零或到期保证。不得把 token/云凭证列入 profile 环境策略,也不得把 fixed executable/argv 当作 secret 通道。
+
+## 出站
+
+- remote、HTTP、MCP、plugin provider 都经过各自的 URL/host/环检测边界。generic remote 接受可选
+  AbortSignal 与流式 response byte cap；federated search 及其 nested full-help hydration 都下发逐跳递减的
+  remaining-time budget，并把 child body 限在部署上限内。
+- 调用者 SK 不透传上游;只从 `authRef` 解析目标凭证。
+- 内置 plugin 同进程同权,env 白名单和 `guardedFetch` 是代码强制边界。
+- 跨源 redirect 不能携带 Authorization、自定义敏感头或 secret body；MCP OAuth token form 请求禁止自动 redirect，
+  避免 authorization code、PKCE verifier、refresh token 或 confidential client secret 被 307/308 重放到新 origin。
+- generic remote transport 对所有 30x 使用 `redirect:'error'`，不依赖 runtime 的跨源 header stripping，也不允许 same-origin 自动跟随。管理员必须把 `baseUrl` 配成最终 URL。
+- remote `~help/~tree` 成功体是不可信协议数据：先过 strict wire 与 canonical path projector，拒绝编码分隔符、控制字符、过编码、root mismatch、非 direct child 与跨 node command；localized tree 后代重新执行外层 read/call 授权。
+
+## 搜索
+
+- SearchIndex 是可重建召回投影，不是权限真源；每个 hit 都从 canonical state hydrate，并重做 read+call、virtualize 与 effect。compact 只减少上下文，不减少授权检查。
+- effect filter 只消费结构化 canonical effect，不从 prose 猜安全语义；SQL filter 后仍在 hydration 复核，防同步竞态。
+- local cursor v2 虽加密认证并绑定 query/revision/ranking/options，仍不是授权凭据；每页重新鉴权。
+- federated cursor 是固定尺寸随机 opaque handle，StateStore key 只存其 SHA-256。session record 绑定
+  caller key/scopes digest、request、ranking 和每 hop topology，不保存 Authorization、SK 明文、baseUrl 或
+  完整 schema；结构 parser 拒绝 credential/schema 字段。immutable generation 由 CAS 和原子 quota 约束，
+  continuation 每次递归验证 child snapshot，并重新执行当前权限、secret、allowlist 与 canonical hydration。
+- remote 只有声明且当次能解析 `skRef` 才参与联邦。未声明为 `unsupported`，声明但 secret 缺失为
+  `unavailable`，两者均不出站；不可用 remote 不占有限 source slot。终端 caller SK 永不跨 gateway。
+
+## 存储与日志
+
+- 派生投影(presence、缓存、搜索索引)的 TTL/降级防御、DO hibernation 恢复和 stale generation guard 属于安全下界,不是可删的历史兼容。
+- 日志、错误、调用历史、URL、CLI argv 与一次性验证输出都不得回显 secret、Admin SK、OAuth token 或含敏感 args 的 payload。
+- Presigned GET/PUT URL 本身是 bearer secret：客户端错误不得回显 fetch 原始 URL 或对象存储响应体，成功结果只持久化稳定 `node://` URI。写 grant 缺省把 `If-None-Match: *` 纳入签名以阻止静默覆盖，只有显式 `overwrite` 才扩大到可替换对象。
+- Store 的 `store://default/...` 同样只是稳定身份，不是 capability；读取仍需 owner `read` 或短期 share。
+  call/upload capability 只进 `x-tb-store-capability` / `x-tb-store-upload` header，相关 body 字段拒绝；
+  `~store/refs|shares/<token>` path、presigned URL、headers 与 token 必须在日志/错误/历史中脱敏。无效 bearer、
+  跨 owner 和非 ready 对象统一 not_found，避免对象 oracle。
+- Store direct 不是普通 presign 的性能开关：只有请求声明精确 size 且 driver 的 `presignPutExact` 把
+  `Content-Length`、`Content-Type` 与 create-only 条件纳入签名时才允许绕过网关；未知 size、旧
+  `presignPut` 或 signer 失败必须退回受流式硬限额保护的 relay，complete/HEAD 仍做最终校验。
+- Store HMAC key 优先从部署信任根经版本化域分离派生，不把派生 key 写入 StateStore；权威 session/share/
+  call capability 只存 token hash。设备 wire 上的 call token 由 SDK 内部消费，handler 的安全 context
+  不暴露原始 bearer；客户端限额只做早拒，服务端 reservation/CAS 才是权威。
+- Context 与 Store 即使复用同一 ObjectStore 也属于不同授权域：`__tool_bridge_internal__/store/v1` 是
+  强制保留根，重叠的非空
+  Context prefix 挂载时 fail closed；空 prefix 挂载必须过滤/隐藏 Store read/list/search，并拒绝
+  write/update/delete/create_upload。旧 `store/v1` 不是授权边界，已有同名 Context prefix 继续可用。
+  Store cleanup 只相信权威 metadata，不把未知 driver key 猜作 orphan。
+- relay filename 不参与 key，本地 driver 还要用根内检查、no-follow 与原子 no-replace 做第二层路径
+  防护。终态对象在 driver DELETE 成功后先 CAS 记录 `bytesDeletedAt`，安全保留窗口后再删除 metadata，
+  避免重复外部删除和无界 tombstone 增长。
+- 配置仓库只保留账户中立模板;Cloudflare account、域名、资源 ID 与登录态在本地 provision 或平台侧管理。
+
+## 评审规则
+
+- 安全字段同时做客户端快速反馈与服务端权威校验;历史脏值无法证明安全时 fail closed。
+- 删兼容代码时只删项目内部旧预览形状,不删 MCP 世代互操作、Help DSL 未知项忽略、S3-compatible 能力或真实上游差异。

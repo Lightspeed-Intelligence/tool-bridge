@@ -8,11 +8,12 @@ The button copies this template into a new repo in your GitHub account, provisio
 
 | Resource | Binding | Purpose |
 |---|---|---|
-| Workers KV | `TB_KV` | node tree config, SecretKey hashes, plugin manifests |
+| D1 database | `TB_STATE` | authoritative state: node tree config, SecretKey hashes, encrypted secrets, plugin manifests |
+| D1 database (same DB) | `TB_SEARCH` | global tool-search index (`~search`) |
 | R2 bucket | `TB_R2` | context objects, large `$ref` payloads |
 | Durable Object | `TB_DEVICE` | one `DeviceSession` per connected device (WebSocket hibernation) |
 
-The Worker itself is a thin shell over the published [`@tool-bridge/gateway`](https://www.npmjs.com/package/@tool-bridge/gateway) package; the dashboard UI ships prebuilt in [`@tool-bridge/dashboard`](https://www.npmjs.com/package/@tool-bridge/dashboard).
+The Worker itself is a thin shell over the published [`@tool-bridge/gateway`](https://www.npmjs.com/package/@tool-bridge/gateway) package — it imports the `@tool-bridge/gateway/full` entry, which ships the **same fully-assembled gateway as a source deploy** (built-in integration catalog included); the dashboard UI ships prebuilt in [`@tool-bridge/dashboard`](https://www.npmjs.com/package/@tool-bridge/dashboard).
 
 ## Before deploying: create the two trust-root secrets
 
@@ -31,7 +32,8 @@ Paste the first value into `TB_BOOTSTRAP_ADMIN_SK` and the second into `TB_SECRE
 ## After deploying
 
 1. Copy the generated `*.workers.dev` URL from the deployment result.
-2. Verify with the Admin SK you saved:
+2. In Cloudflare Dashboard, open `D1 → tool-bridge-db → Settings` and enable **Read Replication**. The gateway already uses request-scoped D1 Sessions; replicas are only used after this database setting is enabled.
+3. Verify with the Admin SK you saved:
 
 ```sh
 curl https://<your-worker>.workers.dev/healthz
@@ -39,16 +41,31 @@ curl -H "Authorization: Bearer <your-admin-sk>" \
   https://<your-worker>.workers.dev/~help
 ```
 
+Authenticated responses include `Server-Timing: tb-d1;dur=..., tb-worker;dur=...`. Requests taking at least 500ms emit a structured `tool_bridge_slow_request` warning in Workers Logs with D1 wall/SQL time and primary/replica regions, but never SQL, keys, credentials, or response data. Smart Placement is enabled for API latency; because `/ui` currently runs Worker-first, this may trade a little static-asset TTFB for fewer cross-region D1 round trips.
+
 The dashboard lives at `https://<your-worker>.workers.dev/ui`. You can also save the target locally with `tb login --base-url https://<your-worker>.workers.dev --profile default`; enter the Admin SK at the prompt so it does not appear in shell history.
 
 ## Optional configuration
 
-- **Presigned R2 links** — without them, large payload `$ref` URLs are proxied through the Worker (`/~ref`), which just works. To hand out direct presigned R2 URLs instead, add to `wrangler.jsonc` `vars`:
+- **Presigned R2 downloads and uploads** — the default Store is always available: without signing credentials it relays uploads through the Worker (with a conservative 90 MiB request limit). Context `$ref` downloads are likewise proxied through `~ref`, while Context `create_upload` is not advertised. Configure signing credentials to enable direct Store uploads above the relay limit plus direct Context downloads and path-scoped Context PUT uploads. Store owner/share reads remain revocable gateway refs. Add to `wrangler.jsonc` `vars`:
 
   - `TB_R2_S3_ENDPOINT`: `https://<your-account-id>.r2.cloudflarestorage.com`
   - `TB_R2_BUCKET`: `tool-bridge`
+  - `TB_UPLOAD_GRANT_TTL_SEC`: optional upload-grant lifetime in seconds (default `min(TB_REF_TTL_SEC, 900)`, maximum `604800`)
 
   and store an R2 API token via the gateway's secret registry under the reserved name `r2-presign` (or set `TB_R2_ACCESS_KEY_ID` / `TB_R2_SECRET_ACCESS_KEY` secrets).
+
+  Dashboard uploads also require an R2 bucket CORS policy. Restrict `AllowedOrigins` to the exact Dashboard origin, allow `PUT` with the signed `Content-Type` and `If-None-Match` headers, and expose `ETag` if the UI should display it:
+
+  ```json
+  [{
+    "AllowedOrigins": ["https://<your-worker>.workers.dev"],
+    "AllowedMethods": ["PUT"],
+    "AllowedHeaders": ["Content-Type", "If-None-Match"],
+    "ExposeHeaders": ["ETag"],
+    "MaxAgeSeconds": 3600
+  }]
+  ```
 - **Custom domains** — add a [`routes`](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/) entry to `wrangler.jsonc`, set `TB_CANONICAL_ORIGIN` to the one canonical `https://...` origin used for OAuth callbacks, and keep Preview URLs disabled.
 - **Remote gateway federation** — set `TB_REMOTE_ALLOWLIST` (comma-separated host suffixes) to allow proxying to other tool-bridge instances.
 

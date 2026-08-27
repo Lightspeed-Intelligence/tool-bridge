@@ -1,14 +1,16 @@
 /**
  * 宿主注入面与请求期公共类型。
  *
- * 这里只放形状:五个注入点(state / objects / secrets / device / search)、进程内
- * Provider 钩子与解析后的部署配置。行为实现分散在 paths/federation/deviceNodes/
- * toolNodes/contextNodes/helpModel 与 routes/*,装配在 tbApp.ts。
+ * 这里只放形状:五个数据/设备注入点(state / objects / secrets / device / search)、
+ * Provider OAuth 安全出站通道、进程内 Provider 钩子与解析后的部署配置。行为实现
+ * 分散在 paths/federation/deviceNodes/toolNodes/contextNodes/helpModel 与 routes/*,
+ * 装配在 tbApp.ts。
  */
 import type {
   BuiltinCatalog,
   CallContext,
   ContextProvider,
+  DeviceCallContext,
   ObjectStore,
   SearchIndex,
   SecretStoreImpl,
@@ -24,9 +26,11 @@ import type { RemoteSettings } from './providers/remote'
 /** 帧协议 call 转发的入参(id 由调用点生成,幂等键)。 */
 export interface DeviceInvokeRequest {
   arguments: Record<string, unknown>
+  /** 网关鉴权后的调用方来源与权威期限;缺省则不写入 call 帧。 */
+  context?: DeviceCallContext
   id: string
+  /** 相对 mountPath 且含命令叶子段,如 "shell/exec"、"fs/get"。 */
   path: string
-  tool: string
 }
 
 /** 设备通道宿主(CF = DeviceSession DO / Docker = ws)。 */
@@ -46,7 +50,17 @@ export interface LocalProviderHooks {
 }
 
 /**
- * tb app 的宿主注入面(五注入点 + 解析后的部署配置)。
+ * 就绪探测报告(GET /readyz 的响应体)。checks 逐后端给出连通结果;
+ * ready=false → 503,编排器(k8s readiness / LB)据此摘除流量。
+ * detail 只放短语级原因(如 "timeout after 1000ms"),不放凭证或拓扑细节。
+ */
+export interface ReadinessReport {
+  checks: Record<string, { detail?: string, ok: boolean }>
+  ready: boolean
+}
+
+/**
+ * tb app 的宿主注入面(数据/设备五注入点 + 安全出站通道 + 解析后的部署配置)。
  * 核心业务逻辑零分叉:Workers 适配层(app.ts)与 SDK(packages/sdk)都注入此形状。
  */
 export interface TbAppDeps {
@@ -106,6 +120,18 @@ export interface TbAppDeps {
    * 那个插件解析不出 export;反之则解析得出但调不动(unavailable)。宿主该两者同源装配。
    */
   pluginCatalog?: BuiltinCatalog
+  /**
+   * Provider OAuth 令牌端点的宿主出站通道。必须由宿主显式注入；缺省时 OAuth
+   * 发起、回调兑换与 access-token 解析全部 fail closed，绝不回退到全局 fetch。
+   * 标准宿主注入逐跳校验且拒绝跨源 body 重定向的 guarded fetch。
+   */
+  providerOAuthFetch?: typeof fetch
+  /**
+   * 后端连通性探测(GET /readyz;k8s readiness)。宿主注入闭包,自行探测其长连接
+   * 后端(PG 池 / Redis)并叠加 draining 状态。缺省 → /readyz 恒 200:请求期绑定
+   * 宿主(Workers 的 KV/D1/R2)无"断连"态,嵌入宿主自理。
+   */
+  readiness?: () => Promise<ReadinessReport>
   /** context Get 的 $ref 内联阈值(字节,缺省 1 MiB)。 */
   refThresholdBytes?: number
   /** $ref URL(presign 与 /~ref 中转)有效期秒(缺省 900)。 */
@@ -118,8 +144,30 @@ export interface TbAppDeps {
   search?: SearchIndex
   secrets: SecretStoreImpl
   state: StateStore
+  /** call capability 允许的 MIME pattern；缺省 `*\/*`。 */
+  storeCallAllowedContentTypes?: string[]
+  /** 单次 device call 的聚合上传字节预算。 */
+  storeCallMaxBytes?: number
+  /** 单次 device call 的单对象字节预算。 */
+  storeCallMaxObjectBytes?: number
+  /** 单次 device call 最多创建的 Store 对象数。 */
+  storeCallMaxObjects?: number
+  /** default Store 的单对象部署级上限。 */
+  storeMaxObjectBytes?: number
+  /** owner read `$ref` 有效期秒；缺省 refTtlSec 或 900。 */
+  storeReadTtlSec?: number
+  /** relay transport 的有效 request-body 上限；direct 不受此值收紧。 */
+  storeRelayMaxBytes?: number
+  /** 短期 share 的缺省有效期秒。 */
+  storeShareTtlSec?: number
+  /** Store capability HMAC secret；缺省由 StateStore 原子生成并持久化。 */
+  storeTokenSecret?: string
+  /** Store upload session 有效期秒。 */
+  storeUploadTtlSec?: number
   /** mcp/tool 工具缓存 TTL 秒(缺省 300)。 */
   toolCacheTtlSec?: number
+  /** create_upload 写入 grant 有效期秒；缺省 min(refTtlSec, 900)。 */
+  uploadGrantTtlSec?: number
   /** healthz 与 system/status 回显的版本号(单一真源:宿主 package.json)。 */
   version: string
 }

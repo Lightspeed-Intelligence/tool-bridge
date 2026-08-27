@@ -78,7 +78,7 @@ npm install -g @tool-bridge/cli
 tb login --base-url http://127.0.0.1:8787   # enter the saved Admin SK when prompted
 tb tree --depth 2                           # browse the current identity's visible tree
 tb help system/status                      # read the node's live contract
-tb call system/status --tool get           # invoke its get command
+tb call system/status/get                  # invoke its get command
 ```
 
 The deployment includes the Dashboard at [http://127.0.0.1:8787/ui](http://127.0.0.1:8787/ui). It uses the same public API, and the SK stays in local browser storage.
@@ -92,8 +92,8 @@ curl -H "Authorization: Bearer $TB_ADMIN_SK" \
 curl -X POST \
   -H "Authorization: Bearer $TB_ADMIN_SK" \
   -H "Content-Type: application/json" \
-  -d '{"tool":"get","arguments":{}}' \
-  http://127.0.0.1:8787/system/status
+  -d '{}' \
+  http://127.0.0.1:8787/system/status/get
 ```
 
 `~help` returns Markdown by default. Send `Accept: text/plain` for the compact Help DSL, or `Accept: application/json` for a structured representation with JSON Schema.
@@ -125,11 +125,31 @@ The skill verifies the target, searches or browses progressively, reads the tool
 | Use case | Current entry point | Typical purpose |
 |---|---|---|
 | Connect existing tools | MCP, declarative HTTP, built-in integrations, external plugins | Give agents one discovery and invocation surface |
+| Store device artifacts and attachments | Deployment default Store, SDK, CLI, Dashboard | Upload photos, video, or audio, keep a stable URI, and create short-lived shares |
 | Manage context and skills | R2, S3, Node file object storage, plugin contexts, Skillhub | Read, write, and search documents and objects; publish and fetch Agent Skills |
 | Connect local machines | `tb connect`, SDK `connect()` | Dial out from a private network and expose allowlisted shell, files, or local functions |
 | Share usage experience | Per-path `~feedback`, CLI, Dashboard | Show later agents verified pitfalls and recommendations before they call a tool |
 | Federate teams | Remote nodes, `system/federation` | Mount another HTBP tree without sharing the local caller's credentials |
 | Support MCP clients | `/<base>/~mcp` | Project the current identity's visible tools as an MCP server |
+
+### Upload device artifacts and ordinary attachments
+
+Every standard deployment includes a default Store that is independent from Context. Node/Docker stores
+it on the `/data` volume, while Cloudflare uses the R2 bucket created during deployment. A device does not
+need a Context mount before uploading a photo, video, or recording:
+
+```sh
+tb store upload ./capture.jpg --json
+tb store ls
+tb store stat store://default/<objectId>
+tb store get store://default/<objectId> --out ./capture.jpg
+tb store share store://default/<objectId> --ttl 3600 --json
+tb store revoke-share <shareId>
+```
+
+The stable `store://default/...` identifier grants no read access by itself. The `$ref` returned by `share`
+is a short-lived bearer shown only on that successful command's stdout/JSON; do not log it. Context upload
+remains the authoring path for a named binary entry in a semantic Context, which is a separate use case.
 
 ### Connect tools and context
 
@@ -144,7 +164,7 @@ tb tool mount tools/docs \
   --url https://mcp.example.com/mcp
 
 tb help tools/docs
-tb call tools/docs --tool search --args '{"query":"tool-bridge"}'
+tb call tools/docs/search --args '{"query":"tool-bridge"}'
 ```
 
 An S3-compatible object store can be mounted as a Context namespace. Credentials are written only to the SecretStore; node records keep the reference name:
@@ -221,11 +241,15 @@ Federation fails closed by default: an empty host allowlist permits no remote, H
 
 ## Deploy or embed
 
-| Shape | State and objects | Best fit |
-|---|---|---|
-| **Node / Docker** | SQLite + local filesystem; one container and one `/data` volume | Self-hosting, private networks, quick local evaluation |
-| **Cloudflare Workers** | KV + R2 + D1 + Durable Objects | Edge deployment, low operations, long-lived device connections |
-| **Embedded SDK** | Caller-injected stores and providers | Register local functions inside your own Node/Workers application |
+| Shape | State / objects / devices | Replicas | Best fit |
+|---|---|---|---|
+| **Docker (single container)** | SQLite + local filesystem + in-process WebSocket | 1 | Self-hosting, private networks, quick evaluation |
+| **Docker Compose** | PostgreSQL (+ optional S3/R2, Redis) | 1–2 (one machine) | Single-machine production, incl. an HA reference stack — see [`deploy/compose/`](deploy/compose/docker-compose.yml) |
+| **Kubernetes (Helm)** | PostgreSQL + S3/R2 + Redis → stateless multi-replica; or SQLite + PVC single replica | 1–N | Multi-replica production with rolling updates — see [`deploy/helm/tool-bridge/`](deploy/helm/tool-bridge) |
+| **Cloudflare Workers** | D1 + R2 + Durable Objects | serverless | Edge deployment, low operations, long-lived device connections |
+| **Embedded SDK** | Caller-injected stores and providers | — | Register local functions inside your own Node/Workers application |
+
+Horizontal scaling formula for the Node host: **PostgreSQL (`TB_DATABASE_URL`) + S3/R2 (`TB_OBJECT_STORE_*`) + Redis (`TB_REDIS_URL`) together make it a stateless multi-replica deployment**; with only the first two it is a single-replica stateless shape (containers can be recreated freely, but do not scale out). The Helm chart rejects dangerous combinations (such as `replicas>1 + SQLite`) at render time. Health probes: `/livez` (liveness), `/readyz` (readiness: backend connectivity plus early traffic removal during graceful shutdown), `/healthz` (version and catalog digest).
 
 ### Cloudflare Workers
 
@@ -242,7 +266,9 @@ npm install -g @tool-bridge/cli
 tb init cloudflare --repo .
 ```
 
-The wizard logs into and selects an account, generates trust roots, provisions KV/R2/D1, builds and deploys, verifies `~help`, and saves a local profile. Use `--account-id <id> --yes` in non-interactive environments and `--domain tb.example.com` for a custom domain.
+The wizard logs into and selects an account, generates trust roots, provisions R2/D1, builds and deploys, verifies `~help`, and saves a local profile. Use `--account-id <id> --yes` in non-interactive environments and `--domain tb.example.com` for a custom domain.
+
+After deployment, enable **Read Replication** under `D1 → <database> → Settings` in the Cloudflare Dashboard. The gateway already uses request-scoped D1 Sessions (State and Search start on primary; later reads may use replicas that satisfy the session bookmark) and enables Smart Placement by default. Without database replication the behavior remains correct, but queries still run on primary. Use the response `Server-Timing` header and `tool_bridge_slow_request` Workers Logs events to separate D1 network wait, SQL execution, and application/upstream time.
 
 ### Embed in your own application
 
@@ -251,16 +277,18 @@ npm install @tool-bridge/sdk
 ```
 
 ```ts
-import { createToolBridge, MemoryStateStore } from '@tool-bridge/sdk'
+import { createToolBridge, MemoryObjectStore, MemoryStateStore } from '@tool-bridge/sdk'
 
 const tb = createToolBridge({
   state: new MemoryStateStore(),
+  // Store is required. Memory is only for examples/tests; use persistent FS, R2, or S3 in production.
+  objects: new MemoryObjectStore(),
   adminSk: process.env.TB_BOOTSTRAP_ADMIN_SK!,
 })
 
 tb.registerTool('tools/echo', {
-  List: () => [{ name: 'echo', description: 'Return the input text' }],
-  Call: (_name, args) => ({ content: { echoed: args.text } }),
+  list: () => [{ name: 'echo', description: 'Return the input text' }],
+  call: (_name, args) => ({ content: { echoed: args.text } }),
 })
 
 export default { fetch: tb.fetch }
@@ -274,7 +302,7 @@ See [`packages/sdk/README.md`](packages/sdk/README.md) for a Node HTTP server, r
 - Invisible paths return 404 from `~help`, `~tree`, and invocation, avoiding existence leaks.
 - Upstream credentials enter the write-only SecretStore. Node config, logs, and read-only management responses do not reveal secret values.
 - Built-in plugins share the gateway's process privileges and use controlled outbound access. External plugins are descriptor- and health-checked during registration.
-- Workers KV has eventual-consistency windows for revocation and registry reads. Prefer the Node/SQLite host when state must be strongly consistent.
+- Authoritative state is strongly consistent on every host (Workers = D1, Node = SQLite/PG); SK revocation takes effect immediately.
 
 Example: issue a least-privilege SK.
 
@@ -292,7 +320,7 @@ tb sk create \
 | `packages/core` | Pure tree, auth, protocol, store, and builtin logic |
 | `packages/app` | Host-neutral Hono application and provider orchestration |
 | `packages/server` | Node/SQLite/filesystem/WebSocket host |
-| `packages/gateway` | Cloudflare KV/R2/D1/DO/Assets host |
+| `packages/gateway` | Cloudflare D1/R2/DO/Assets host |
 | `packages/cli` | `tb` CLI, device connection, and Cloudflare initialization |
 | `packages/dashboard` | Web management UI over the public API |
 | `packages/sdk` | Embedded instance, local providers, and reverse connection |

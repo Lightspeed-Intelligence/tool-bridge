@@ -15,6 +15,11 @@ import {
   type TBErrorBody,
   type TreeNode,
 } from '@tool-bridge/core'
+import {
+  healthResponseSchema,
+  livenessResponseSchema,
+  readinessResponseSchema,
+} from '@tool-bridge/core/protocol'
 import { generateCookie, getCookie } from 'hono/cookie'
 import type { AppContext, TbAppDeps, TbHono } from '../deps'
 import type { RouteEnv } from './env'
@@ -91,7 +96,7 @@ async function finishToolAuthorization(opts: {
       codeVerifier: opts.verifier,
       config: exported.oauth,
       encryptionKey: opts.encryptionKey,
-      fetcher: fetch,
+      fetcher: opts.deps.providerOAuthFetch,
       nodePath: opts.node.path,
       now: new Date(),
       origin: opts.origin,
@@ -202,13 +207,34 @@ export function registerPublicRoutes(app: TbHono, env: RouteEnv): void {
   app.get('/healthz', async (c) => {
     const catalog = deps.pluginCatalog
     const digest = await env.pluginCatalogDigest()
-    return c.json({
+    return c.json(healthResponseSchema.parse({
       healthy: true,
       version: deps.version,
       ...(catalog !== undefined && digest !== undefined
         ? { catalog: { count: Object.keys(catalog).length, digest } }
         : {}),
-    })
+    }))
+  })
+
+  // GET /livez → 恒 200(进程活着即可;k8s liveness 的惯用名)。后端断连不算"死",
+  // 那是 /readyz 的职责——liveness 探后端会让编排器在 PG 抖动时错杀健康进程。
+  app.get('/livez', c => c.json(livenessResponseSchema.parse({ live: true })))
+
+  // GET /readyz → 就绪探测,树外免认证(编排器无 SK)。宿主注入的 readiness 闭包探测
+  // 长连接后端并叠加 draining;未注入(Workers/嵌入宿主)恒 200。ready=false → 503,
+  // k8s/LB 据此摘流量。报告只含布尔与短语级 detail,不含凭证。
+  app.get('/readyz', async (c) => {
+    const probe = deps.readiness
+    if (probe === undefined) {
+      return c.json(readinessResponseSchema.parse({ checks: {}, ready: true }))
+    }
+    try {
+      const report = readinessResponseSchema.parse(await probe())
+      return c.json(report, report.ready ? 200 : 503)
+    } catch {
+      // 探测器本身抛错 = 未就绪;不泄漏内部错误细节。
+      return c.json(readinessResponseSchema.parse({ checks: {}, ready: false }), 503)
+    }
   })
 
   // GET /~ref/<token> → 大对象中转下载,树外免认证(中转下载路由)。
@@ -260,12 +286,19 @@ export function registerPublicRoutes(app: TbHono, env: RouteEnv): void {
       return tbErrorResponse(TBError.notFound('dashboard assets not deployed'))
     }
     const url = new URL(c.req.url)
+    // 内容协商与条件请求交给 assets 实现(Node 侧做压缩/304,CF 侧平台代劳):
+    // 只透传这两个安全的读侧头,不带 SK/cookie 等(/ui 免认证,静态资源无机密)。
+    const fwd = new Headers()
+    const ae = c.req.header('accept-encoding')
+    if (ae) fwd.set('accept-encoding', ae)
+    const inm = c.req.header('if-none-match')
+    if (inm) fwd.set('if-none-match', inm)
     // 构建产物是站点根布局(index.html + assets/*),/ui 挂载前缀在此剥离。
     const sub = url.pathname.slice('/ui'.length) || '/'
-    const res = await assets(new Request(new URL(sub, url.origin)))
+    const res = await assets(new Request(new URL(sub, url.origin), { headers: fwd }))
     if (res.status !== 404) return res
     // SPA 回退(仅 /ui 内):深链交给前端路由,由 '/' 取回 index.html。
-    return await assets(new Request(new URL('/', url.origin)))
+    return await assets(new Request(new URL('/', url.origin), { headers: fwd }))
   }
   app.get('/ui', c => c.redirect('/ui/', 302))
   app.get('/ui/*', serveUi)
@@ -320,15 +353,33 @@ export function registerPublicRoutes(app: TbHono, env: RouteEnv): void {
       if (node.kind !== 'mcp' || node.config?.kind !== 'mcp' || node.config.auth !== 'oauth') {
         return renderOAuthCallbackHtml(false, 'target node is not an OAuth-backed mount')
       }
+      const currentClient = node.config.oauthClient
+      if (
+        (payload.o === undefined) !== (currentClient === undefined)
+        || (payload.o !== undefined && (
+          currentClient?.clientId !== payload.o.i
+          || currentClient.clientSecretRef !== payload.o.r
+        ))
+      ) {
+        return renderOAuthCallbackHtml(
+          false,
+          'OAuth client configuration changed; restart authorization',
+        )
+      }
       try {
         await finishMcpAuthorization({
           store: deps.state,
           encryptionKey: encKey,
           nodePath: payload.p,
           serverUrl: node.config.url,
+          secrets: deps.secrets,
           origin: deps.canonicalOrigin ?? new URL(c.req.url).origin,
           code,
           codeVerifier: payload.v,
+          ...(q.iss !== undefined ? { authorizationResponseIssuer: q.iss } : {}),
+          ...(node.config.oauthClient !== undefined
+            ? { oauthClient: node.config.oauthClient }
+            : {}),
           // 本地回调通道(CLI --local):兑换必须复用授权时的 redirect_uri。
           ...(payload.r !== undefined ? { redirectUri: payload.r } : {}),
         })

@@ -10,7 +10,6 @@ import {
   ShieldAlert,
   Trash2,
 } from 'lucide-react'
-import { useQueryClient } from '@tanstack/react-query'
 import { useState } from 'react'
 import { toast } from 'sonner'
 import type { FederationHost } from '@/lib/types'
@@ -31,7 +30,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { useFederationList, useInvoke } from '@/lib/queries'
+import { useFederationList, useInvalidate, useInvoke } from '@/lib/queries'
 import { ConfirmAction } from '@/components/ConfirmAction'
 import { EmptyState } from '@/components/EmptyState'
 import { PageHeader } from '@/components/PageHeader'
@@ -195,7 +194,7 @@ function HostLayer({
 
 function AddHostDialog() {
   const invoke = useInvoke()
-  const qc = useQueryClient()
+  const invalidate = useInvalidate()
   const [open, setOpen] = useState(false)
   const [host, setHost] = useState('')
   const [err, setErr] = useState<string | null>(null)
@@ -224,8 +223,7 @@ function AddHostDialog() {
     await invoke
       .mutateAsync(
         {
-          path: 'system/federation',
-          tool: 'add',
+          commandPath: 'system/federation/add',
           args: { host: preview.normalized },
         },
         {
@@ -234,7 +232,7 @@ function AddHostDialog() {
             setOpen(false)
             setHost('')
             setErr(null)
-            qc.invalidateQueries({ queryKey: ['tb'] })
+            invalidate('federation-list')
           },
           onError: e => setErr(e.message),
         },
@@ -346,16 +344,16 @@ function AddHostDialog() {
 export function FederationPage() {
   const list = useFederationList()
   const invoke = useInvoke()
-  const qc = useQueryClient()
+  const invalidate = useInvalidate()
   const items = list.data?.items ?? []
   const envItems = items.filter(item => item.source === 'env')
   const runtimeItems = items.filter(item => item.source === 'store')
 
   const remove = async (host: string) => {
     try {
-      await invoke.mutateAsync({ path: 'system/federation', tool: 'remove', args: { host } })
+      await invoke.mutateAsync({ commandPath: 'system/federation/remove', args: { host } })
       toast.success(`已移除 ${host}`)
-      await qc.invalidateQueries({ queryKey: ['tb'] })
+      await invalidate('federation-list')
     } catch (error) {
       toast.error(error instanceof Error ? error.message : '移除联邦白名单失败')
       throw error

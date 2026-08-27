@@ -8,7 +8,7 @@ import {
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createMcpProvider } from '@tool-bridge/app'
 import { env, SELF } from 'cloudflare:test'
-import { KvStateStore } from '../src/kvStateStore'
+import { D1StateStore } from '../src/d1StateStore'
 import { TEST_ADMIN_SK } from './fixtures'
 
 // Tool Layer 集成测试:mcp/http Provider、工具虚拟化、调用点 call 判定、
@@ -34,26 +34,21 @@ async function postJson(path: string, body: unknown, init: RequestInit = {}): Pr
 }
 
 async function issueSk(input: unknown): Promise<string> {
-  const res = await postJson('system/sk', { tool: 'write', arguments: input }, admin())
+  const res = await postJson('system/sk/write', input, admin())
   expect(res.status).toBe(200)
   return ((await res.json()) as { secret: string }).secret
 }
 
 /** 用 admin 挂一个 http 工具节点。 */
 async function mountHttp(path: string, tools: unknown, virtualize?: unknown): Promise<void> {
-  const res = await postJson(
-    'system/registry',
-    {
-      tool: 'write',
-      arguments: {
-        path,
-        kind: 'http',
-        description: 'http tools',
-        config: { kind: 'http', endpoint: 'https://postman-echo.com', tools },
-        ...(virtualize !== undefined ? { virtualize } : {}),
-      },
-    },
-    admin(),
+  const res = await postJson('system/registry/write', {
+    path,
+    kind: 'http',
+    description: 'http tools',
+    config: { kind: 'http', endpoint: 'https://postman-echo.com', tools },
+    ...(virtualize !== undefined ? { virtualize } : {}),
+  },
+  admin(),
   )
   expect(res.status).toBe(200)
 }
@@ -129,9 +124,9 @@ describe('工具虚拟化(hide 不可见、rename 后原名不可调)', () => {
 
   it('call 原名(real)→ 404;call 隐藏名(secret_tool)→ 404(反查前不泄露)', async () => {
     await mountHttp('ext/v2', tools, { hide: ['secret_tool'], rename: { real: 'shiny' } })
-    const a = await postJson('ext/v2', { tool: 'real', arguments: {} }, admin())
+    const a = await postJson('ext/v2/real', {}, admin())
     expect(a.status).toBe(404)
-    const b = await postJson('ext/v2', { tool: 'secret_tool', arguments: {} }, admin())
+    const b = await postJson('ext/v2/secret_tool', {}, admin())
     expect(b.status).toBe(404)
   })
 })
@@ -217,18 +212,13 @@ function mcpUpstreamMock(tools: Array<{ description: string, name: string }>) {
 }
 
 async function mountMcp(path: string): Promise<void> {
-  const res = await postJson(
-    'system/registry',
-    {
-      tool: 'write',
-      arguments: {
-        path,
-        kind: 'mcp',
-        description: 'mock mcp',
-        config: { kind: 'mcp', url: 'https://mcp-mock.test/mcp' },
-      },
-    },
-    admin(),
+  const res = await postJson('system/registry/write', {
+    path,
+    kind: 'mcp',
+    description: 'mock mcp',
+    config: { kind: 'mcp', url: 'https://mcp-mock.test/mcp' },
+  },
+  admin(),
   )
   expect(res.status).toBe(200)
 }
@@ -256,18 +246,17 @@ describe('tool cache → SearchIndex 自动同步', () => {
         tool: {
           name: 'cache_search_probe',
           description: 'uniquecacheprobe tool',
-          inputSchema: { type: 'object' },
         },
       }],
     })
-    const dirty = await new KvStateStore((env as { TB_KV: KVNamespace }).TB_KV)
+    const dirty = await new D1StateStore((env as { TB_STATE: D1Database }).TB_STATE)
       .list('searchdirty:')
     expect(dirty.items.filter(item => (
       (item.value as { path?: unknown }).path === 'ext/search-cache-sync'
     ))).toEqual([])
   })
 
-  it('indexes a Feishu-sized MCP catalog while returning complete canonical ToolSpecs', async () => {
+  it('indexes a Feishu-sized MCP catalog while returning compact canonical metadata', async () => {
     const description = `feishucatalogunique ${'长描述'.repeat(2_000)}`
     const tools = Array.from({ length: 8 }, (_, index) => ({
       name: `feishu_large_probe_${index}`,
@@ -292,8 +281,11 @@ describe('tool cache → SearchIndex 自动同步', () => {
     expect(page.items).toHaveLength(8)
     expect(page.items[0]).toMatchObject({
       path: 'ext/search-large-cache',
-      tool: { description, name: 'feishu_large_probe_0' },
+      tool: { name: 'feishu_large_probe_0' },
     })
+    const compactBytes = new TextEncoder().encode(page.items[0]?.tool.description ?? '').length
+    expect(compactBytes).toBeGreaterThan(0)
+    expect(compactBytes).toBeLessThanOrEqual(1024)
   })
 })
 
@@ -315,7 +307,7 @@ describe('直连工具调用(POST /<node>/<tool>,body 即 arguments)', () => {
     expect(empty.status).toBe(200)
   })
 
-  it('信封入口不受影响:POST /<node> + {tool,arguments} 仍可调用', async () => {
+  it('节点本身不可调用:POST /<node> + {tool,arguments} 不作为兼容入口', async () => {
     const upstream = mcpUpstreamMock([{ name: 'echo', description: 'echo back' }])
     vi.stubGlobal('fetch', upstream.fetchMock)
     await mountMcp('ext/direct-legacy')
@@ -325,8 +317,8 @@ describe('直连工具调用(POST /<node>/<tool>,body 即 arguments)', () => {
       { tool: 'echo', arguments: { text: 'hi' } },
       admin(),
     )
-    expect(res.status).toBe(200)
-    expect(await res.json()).toBe('called:echo:{"text":"hi"}')
+    expect(res.status).toBe(404)
+    expect(await res.json()).toMatchObject({ code: 'not_found' })
   })
 
   it('直连虚拟化:rename 后新名可直连、原名与 hidden 404;未知工具 404', async () => {
@@ -335,19 +327,14 @@ describe('直连工具调用(POST /<node>/<tool>,body 即 arguments)', () => {
       { name: 'secret_tool', description: 'hidden' },
     ])
     vi.stubGlobal('fetch', upstream.fetchMock)
-    const res = await postJson(
-      'system/registry',
-      {
-        tool: 'write',
-        arguments: {
-          path: 'ext/direct-v',
-          kind: 'mcp',
-          description: 'mock mcp',
-          config: { kind: 'mcp', url: 'https://mcp-mock.test/mcp' },
-          virtualize: { hide: ['secret_tool'], rename: { real: 'shiny' } },
-        },
-      },
-      admin(),
+    const res = await postJson('system/registry/write', {
+      path: 'ext/direct-v',
+      kind: 'mcp',
+      description: 'mock mcp',
+      config: { kind: 'mcp', url: 'https://mcp-mock.test/mcp' },
+      virtualize: { hide: ['secret_tool'], rename: { real: 'shiny' } },
+    },
+    admin(),
     )
     expect(res.status).toBe(200)
 
@@ -414,7 +401,7 @@ describe('调用点 call 判定(无 call → 403;不可见 → 404)', () => {
       scopes: [{ pattern: 'ext/**', actions: ['read'] }],
     })
     const ro = { authorization: `Bearer ${roSk}` }
-    const denied = await postJson('ext/perm', { tool: 'get_thing', arguments: {} }, { headers: ro })
+    const denied = await postJson('ext/perm/get_thing', {}, { headers: ro })
     expect(denied.status).toBe(403)
     const parent = await SELF.fetch('https://tb.test/ext/~help', {
       headers: { ...ro, accept: 'application/json' },
@@ -429,9 +416,7 @@ describe('调用点 call 判定(无 call → 403;不可见 → 404)', () => {
       scopes: [{ pattern: 'other/**', actions: ['read', 'call'] }],
     })
     const other = { authorization: `Bearer ${otherSk}` }
-    const invisible = await postJson(
-      'ext/perm',
-      { tool: 'get_thing', arguments: {} },
+    const invisible = await postJson('ext/perm/get_thing', {},
       { headers: other },
     )
     expect(invisible.status).toBe(404)
@@ -524,71 +509,51 @@ describe('两级披露(节点级索引 + 工具级全量)', () => {
 
 describe('remote 节点(白名单、X-TB-Via 环检测)', () => {
   secureOnlyIt('http:// baseUrl 默认被拒(即使 host 在白名单内)', async () => {
-    const res = await postJson(
-      'system/registry',
-      {
-        tool: 'write',
-        arguments: {
-          path: 'srv/insecure',
-          kind: 'remote',
-          description: 'insecure',
-          config: { kind: 'remote', baseUrl: 'http://api.example.com/htbp' },
-        },
-      },
-      admin(),
+    const res = await postJson('system/registry/write', {
+      path: 'srv/insecure',
+      kind: 'remote',
+      description: 'insecure',
+      config: { kind: 'remote', baseUrl: 'http://api.example.com/htbp' },
+    },
+    admin(),
     )
     expect(res.status).toBe(400)
     expect(((await res.json()) as { code: string }).code).toBe('invalid_argument')
   })
 
   it('白名单外 baseUrl → 注册被拒(invalid_argument 400)', async () => {
-    const res = await postJson(
-      'system/registry',
-      {
-        tool: 'write',
-        arguments: {
-          path: 'srv/bad',
-          kind: 'remote',
-          description: 'not allowed',
-          config: { kind: 'remote', baseUrl: 'https://api.notallowed.io' },
-        },
-      },
-      admin(),
+    const res = await postJson('system/registry/write', {
+      path: 'srv/bad',
+      kind: 'remote',
+      description: 'not allowed',
+      config: { kind: 'remote', baseUrl: 'https://api.notallowed.io' },
+    },
+    admin(),
     )
     expect(res.status).toBe(400)
     expect(((await res.json()) as { code: string }).code).toBe('invalid_argument')
   })
 
   it('白名单内 baseUrl → 注册成功', async () => {
-    const res = await postJson(
-      'system/registry',
-      {
-        tool: 'write',
-        arguments: {
-          path: 'srv/ok',
-          kind: 'remote',
-          description: 'allowed',
-          config: { kind: 'remote', baseUrl: 'https://api.example.com/htbp' },
-        },
-      },
-      admin(),
+    const res = await postJson('system/registry/write', {
+      path: 'srv/ok',
+      kind: 'remote',
+      description: 'allowed',
+      config: { kind: 'remote', baseUrl: 'https://api.example.com/htbp' },
+    },
+    admin(),
     )
     expect(res.status).toBe(200)
   })
 
   it('入站 X-TB-Via 含自身标识 → ~help 透传前被判环 → 503 unavailable(retryable:false)', async () => {
-    await postJson(
-      'system/registry',
-      {
-        tool: 'write',
-        arguments: {
-          path: 'srv/loop',
-          kind: 'remote',
-          description: 'loop',
-          config: { kind: 'remote', baseUrl: 'https://api.example.com/htbp' },
-        },
-      },
-      admin(),
+    await postJson('system/registry/write', {
+      path: 'srv/loop',
+      kind: 'remote',
+      description: 'loop',
+      config: { kind: 'remote', baseUrl: 'https://api.example.com/htbp' },
+    },
+    admin(),
     )
     // TB_INSTANCE_ID 绑定为 'tb-test-instance';入站链已含它 → 环。
     const res = await SELF.fetch(
@@ -602,28 +567,21 @@ describe('remote 节点(白名单、X-TB-Via 环检测)', () => {
   })
 
   it('remote 调用不转发本地 SK,仅用 skRef 换发出站 Authorization', async () => {
-    const setSecret = await postJson(
-      'system/secret',
-      { tool: 'set', arguments: { name: 'remote-sk', value: 'tbk_remote_secret' } },
+    const setSecret = await postJson('system/secret/set', { name: 'remote-sk', value: 'tbk_remote_secret' },
       admin(),
     )
     expect(setSecret.status).toBe(200)
-    const registered = await postJson(
-      'system/registry',
-      {
-        tool: 'write',
-        arguments: {
-          path: 'srv/peer-auth',
-          kind: 'remote',
-          description: 'peer with skRef',
-          config: {
-            kind: 'remote',
-            baseUrl: 'https://peer.example.com/htbp',
-            skRef: 'remote-sk',
-          },
-        },
+    const registered = await postJson('system/registry/write', {
+      path: 'srv/peer-auth',
+      kind: 'remote',
+      description: 'peer with skRef',
+      config: {
+        kind: 'remote',
+        baseUrl: 'https://peer.example.com/htbp',
+        skRef: 'remote-sk',
       },
-      admin(),
+    },
+    admin(),
     )
     expect(registered.status).toBe(200)
 
@@ -640,7 +598,7 @@ describe('remote 节点(白名单、X-TB-Via 环检测)', () => {
     vi.stubGlobal('fetch', fetchMock)
     const auditLog = vi.spyOn(console, 'log').mockImplementation(() => {})
 
-    const res = await postJson('srv/peer-auth', { tool: 'anything', arguments: { x: 1 } }, admin())
+    const res = await postJson('srv/peer-auth/anything', { x: 1 }, admin())
     expect(res.status).toBe(200)
     expect(fetchMock).toHaveBeenCalledTimes(1)
     const event = auditLog.mock.calls
@@ -657,7 +615,7 @@ describe('remote 节点(白名单、X-TB-Via 环检测)', () => {
       method: 'POST',
       nodePath: 'srv/peer-auth',
       skRef: 'remote-sk',
-      target: 'https://peer.example.com/htbp',
+      target: 'https://peer.example.com/htbp/anything',
     })
     expect(event?.actorKeyId).toEqual(expect.any(String))
     expect(event?.traceId).toEqual(expect.any(String))
@@ -665,18 +623,13 @@ describe('remote 节点(白名单、X-TB-Via 环检测)', () => {
   })
 
   it('根 ~tree 聚合 remote 子树并把远端路径映射到本地挂载前缀', async () => {
-    const registered = await postJson(
-      'system/registry',
-      {
-        tool: 'write',
-        arguments: {
-          path: 'srv/peer-tree',
-          kind: 'remote',
-          description: 'peer tree',
-          config: { kind: 'remote', baseUrl: 'https://peer.example.com/htbp' },
-        },
-      },
-      admin(),
+    const registered = await postJson('system/registry/write', {
+      path: 'srv/peer-tree',
+      kind: 'remote',
+      description: 'peer tree',
+      config: { kind: 'remote', baseUrl: 'https://peer.example.com/htbp' },
+    },
+    admin(),
     )
     expect(registered.status).toBe(200)
 
@@ -830,31 +783,24 @@ describe('mcp 自定义请求头(飞书形态:凭证进自定义头 + 静态白�
     const upstream = mcpUpstreamMock([{ name: 'search-doc', description: 'search cloud docs' }])
     vi.stubGlobal('fetch', upstream.fetchMock)
 
-    const setSecret = await postJson(
-      'system/secret',
-      { tool: 'set', arguments: { name: 'lark-tat', value: 't-tat-secret' } },
+    const setSecret = await postJson('system/secret/set', { name: 'lark-tat', value: 't-tat-secret' },
       admin(),
     )
     expect(setSecret.status).toBe(200)
-    const mounted = await postJson(
-      'system/registry',
-      {
-        tool: 'write',
-        arguments: {
-          path: 'ext/lark',
-          kind: 'mcp',
-          description: 'feishu mcp',
-          config: {
-            kind: 'mcp',
-            url: 'https://mcp-mock.test/mcp',
-            authRef: 'lark-tat',
-            authHeader: 'X-Lark-MCP-TAT',
-            authScheme: '',
-            headers: { 'X-Lark-MCP-Allowed-Tools': 'search-doc,fetch-doc' },
-          },
-        },
+    const mounted = await postJson('system/registry/write', {
+      path: 'ext/lark',
+      kind: 'mcp',
+      description: 'feishu mcp',
+      config: {
+        kind: 'mcp',
+        url: 'https://mcp-mock.test/mcp',
+        authRef: 'lark-tat',
+        authHeader: 'X-Lark-MCP-TAT',
+        authScheme: '',
+        headers: { 'X-Lark-MCP-Allowed-Tools': 'search-doc,fetch-doc' },
       },
-      admin(),
+    },
+    admin(),
     )
     expect(mounted.status).toBe(200)
 
@@ -935,9 +881,7 @@ describe('http 上游真实调用(opt-in via TB_TEST_LIVE_HTTP)', () => {
     'POST get_thing → postman-echo 回显 query',
     async () => {
       await mountHttp('ext/live', HTTP_TOOLS)
-      const res = await postJson(
-        'ext/live',
-        { tool: 'get_thing', arguments: { foo: 'bar' } },
+      const res = await postJson('ext/live/get_thing', { foo: 'bar' },
         admin(),
       )
       expect(res.status).toBe(200)
@@ -950,18 +894,13 @@ describe('http 上游真实调用(opt-in via TB_TEST_LIVE_HTTP)', () => {
 
 describe('mcp 真实上游 E2E(opt-in via TB_TEST_MCP_URL)', () => {
   mcpIt('mount mcp → ~help 见 echo 工具 → call echo 回显', async () => {
-    const mk = await postJson(
-      'system/registry',
-      {
-        tool: 'write',
-        arguments: {
-          path: 'ext/mcp',
-          kind: 'mcp',
-          description: 'echo mcp',
-          config: { kind: 'mcp', url: mcpUrl },
-        },
-      },
-      admin(),
+    const mk = await postJson('system/registry/write', {
+      path: 'ext/mcp',
+      kind: 'mcp',
+      description: 'echo mcp',
+      config: { kind: 'mcp', url: mcpUrl },
+    },
+    admin(),
     )
     expect(mk.status).toBe(200)
 
@@ -973,9 +912,7 @@ describe('mcp 真实上游 E2E(opt-in via TB_TEST_MCP_URL)', () => {
     const names = parseHelpDsl(await help.text()).cmds.map(c => c.name)
     expect(names).toContain('echo')
 
-    const call = await postJson(
-      'ext/mcp',
-      { tool: 'echo', arguments: { text: 'hello-tb' } },
+    const call = await postJson('ext/mcp/echo', { text: 'hello-tb' },
       admin(),
     )
     expect(call.status).toBe(200)
@@ -983,18 +920,13 @@ describe('mcp 真实上游 E2E(opt-in via TB_TEST_MCP_URL)', () => {
   })
 
   mcpIt('era 协商:连真实 echo-mcp 上游,whoami 回报协商到的 era 且两次一致', async () => {
-    const mk = await postJson(
-      'system/registry',
-      {
-        tool: 'write',
-        arguments: {
-          path: 'ext/mcp-session',
-          kind: 'mcp',
-          description: 'echo mcp(era negotiation)',
-          config: { kind: 'mcp', url: mcpUrl },
-        },
-      },
-      admin(),
+    const mk = await postJson('system/registry/write', {
+      path: 'ext/mcp-session',
+      kind: 'mcp',
+      description: 'echo mcp(era negotiation)',
+      config: { kind: 'mcp', url: mcpUrl },
+    },
+    admin(),
     )
     expect(mk.status).toBe(200)
 
@@ -1003,7 +935,7 @@ describe('mcp 真实上游 E2E(opt-in via TB_TEST_MCP_URL)', () => {
     // 现在断言的是 era 协商结果稳定:同一节点两次调用协商到同一个 era(第二次走
     // mcpera:<path> 缓存的判定,不重探 server/discover)。
     const whoami = async (): Promise<string> => {
-      const res = await postJson('ext/mcp-session', { tool: 'whoami', arguments: {} }, admin())
+      const res = await postJson('ext/mcp-session/whoami', {}, admin())
       expect(res.status).toBe(200)
       return JSON.stringify(await res.json())
     }
@@ -1016,18 +948,13 @@ describe('mcp 真实上游 E2E(opt-in via TB_TEST_MCP_URL)', () => {
 
 describe('system/federation 运行时白名单(env 基线 ∪ 运行时叠加)', () => {
   const mountRemote = (path: string, host: string): Promise<Response> =>
-    postJson(
-      'system/registry',
-      {
-        tool: 'write',
-        arguments: {
-          path,
-          kind: 'remote',
-          description: 'runtime allowlisted',
-          config: { kind: 'remote', baseUrl: `https://${host}/htbp` },
-        },
-      },
-      admin(),
+    postJson('system/registry/write', {
+      path,
+      kind: 'remote',
+      description: 'runtime allowlisted',
+      config: { kind: 'remote', baseUrl: `https://${host}/htbp` },
+    },
+    admin(),
     )
 
   it('运行时 add 后,原本白名单外的 baseUrl 可挂载', async () => {
@@ -1036,9 +963,7 @@ describe('system/federation 运行时白名单(env 基线 ∪ 运行时叠加)',
     expect(before.status).toBe(400)
     expect(((await before.json()) as { code: string }).code).toBe('invalid_argument')
 
-    const add = await postJson(
-      'system/federation',
-      { tool: 'add', arguments: { host: 'newpeer.io' } },
+    const add = await postJson('system/federation/add', { host: 'newpeer.io' },
       admin(),
     )
     expect(add.status).toBe(200)
@@ -1049,9 +974,9 @@ describe('system/federation 运行时白名单(env 基线 ∪ 运行时叠加)',
   })
 
   it('list 合并视图:env 基线不可删、运行时条目可删;remove env 基线 → 400', async () => {
-    await postJson('system/federation', { tool: 'add', arguments: { host: 'newpeer.io' } }, admin())
+    await postJson('system/federation/add', { host: 'newpeer.io' }, admin())
 
-    const listRes = await postJson('system/federation', { tool: 'list', arguments: {} }, admin())
+    const listRes = await postJson('system/federation/list', {}, admin())
     expect(listRes.status).toBe(200)
     const items = (
       (await listRes.json()) as {
@@ -1064,9 +989,7 @@ describe('system/federation 运行时白名单(env 基线 ∪ 运行时叠加)',
     )
 
     // env 基线条目不可经管理面删除(须改 TB_REMOTE_ALLOWLIST 重新部署)。
-    const rm = await postJson(
-      'system/federation',
-      { tool: 'remove', arguments: { host: 'example.com' } },
+    const rm = await postJson('system/federation/remove', { host: 'example.com' },
       admin(),
     )
     expect(rm.status).toBe(400)
@@ -1079,9 +1002,7 @@ describe('system/federation 运行时白名单(env 基线 ∪ 运行时叠加)',
       owner: 'agent:ro',
       scopes: [{ pattern: '**', actions: ['read'] }],
     })
-    const res = await postJson(
-      'system/federation',
-      { tool: 'add', arguments: { host: 'evil.io' } },
+    const res = await postJson('system/federation/add', { host: 'evil.io' },
       { headers: { authorization: `Bearer ${roSk}` } },
     )
     expect(res.status).toBe(403)

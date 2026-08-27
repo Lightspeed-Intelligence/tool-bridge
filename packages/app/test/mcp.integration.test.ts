@@ -8,7 +8,8 @@ import { TEST_ADMIN_SK } from './fixtures'
 // 文件级单实例(对齐原 SELF.fetch 语义:一个文件共享一份持久状态)。
 // 注入索引:/~mcp 只在宿主提供 SearchIndex 时投影 tb_search(gateway 侧对应
 // 可选的 TB_SEARCH binding),缺省不注入就只有 tb_help / tb_list_nodes。
-const tb = await createTestApp({ search: new MemorySearchIndex() })
+const search = new MemorySearchIndex()
+const tb = await createTestApp({ search })
 
 const admin = (extra: RequestInit = {}): RequestInit => ({
   ...extra,
@@ -31,9 +32,7 @@ async function postJson(path: string, body: unknown, init: RequestInit = {}): Pr
 }
 
 async function issueSk(input: unknown): Promise<string> {
-  const response = await postJson(
-    'system/sk',
-    { tool: 'write', arguments: input },
+  const response = await postJson('system/sk/write', input,
     admin(),
   )
   expect(response.status).toBe(200)
@@ -41,22 +40,17 @@ async function issueSk(input: unknown): Promise<string> {
 }
 
 async function mountHttpTools(path: string, tools: unknown[]): Promise<void> {
-  const response = await postJson(
-    'system/registry',
-    {
-      tool: 'write',
-      arguments: {
-        path,
-        kind: 'http',
-        description: `${path} tools`,
-        config: {
-          kind: 'http',
-          endpoint: 'https://mcp-exit-upstream.test',
-          tools,
-        },
-      },
+  const response = await postJson('system/registry/write', {
+    path,
+    kind: 'http',
+    description: `${path} tools`,
+    config: {
+      kind: 'http',
+      endpoint: 'https://mcp-exit-upstream.test',
+      tools,
     },
-    admin(),
+  },
+  admin(),
   )
   expect(response.status).toBe(200)
   mountedPaths.push(path)
@@ -79,54 +73,77 @@ async function mountHttp(path: string): Promise<void> {
 }
 
 async function mountMcp(path: string): Promise<void> {
-  const response = await postJson(
-    'system/registry',
-    {
-      tool: 'write',
-      arguments: {
-        path,
-        kind: 'mcp',
-        description: `${path} MCP`,
-        config: { kind: 'mcp', url: 'https://round15-mcp-upstream.test/mcp' },
-      },
-    },
-    admin(),
+  const response = await postJson('system/registry/write', {
+    path,
+    kind: 'mcp',
+    description: `${path} MCP`,
+    config: { kind: 'mcp', url: 'https://round15-mcp-upstream.test/mcp' },
+  },
+  admin(),
   )
   expect(response.status).toBe(200)
   mountedPaths.push(path)
 }
 
+function stubSimpleMcpUpstream(tools: Array<Record<string, unknown>>): {
+  toolCalls: Array<{ arguments?: unknown, name?: string }>
+} {
+  const toolCalls: Array<{ arguments?: unknown, name?: string }> = []
+  const upstream = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body)) as {
+      id?: number | string
+      method: string
+      params?: { arguments?: unknown, name?: string, protocolVersion?: string }
+    }
+    const rpc = (result: unknown, headers: Record<string, string> = {}) =>
+      new Response(JSON.stringify({ jsonrpc: '2.0', id: body.id, result }), {
+        headers: { 'content-type': 'application/json', ...headers },
+      })
+    if (body.method === 'initialize') {
+      return rpc(
+        {
+          protocolVersion: body.params?.protocolVersion ?? '2025-03-26',
+          capabilities: { tools: {} },
+          serverInfo: { name: 'simple-upstream', version: '1.0.0' },
+        },
+        { 'mcp-session-id': 'simple-session' },
+      )
+    }
+    if (body.method === 'notifications/initialized') {
+      return new Response(null, { status: 202 })
+    }
+    if (body.method === 'tools/list') return rpc({ tools })
+    if (body.method === 'tools/call') {
+      toolCalls.push({ name: body.params?.name, arguments: body.params?.arguments })
+      return rpc({ content: [{ type: 'text', text: 'called' }] })
+    }
+    return new Response('unexpected MCP upstream request', { status: 500 })
+  })
+  vi.stubGlobal('fetch', upstream)
+  return { toolCalls }
+}
+
 async function mountContext(path: string): Promise<void> {
-  const response = await postJson(
-    'system/registry',
-    {
-      tool: 'write',
-      arguments: {
-        path,
-        kind: 'context',
-        description: `${path} context`,
-        config: { kind: 'context', provider: 'r2' },
-      },
-    },
-    admin(),
+  const response = await postJson('system/registry/write', {
+    path,
+    kind: 'context',
+    description: `${path} context`,
+    config: { kind: 'context', provider: 'r2' },
+  },
+  admin(),
   )
   expect(response.status).toBe(200)
   mountedPaths.push(path)
 }
 
 async function mountRemote(path: string): Promise<void> {
-  const response = await postJson(
-    'system/registry',
-    {
-      tool: 'write',
-      arguments: {
-        path,
-        kind: 'remote',
-        description: `${path} remote`,
-        config: { kind: 'remote', baseUrl: 'https://api.example.com/htbp' },
-      },
-    },
-    admin(),
+  const response = await postJson('system/registry/write', {
+    path,
+    kind: 'remote',
+    description: `${path} remote`,
+    config: { kind: 'remote', baseUrl: 'https://api.example.com/htbp' },
+  },
+  admin(),
   )
   expect(response.status).toBe(200)
   mountedPaths.push(path)
@@ -134,9 +151,7 @@ async function mountRemote(path: string): Promise<void> {
 
 afterEach(async () => {
   for (const path of mountedPaths.reverse()) {
-    await postJson(
-      'system/registry',
-      { tool: 'delete', arguments: { path } },
+    await postJson('system/registry/delete', { path },
       admin(),
     )
   }
@@ -192,6 +207,13 @@ describe('MCP consumer endpoint', () => {
       method: 'GET',
       pathTemplate: '/calendar',
       inputSchema: { type: 'object', properties: {} },
+    }, {
+      name: 'update_calendar',
+      description: 'controlcatalogunique visible calendar update',
+      effect: 'write',
+      method: 'POST',
+      pathTemplate: '/calendar',
+      inputSchema: { type: 'object', properties: {} },
     }])
     await mountHttpTools('mcp-controls-hidden', [{
       name: 'discover_private',
@@ -216,18 +238,83 @@ describe('MCP consumer endpoint', () => {
         'tb_help',
         'tb_list_nodes',
       ]))
+      expect(listed.tools.find(tool => tool.name === 'tb_search')).toMatchObject({
+        description: expect.stringContaining('compact by default'),
+        inputSchema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            query: { type: 'string', minLength: 1 },
+            mode: { type: 'string', enum: ['keyword', 'semantic'] },
+            limit: { type: 'integer', minimum: 1, maximum: 200 },
+            cursor: { type: 'string', minLength: 1 },
+            detail: { type: 'string', enum: ['compact', 'full'], default: 'compact' },
+            effects: {
+              type: 'array',
+              minItems: 1,
+              items: {
+                type: 'string',
+                enum: ['read', 'write', 'destructive', 'unknown'],
+              },
+            },
+            federation: { type: 'string', enum: ['local', 'recursive'] },
+            matching: { type: 'string', enum: ['best', 'all'] },
+            minCoverage: { type: 'number', exclusiveMinimum: 0, maximum: 1 },
+            pathPrefix: { type: 'string', minLength: 1 },
+          },
+          required: ['query'],
+        },
+      })
 
-      await expect(client.callTool({
+      const compact = await client.callTool({
         name: 'tb_search',
         arguments: { query: 'controlcatalogunique', limit: 20 },
-      })).resolves.toMatchObject({
+      })
+      const compactItems = (compact.structuredContent as {
+        items: Array<{ path: string, tool: { name: string } }>
+      }).items
+      expect(compactItems).toEqual(expect.arrayContaining([expect.objectContaining({
+        path: 'mcp-controls-visible',
+        tool: expect.objectContaining({ name: 'discover_calendar' }),
+      })]))
+      expect(JSON.stringify(compact.structuredContent)).not.toContain('inputSchema')
+
+      const searchCall = vi.spyOn(search, 'search')
+      const full = await client.callTool({
+        name: 'tb_search',
+        arguments: {
+          query: 'controlcatalogunique',
+          detail: 'full',
+          effects: ['read'],
+          federation: 'local',
+          matching: 'all',
+          minCoverage: 1,
+          mode: 'keyword',
+          pathPrefix: 'mcp-controls-visible',
+          limit: 20,
+        },
+      })
+      expect(full).toMatchObject({
         structuredContent: {
           items: [{
             path: 'mcp-controls-visible',
-            tool: { name: 'discover_calendar' },
+            tool: {
+              name: 'discover_calendar',
+              inputSchema: { type: 'object', properties: {} },
+            },
           }],
         },
       })
+      expect(JSON.stringify(full.structuredContent)).not.toContain('update_calendar')
+      expect(searchCall).toHaveBeenCalledWith(
+        'controlcatalogunique',
+        expect.objectContaining({
+          matching: 'all',
+          minCoverage: 1,
+          mode: 'keyword',
+          pathPrefix: 'mcp-controls-visible',
+        }),
+      )
 
       await expect(client.callTool({
         name: 'tb_help',
@@ -253,10 +340,12 @@ describe('MCP consumer endpoint', () => {
         name: 'tb_help',
         arguments: { path: 'mcp-controls-hidden' },
       })).resolves.toMatchObject({ isError: true })
+      searchCall.mockClear()
       await expect(client.callTool({
         name: 'tb_search',
         arguments: { query: 'controlcatalogunique', unexpected: true },
       })).rejects.toThrow(/unexpected|additional/i)
+      expect(searchCall).not.toHaveBeenCalled()
     } finally {
       await client.close()
     }
@@ -347,8 +436,8 @@ describe('MCP consumer endpoint', () => {
       const contextCommands = listed.tools
         .filter(tool => tool._meta?.['io.tool-bridge/path'] === 'mcp-round15/context')
         .map(tool => tool._meta?.['io.tool-bridge/command'])
-      expect(contextCommands).toContain('List')
-      expect(contextCommands).not.toContain('Write')
+      expect(contextCommands).toContain('list')
+      expect(contextCommands).not.toContain('write')
 
       await expect(client.callTool({
         name: allowed?.name ?? '',
@@ -369,6 +458,58 @@ describe('MCP consumer endpoint', () => {
         structuredContent: { greeting: 'hello Ada' },
       })
       expect(upstream).toHaveBeenCalledTimes(1)
+    } finally {
+      await client.close()
+    }
+  })
+
+  it('没有 write scope 的 MCP tools/list 不探测直传 signer', async () => {
+    const objectsFactory = vi.fn(async () => {
+      throw new Error('must not resolve object signer')
+    })
+    const isolated = await createTestApp({ objectsFactory })
+    const register = await isolated.request('https://tb.test/mcp-read/context/~register', {
+      method: 'POST',
+      headers: {
+        ...admin().headers,
+        'accept': 'application/json',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        path: 'mcp-read/context',
+        kind: 'context',
+        description: 'read-only caller view',
+        config: { kind: 'context', provider: 'r2' },
+      }),
+    })
+    expect(register.status).toBe(200)
+    const skResponse = await isolated.request('https://tb.test/system/sk/write', {
+      method: 'POST',
+      headers: {
+        ...admin().headers,
+        'accept': 'application/json',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        owner: 'agent:mcp-read',
+        scopes: [{ pattern: 'mcp-read/context', actions: ['read'] }],
+      }),
+    })
+    expect(skResponse.status).toBe(200)
+    const sk = ((await skResponse.json()) as { secret: string }).secret
+    const client = await connectTestMcpClient(
+      'https://tb.test/~mcp',
+      sk,
+      (input, init) => isolated.request(input, init),
+    )
+    try {
+      const listed = await client.listTools()
+      const commands = listed.tools
+        .filter(tool => tool._meta?.['io.tool-bridge/path'] === 'mcp-read/context')
+        .map(tool => tool._meta?.['io.tool-bridge/command'])
+      expect(commands).toContain('list')
+      expect(commands).not.toContain('create_upload')
+      expect(objectsFactory).not.toHaveBeenCalled()
     } finally {
       await client.close()
     }
@@ -533,6 +674,74 @@ describe('MCP consumer endpoint', () => {
     }
   })
 
+  it('advertises CamelCase upstream tools as callable canonical paths and preserves call identity', async () => {
+    await mountMcp('mcp-round15/camel-case')
+    const { toolCalls } = stubSimpleMcpUpstream([{
+      name: 'GetLiveContext',
+      description: 'Get Home Assistant live context',
+      inputSchema: {
+        type: 'object',
+        properties: { domain: { type: 'string' } },
+      },
+    }])
+
+    const helpResponse = await tb.request(
+      'https://tb.test/mcp-round15/camel-case/~help?schemas=1',
+      admin({ headers: { accept: 'application/json' } }),
+    )
+    expect(helpResponse.status).toBe(200)
+    const help = (await helpResponse.json()) as {
+      cmds: Array<{ name: string, path: string }>
+    }
+    expect(help.cmds).toEqual([
+      expect.objectContaining({
+        name: 'getlivecontext',
+        path: '/mcp-round15/camel-case/getlivecontext',
+      }),
+    ])
+    const advertisedPath = help.cmds[0]?.path
+    expect(advertisedPath).toBeDefined()
+
+    const detailResponse = await tb.request(
+      `https://tb.test${advertisedPath}/~help`,
+      admin({ headers: { accept: 'application/json' } }),
+    )
+    expect(detailResponse.status).toBe(200)
+    await expect(detailResponse.json()).resolves.toMatchObject({
+      node: { path: 'mcp-round15/camel-case/getlivecontext' },
+      cmds: [{ name: 'getlivecontext', path: advertisedPath }],
+    })
+
+    const invokeResponse = await postJson(
+      advertisedPath?.replace(/^\//, '') ?? '',
+      { domain: 'sensor' },
+      admin(),
+    )
+    expect(invokeResponse.status).toBe(200)
+    expect(toolCalls).toEqual([
+      { name: 'GetLiveContext', arguments: { domain: 'sensor' } },
+    ])
+  })
+
+  it('fails discovery when upstream tool names collide after canonicalization', async () => {
+    await mountMcp('mcp-round15/case-collision')
+    stubSimpleMcpUpstream([
+      { name: 'HassTurnOn', inputSchema: { type: 'object' } },
+      { name: 'hassturnon', inputSchema: { type: 'object' } },
+    ])
+
+    const response = await tb.request(
+      'https://tb.test/mcp-round15/case-collision/~help',
+      admin({ headers: { accept: 'application/json' } }),
+    )
+    expect(response.status).toBe(400)
+    await expect(response.json()).resolves.toMatchObject({
+      code: 'invalid_argument',
+      message: expect.stringMatching(/规范化后冲突.*显式 rename/),
+      retryable: false,
+    })
+  })
+
   it('remote descendants are localized, schema-complete, and callable through the mount', async () => {
     await mountRemote('mcp-round15/peer')
     const remoteFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -542,13 +751,10 @@ describe('MCP consumer endpoint', () => {
           headers: { 'content-type': 'application/json' },
         })
 
-      if (init?.method === 'POST' && url.pathname === '/htbp/alpha') {
-        const body = JSON.parse(String(init.body)) as {
-          arguments?: Record<string, unknown>
-          tool?: string
-        }
-        expect(body).toEqual({ tool: 'echo', arguments: { text: 'remote' } })
-        return json({ echoed: body.arguments?.text })
+      if (init?.method === 'POST' && url.pathname === '/htbp/alpha/echo') {
+        const body = JSON.parse(String(init.body)) as Record<string, unknown>
+        expect(body).toEqual({ text: 'remote' })
+        return json({ echoed: body.text })
       }
       if (url.pathname === '/htbp/~tree') {
         return json({
@@ -632,7 +838,7 @@ describe('MCP consumer endpoint', () => {
       expect(called).toMatchObject({ structuredContent: { echoed: 'remote' } })
       expect(
         remoteFetch.mock.calls.some(([input, init]) =>
-          init?.method === 'POST' && new URL(String(input)).pathname === '/htbp/alpha'),
+          init?.method === 'POST' && new URL(String(input)).pathname === '/htbp/alpha/echo'),
       ).toBe(true)
     } finally {
       await client.close()
@@ -765,10 +971,10 @@ describe('MCP consumer endpoint', () => {
   )
 
   it('flat names are collision-safe, client-compatible, and length bounded', async () => {
-    const slash = await mcpToolName(mcpToolIdentity('/a', 'b\0c', true))
-    const shiftedNul = await mcpToolName(mcpToolIdentity('/a\0b', 'c', true))
-    const escapedLiteral = await mcpToolName(mcpToolIdentity('/a_2Fb', 'c', true))
-    const long = await mcpToolName(mcpToolIdentity(`/${'很长'.repeat(100)}`, '工具', true))
+    const slash = await mcpToolName(mcpToolIdentity('/a', 'b\0c'))
+    const shiftedNul = await mcpToolName(mcpToolIdentity('/a\0b', 'c'))
+    const escapedLiteral = await mcpToolName(mcpToolIdentity('/a_2Fb', 'c'))
+    const long = await mcpToolName(mcpToolIdentity(`/${'很长'.repeat(100)}`, '工具'))
     expect(slash).not.toBe(shiftedNul)
     expect(slash).not.toBe(escapedLiteral)
     expect(long).toMatch(/^[A-Za-z0-9._-]{1,128}$/)

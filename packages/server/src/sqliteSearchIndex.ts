@@ -33,7 +33,7 @@ class SqliteSearchDriver implements SqlSearchDriver {
 
   insertRecords(records: readonly SerializedToolSearchRecord[]): SqlSearchStatement[] {
     return records.map(record => ({
-      params: [record.path, record.name, record.description, record.feedback],
+      params: [record.path, record.name, record.description, record.effect, record.feedback],
       sql: TOOL_SEARCH_INSERT_SQL,
     }))
   }
@@ -58,7 +58,7 @@ class SqliteSearchDriver implements SqlSearchDriver {
   }
 }
 
-/** Node 宿主的 better-sqlite3 FTS5/trigram SearchIndex。 */
+/** Node 宿主的 better-sqlite3 纯 LIKE SearchIndex。 */
 export class SqliteSearchIndex extends SqlSearchIndex {
   private readonly db: Database.Database
 

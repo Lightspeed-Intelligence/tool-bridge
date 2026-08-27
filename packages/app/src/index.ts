@@ -43,6 +43,7 @@ export {
   type DeviceChannel,
   type DeviceInvokeRequest,
   type LocalProviderHooks,
+  type ReadinessReport,
   type TbAppDeps,
 } from './deps'
 
@@ -91,6 +92,10 @@ export {
   parseOAuthDelegationClients,
   parseOAuthDelegationClientsJson,
 } from './oauthDelegation'
+export {
+  toWebObjectBodyStream,
+  type WebObjectBodyStreamOptions,
+} from './objectBodyStream'
 // --- Provider 接线零件(自建宿主按需装配)---
 export { createHttpProvider, type HttpConfig } from './providers/http'
 export { createMcpProvider, invalidateMcpEra, type McpConfig } from './providers/mcp'
@@ -114,7 +119,7 @@ export type { RemoteSettings } from './providers/remote'
 
 export { createS3ObjectStore, type S3StoreConfig } from './providers/s3Object'
 // --- 大对象 $ref:预签名与网关中转 token ---
-export { encodeObjectKey, presignS3Url } from './providers/s3Sign'
+export { encodeObjectKey, presignS3Put, presignS3Url } from './providers/s3Sign'
 export {
   cachedTools,
   getTools,
@@ -132,5 +137,15 @@ export {
   type SearchDirtyMarker,
   SearchSynchronizer,
 } from './search/synchronizer'
-
+// --- 部署级 default Store：宿主装配与 scheduled cleanup ---
+export {
+  cleanupDefaultStore,
+  defaultStoreRuntime,
+  KEY_STORE_CLEANUP_PROGRESS,
+  KEY_STORE_TOKEN_SECRET,
+  resolveStoreRequestOrigin,
+  STORE_CALL_CAPABILITY_HEADER,
+  STORE_UPLOAD_HEADER,
+  storeTokenSecret,
+} from './store'
 export { createTbApp } from './tbApp'

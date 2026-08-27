@@ -13,8 +13,8 @@
 import {
   assertSecureUrl,
   normalizeUpstreamError,
+  type ObjectBody,
   type ObjectBodyStream,
-  objectBodyToBytes,
   type ObjectListOptions,
   type ObjectListResult,
   type ObjectMeta,
@@ -22,7 +22,8 @@ import {
   TBError,
 } from '@tool-bridge/core'
 import { AwsClient } from 'aws4fetch'
-import { encodeObjectKey, presignS3Url } from './s3Sign'
+import { encodeObjectKey, presignS3Put, presignS3Url } from './s3Sign'
+import { toWebObjectBodyStream } from '../objectBodyStream'
 
 /** s3 provider 的构造参数(providerConfig + authRef 解析出的凭证)。 */
 export interface S3StoreConfig {
@@ -87,21 +88,42 @@ export function createS3ObjectStore(
     secretAccessKey: cfg.secretAccessKey,
     service: 's3',
     region: cfg.region ?? 'auto',
+    // Store 的重试由上层按操作幂等性统一决定。传输层不得自动重放写入，
+    // 也不能让读/删路径悄悄继承 aws4fetch 的默认 10 次重试。
+    retries: 0,
   })
   const base = cfg.endpoint.replace(/\/+$/, '')
   const bucketUrl = `${base}/${cfg.bucket}`
   const urlFor = (key: string): string => `${bucketUrl}/${encodeObjectKey(key)}`
 
   /** 签名 fetch;网络失败归一为 unavailable(retryable)。 */
-  const s3Fetch = async (url: string, init: RequestInit): Promise<Response> => {
+  const s3FetchWith = async (
+    aws: AwsClient,
+    url: string,
+    init: RequestInit,
+  ): Promise<Response> => {
     try {
-      return await client.fetch(url, init)
+      return await aws.fetch(url, init)
     } catch (err) {
       throw normalizeUpstreamError({
         kind: 'network',
         message: err instanceof Error ? err.message : String(err),
       })
     }
+  }
+  const s3Fetch = async (url: string, init: RequestInit): Promise<Response> => {
+    return await s3FetchWith(client, url, init)
+  }
+
+  /** ObjectBody → fetch body without reading an ObjectBodyStream ahead of fetch. */
+  const fetchBody = (body: ObjectBody): NonNullable<RequestInit['body']> => {
+    if (typeof body === 'string' || body instanceof ArrayBuffer) return body
+    if (body instanceof Uint8Array) {
+      return body.buffer instanceof ArrayBuffer
+        ? new Uint8Array(body.buffer, body.byteOffset, body.byteLength)
+        : new Uint8Array(body)
+    }
+    return toWebObjectBodyStream(body, { highWaterMark: 0 })
   }
 
   const metaFromHeaders = (key: string, headers: Headers): ObjectMeta => {
@@ -123,13 +145,15 @@ export function createS3ObjectStore(
     return meta
   }
 
+  const headObject = async (key: string): Promise<ObjectMeta | null> => {
+    const resp = await s3Fetch(urlFor(key), { method: 'HEAD' })
+    if (resp.status === 404) return null
+    if (!resp.ok) throw s3Error('head', resp.status)
+    return metaFromHeaders(key, resp.headers)
+  }
+
   return {
-    async head(key) {
-      const resp = await s3Fetch(urlFor(key), { method: 'HEAD' })
-      if (resp.status === 404) return null
-      if (!resp.ok) throw s3Error('head', resp.status)
-      return metaFromHeaders(key, resp.headers)
-    },
+    head: headObject,
 
     async get(key) {
       const resp = await s3Fetch(urlFor(key), { method: 'GET' })
@@ -145,28 +169,40 @@ export function createS3ObjectStore(
     },
 
     async put(key, body, putOpts) {
-      const bytes = await objectBodyToBytes(body)
       const headers: Record<string, string> = {}
+      // aws4fetch already chooses this value for non-query S3 signing; setting
+      // it explicitly makes streaming/no-pre-read behavior an enforced input.
+      headers['x-amz-content-sha256'] = 'UNSIGNED-PAYLOAD'
       if (putOpts?.contentType !== undefined) headers['content-type'] = putOpts.contentType
       for (const [name, value] of Object.entries(putOpts?.metadata ?? {})) {
         headers[`${META_HEADER_PREFIX}${name}`] = value
       }
       if (putOpts?.ifMatchEtag !== undefined) headers['if-match'] = `"${putOpts.ifMatchEtag}"`
-      const resp = await s3Fetch(urlFor(key), { method: 'PUT', headers, body: bytes })
+      if (putOpts?.ifNoneMatch !== undefined) headers['if-none-match'] = putOpts.ifNoneMatch
+      const resp = await s3Fetch(urlFor(key), {
+        method: 'PUT',
+        headers,
+        body: fetchBody(body),
+      })
       await resp.body?.cancel()
-      // 条件不满足 → 412;对象不存在时部分实现回 404——两者都按 core 契约归 conflict。
-      if (resp.status === 412 || (putOpts?.ifMatchEtag !== undefined && resp.status === 404)) {
-        throw new TBError('conflict', `etag 不匹配:'${key}'`)
+      const conditional = putOpts?.ifMatchEtag !== undefined || putOpts?.ifNoneMatch !== undefined
+      // S3-compatible implementations use either 409 or 412 for create-only
+      // races. if-match against a missing object may also return 404.
+      if (
+        (conditional && (resp.status === 409 || resp.status === 412))
+        || (putOpts?.ifMatchEtag !== undefined && resp.status === 404)
+      ) {
+        throw new TBError('conflict', `对象条件写冲突:'${key}'`)
       }
       if (!resp.ok) throw s3Error('put', resp.status)
-      const meta: ObjectMeta = {
-        key,
-        etag: stripEtagQuotes(resp.headers.get('etag') ?? ''),
-        size: bytes.byteLength,
-        updatedAt: new Date().toISOString(),
-        metadata: putOpts?.metadata ?? {},
+      // A streaming body has no trustworthy local byte length. HEAD is the
+      // authoritative post-write observation used by StoreService validation.
+      const meta = await headObject(key)
+      if (meta === null) {
+        throw new TBError('unavailable', 's3 put succeeded but HEAD did not observe the object', {
+          retryable: true,
+        })
       }
-      if (putOpts?.contentType !== undefined) meta.contentType = putOpts.contentType
       return meta
     },
 
@@ -229,6 +265,14 @@ export function createS3ObjectStore(
 
     presign(key, ttlSec) {
       return presignS3Url(client, urlFor(key), ttlSec)
+    },
+
+    presignPut(key, ttlSec, putOpts) {
+      return presignS3Put(client, urlFor(key), ttlSec, putOpts)
+    },
+
+    presignPutExact(key, ttlSec, putOpts) {
+      return presignS3Put(client, urlFor(key), ttlSec, putOpts)
     },
   }
 }

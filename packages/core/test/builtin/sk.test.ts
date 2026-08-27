@@ -39,7 +39,7 @@ describe('builtin sk 模块', () => {
       'write',
     ])
     expect(help.cmds.every(c => c.scope === 'admin')).toBe(true)
-    expect(help.cmds.every(c => c.method === 'POST' && c.path === '/system/sk')).toBe(true)
+    expect(help.cmds.every(c => c.method === 'POST' && c.path === `/system/sk/${c.name}`)).toBe(true)
   })
 
   it('write → list:签发的 SK 出现在 list 且投影不含 hash;write 返回一次性 secret', async () => {
@@ -109,5 +109,14 @@ describe('builtin sk 模块', () => {
       expiresAt: string
     }
     expect(unchanged.expiresAt).toBe('2026-07-07T00:00:00.000Z')
+  })
+
+  it('write 顶层与 scope 嵌套对象都拒绝未知字段', async () => {
+    await expect(mod.dispatch('write', { owner: 'agent:x', scopes: [], hash: 'forged' }, ctx))
+      .rejects.toSatisfy(e => isTBError(e) && e.code === 'invalid_argument')
+    await expect(mod.dispatch('write', {
+      owner: 'agent:x',
+      scopes: [{ pattern: '**', actions: ['read'], unexpected: true }],
+    }, ctx)).rejects.toSatisfy(e => isTBError(e) && e.code === 'invalid_argument')
   })
 })

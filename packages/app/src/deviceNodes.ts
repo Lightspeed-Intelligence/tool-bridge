@@ -3,6 +3,9 @@
  * 传输实现由宿主注入(CF = DeviceSession DO / Node = 进程内 ws),这里只认 DeviceChannel。
  */
 import {
+  type CallContext,
+  DEVICE_CALL_TIMEOUT_MS,
+  type DeviceCallContext,
   type DeviceCallResult,
   TBError,
   type TBErrorBody,
@@ -11,6 +14,7 @@ import {
   type TreePath,
 } from '@tool-bridge/core'
 import type { DeviceChannel, TbAppDeps } from './deps'
+import { issueDeviceCallUpload } from './store'
 
 // ---------- device 节点 ----------
 
@@ -29,15 +33,49 @@ export function requireDevice(deps: TbAppDeps): DeviceChannel {
 export async function invokeDevice(
   deps: TbAppDeps,
   deviceId: string,
-  req: { arguments: Record<string, unknown>, path: string, tool: string },
+  req: { arguments: Record<string, unknown>, context?: DeviceCallContext, path: string },
 ): Promise<unknown> {
   const id = crypto.randomUUID()
-  const body = (await requireDevice(deps).invoke(deviceId, { id, ...req })) as DeviceCallResult
+  const upload = req.context === undefined
+    ? null
+    : await issueDeviceCallUpload(deps, deviceId, id, req.context)
+  let body: DeviceCallResult
+  try {
+    body = (await requireDevice(deps).invoke(deviceId, {
+      id,
+      path: req.path,
+      arguments: req.arguments,
+      ...(req.context === undefined ? {} : { context: upload?.context ?? req.context }),
+    })) as DeviceCallResult
+  } finally {
+    // A returned/cancelled call must not leave its create capability replayable.
+    // Revocation is best effort: expiry remains the hard backstop and cleanup
+    // will converge state even if the call's final network hop failed.
+    await upload?.revoke().catch(() => {})
+  }
   if (!body || !('ok' in body)) {
     throw new TBError('unavailable', 'device session returned invalid result')
   }
   if (body.ok) return body.value
   throw tbErrorFromBody(body.error)
+}
+
+/**
+ * 从鉴权后的 CallContext 构造下发给设备的 DeviceCallContext。
+ *
+ * 只读取网关权威事实(keyId/owner/traceId),绝不读取调用 arguments。故意不含
+ * scopes / SK / 敏感参数:设备不做授权裁决,scope 判定在网关侧已完成。
+ * expiresAt 以网关时钟对齐 DEVICE_CALL_TIMEOUT_MS —— 即设备看到的期限正好是网关
+ * 真正取消该 call 的时刻,设备复检以此为准,不信任设备本地时钟。
+ */
+export function deviceCallContextFrom(ctx: CallContext): DeviceCallContext {
+  const now = Date.now()
+  return {
+    caller: { keyId: ctx.keyId, owner: ctx.owner },
+    traceId: ctx.traceId,
+    createdAt: new Date(now).toISOString(),
+    expiresAt: new Date(now + DEVICE_CALL_TIMEOUT_MS).toISOString(),
+  }
 }
 
 /** device 自定义节点转发标记:hello 代注册时网关写入 providerConfig。 */

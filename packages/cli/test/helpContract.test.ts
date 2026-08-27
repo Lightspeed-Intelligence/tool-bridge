@@ -44,6 +44,8 @@ describe('CLI help 参数契约', () => {
     expect(help).toContain('mutually exclusive with --no-shell')
     expect(help).toContain('mutually exclusive with --allow')
     expect(help).toContain('requires at least one --fs')
+    expect(help).toContain('--command-profile <file>')
+    expect(help).toContain('direct argv, no implicit shell')
   })
 
   it('daemon install 复用 connect 安全参数，内部 run 入口不出现在 help', () => {
@@ -51,6 +53,7 @@ describe('CLI help 参数契约', () => {
     expect(install).toContain('persistent systemd user service')
     expect(install).toContain('mutually exclusive with --no-shell')
     expect(install).toContain('requires at least one --fs')
+    expect(install).toContain('--command-profile <file>')
     expect(install).toContain('private 0600 daemon config')
     expect(install).toContain('--yes')
     expect(install).toContain('trusted machines only')
@@ -80,6 +83,26 @@ describe('CLI help 参数契约', () => {
       '--limit/--cursor require system/registry visibility',
     )
     expect(serverLsHelp.match(/--base-url <url>/g)).toHaveLength(1)
+  })
+
+  it('call help 标明 arguments 四源互斥、stdin 与 --arg 定型规则', () => {
+    const help = fullHelpAt('call')
+    expect(help).toContain('Arguments from a JSON file, or `-` for stdin')
+    expect(help).toContain('mutually exclusive with [args]/--args/--args-file')
+    expect(help).toContain('true/false -> boolean')
+    expect(help).toContain('A repeated key wins with its last occurrence')
+    expect(help).toContain('--args-file -')
+  })
+
+  it('search help 标明 compact/full 与排名筛选参数', () => {
+    const help = fullHelpAt('search')
+    expect(help).toContain('default, including --json: compact')
+    expect(help).toContain('--matching <matching>')
+    expect(help).toContain('--federation <scope>')
+    expect(help).toContain('--min-coverage <fraction>')
+    expect(help).toContain('--path-prefix <path>')
+    expect(help).toContain('--effect <effect>')
+    expect(help).toContain('(repeatable)')
   })
 
   it('tree/skill/sk help 标明取值范围与互斥关系', () => {

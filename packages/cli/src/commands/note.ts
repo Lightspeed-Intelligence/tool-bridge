@@ -1,13 +1,8 @@
 import { Command } from 'commander'
-import { guard, printJson, printLine, table } from '../output'
+import { printJson, printLine, table } from '../output'
 import { resolveTarget, withGlobalOpts } from '../args'
-import { callTool } from '../http'
-
-interface NoteGlobalOpts {
-  baseUrl?: string
-  json?: boolean
-  sk?: string
-}
+import { confirmDestructive } from '../confirm'
+import { callDirect } from '../http'
 
 /** system/annotation 的一条补充说明。 */
 interface Annotation {
@@ -28,87 +23,80 @@ function displayPath(path: string): string {
 }
 
 /** `tb note ls [prefix]` → 全部(或某前缀下)已标注路径。 */
-export function noteLsCommand(): Command {
+export function noteLsCommand() {
   return withGlobalOpts(new Command('ls'))
     .description('List annotated paths (optionally under a prefix)')
     .argument('[prefix]', 'Only paths under this prefix')
-    .action(async (prefixArg: string | undefined, opts: NoteGlobalOpts) => {
+    .action(async (prefixArg, opts) => {
       const asJson = Boolean(opts.json)
-      await guard(asJson, async () => {
-        const args = prefixArg !== undefined ? { prefix: prefixArg } : {}
-        const page = await callTool<{ items: Annotation[] }>(
-          resolveTarget(opts),
-          '/system/annotation',
-          'list',
-          args,
-        )
-        if (asJson) {
-          printJson(page)
-          return
-        }
-        const rows = (page.items ?? []).map(a => [
-          displayPath(a.path),
-          a.text,
-          a.updatedAt ? new Date(a.updatedAt).toLocaleString() : '-',
-        ])
-        printLine(table(['PATH', 'NOTE', 'UPDATED'], rows))
-      })
+      const args = prefixArg !== undefined ? { prefix: prefixArg } : {}
+      const page = await callDirect<{ items: Annotation[] }>(
+        resolveTarget(opts),
+        '/system/annotation/list',
+        args,
+      )
+      if (asJson) {
+        printJson(page)
+        return
+      }
+      const rows = (page.items ?? []).map(a => [
+        displayPath(a.path),
+        a.text,
+        a.updatedAt ? new Date(a.updatedAt).toLocaleString() : '-',
+      ])
+      printLine(table(['PATH', 'NOTE', 'UPDATED'], rows))
     })
 }
 
 /** `tb note get <path>` → 单条补充说明全文。 */
-export function noteGetCommand(): Command {
+export function noteGetCommand() {
   return withGlobalOpts(new Command('get'))
     .description('Show the note of a path')
     .argument('<path>', 'Tree path (use \'/\' for the tree-wide notice)')
-    .action(async (pathArg: string, opts: NoteGlobalOpts) => {
+    .action(async (pathArg, opts) => {
       const asJson = Boolean(opts.json)
-      await guard(asJson, async () => {
-        const entry = await callTool<Annotation>(resolveTarget(opts), '/system/annotation', 'get', {
-          path: apiPath(pathArg),
-        })
-        if (asJson) printJson(entry)
-        else printLine(entry.text)
+      const entry = await callDirect<Annotation>(resolveTarget(opts), '/system/annotation/get', {
+        path: apiPath(pathArg),
       })
+      if (asJson) printJson(entry)
+      else printLine(entry.text)
     })
 }
 
 /** `tb note set <path> <text>` → 覆盖写入(展示在该 path 的 ~help;admin scope)。 */
-export function noteSetCommand(): Command {
+export function noteSetCommand() {
   return withGlobalOpts(new Command('set'))
     .description('Upsert the note shown in ~help of a path (use \'/\' for a tree-wide notice)')
     .argument('<path>', 'Tree path (tool sub-paths allowed, e.g. feishu/create-doc)')
     .argument('<text>', 'Note text (<= 2000 chars)')
-    .action(async (pathArg: string, textArg: string, opts: NoteGlobalOpts) => {
+    .action(async (pathArg, textArg, opts) => {
       const asJson = Boolean(opts.json)
-      await guard(asJson, async () => {
-        const entry = await callTool<Annotation>(resolveTarget(opts), '/system/annotation', 'set', {
-          path: apiPath(pathArg),
-          text: textArg,
-        })
-        if (asJson) printJson(entry)
-        else printLine(`note set on ${displayPath(entry.path)}`)
+      const entry = await callDirect<Annotation>(resolveTarget(opts), '/system/annotation/set', {
+        path: apiPath(pathArg),
+        text: textArg,
       })
+      if (asJson) printJson(entry)
+      else printLine(`note set on ${displayPath(entry.path)}`)
     })
 }
 
 /** `tb note rm <path>` → 删除补充说明(admin scope)。 */
-export function noteRmCommand(): Command {
+export function noteRmCommand() {
   return withGlobalOpts(new Command('rm'))
     .description('Remove the note of a path')
     .argument('<path>', 'Tree path (use \'/\' for the tree-wide notice)')
-    .action(async (pathArg: string, opts: NoteGlobalOpts) => {
+    .option('--yes', 'Skip the confirmation prompt')
+    .action(async (pathArg, opts) => {
       const asJson = Boolean(opts.json)
-      await guard(asJson, async () => {
-        const path = apiPath(pathArg)
-        await callTool(resolveTarget(opts), '/system/annotation', 'remove', { path })
-        if (asJson) printJson({ ok: true, path })
-        else printLine(`note removed from ${displayPath(path)}`)
-      })
+      const path = apiPath(pathArg)
+      await confirmDestructive(opts, `Remove the note on ${displayPath(path)}?`)
+      await callDirect(resolveTarget(opts), '/system/annotation/remove', { path })
+      if (asJson) printJson({ ok: true, path })
+      else printLine(`note removed from ${displayPath(path)}`)
     })
 }
 
-export function noteCommand(): Command {
+export function noteCommand() {
   return new Command('note')
     .description('Manage path notes shown in ~help (system/annotation; set/rm need admin scope)')
     .addCommand(noteLsCommand())

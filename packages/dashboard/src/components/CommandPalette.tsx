@@ -12,9 +12,9 @@ import {
   ShieldEllipsis,
   Sun,
 } from 'lucide-react'
-import { useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router'
-import type { NodeKind, TreeJson } from '@/lib/types'
+import { useTheme } from 'next-themes'
+import type { NodeKind, Presence, TreeJson } from '@/lib/types'
 import {
   CommandDialog,
   CommandEmpty,
@@ -24,19 +24,20 @@ import {
   CommandList,
   CommandSeparator,
 } from '@/components/ui/command'
+import { PRESENCE_HINT, PRESENCE_LABEL } from '@/lib/presence'
+import { useInvalidate, useTree } from '@/lib/queries'
 import { KindBadge } from '@/components/KindBadge'
 import { KIND_ICON } from '@/components/kind-icon'
 import { useSession } from '@/lib/session-context'
 import { encodeTreePath } from '@/lib/path'
-import { useTree } from '@/lib/queries'
-import { useTheme } from '@/lib/theme'
 import { cn } from '@/lib/utils'
 
 interface FlatNode {
   description: string
   kind: NodeKind
-  online?: boolean
   path: string
+  /** 数据源是 `~tree`,宿主已投影好三态;这里只搬运不重算。 */
+  presence?: Presence
 }
 
 function flatten(node: TreeJson, acc: FlatNode[] = []): FlatNode[] {
@@ -45,7 +46,7 @@ function flatten(node: TreeJson, acc: FlatNode[] = []): FlatNode[] {
       path: node.path,
       kind: node.kind,
       description: node.description,
-      online: node.online,
+      ...(node.presence !== undefined ? { presence: node.presence } : {}),
     })
   }
   for (const c of node.children ?? []) flatten(c, acc)
@@ -77,9 +78,10 @@ export function CommandPalette({
   // 命令面板关闭时不拉全树,避免首屏绕过 TreeNav 的 remote 懒加载。
   const tree = useTree('', 8, { enabled: open })
   const navigate = useNavigate()
-  const [theme, toggleTheme] = useTheme()
+  const { resolvedTheme, setTheme } = useTheme()
+  const isDark = resolvedTheme !== 'light'
   const { logout } = useSession()
-  const qc = useQueryClient()
+  const invalidate = useInvalidate()
 
   const nodes = tree.data ? flatten(tree.data) : []
 
@@ -113,8 +115,17 @@ export function CommandPalette({
                 >
                   <Icon className={cn('size-3.5', iconClass)} strokeWidth={1.75} />
                   <span className="truncate font-mono text-xs">{n.path}</span>
-                  {n.online === false && (
-                    <span className="font-mono text-[10px] text-muted-foreground">offline</span>
+                  {/* 只标非 online 的状态:online 是默认预期,不占面板宽度。 */}
+                  {n.presence !== undefined && n.presence.state !== 'online' && (
+                    <span
+                      className={cn(
+                        'font-mono text-[10px]',
+                        n.presence.state === 'stale' ? 'text-warn' : 'text-muted-foreground',
+                      )}
+                      title={PRESENCE_HINT[n.presence.state]}
+                    >
+                      {PRESENCE_LABEL[n.presence.state]}
+                    </span>
                   )}
                   <KindBadge className="ml-auto" kind={n.kind} />
                 </CommandItem>
@@ -137,21 +148,21 @@ export function CommandPalette({
         <CommandGroup heading="动作">
           <CommandItem
             onSelect={() => {
-              toggleTheme()
+              setTheme(isDark ? 'light' : 'dark')
               onOpenChange(false)
             }}
             value="action theme 切换主题 dark light"
           >
-            {theme === 'dark' ? <Sun className="size-3.5" /> : <Moon className="size-3.5" />}
+            {isDark ? <Sun className="size-3.5" /> : <Moon className="size-3.5" />}
             <span className="text-xs">
               切换到
-              {theme === 'dark' ? '浅色' : '深色'}
+              {isDark ? '浅色' : '深色'}
               主题
             </span>
           </CommandItem>
           <CommandItem
             onSelect={() => {
-              qc.invalidateQueries({ queryKey: ['tb'] })
+              invalidate()
               onOpenChange(false)
             }}
             value="action refresh 刷新数据"

@@ -55,7 +55,10 @@ function SetTokenDialog({
     setErr(null)
     await invoke
       .mutateAsync(
-        { path: 'system/usercred', tool: 'set', args: { domain: domain.domain, value: value.trim() } },
+        {
+          commandPath: 'system/usercred/set',
+          args: { domain: domain.domain, value: value.trim() },
+        },
         {
           onSuccess: () => {
             toast.success(`已保存 ${domain.domain} 的个人凭证`)
@@ -215,8 +218,7 @@ export function MyCredentialsPage() {
   const clear = async (domain: CredentialDomainState) => {
     try {
       await invoke.mutateAsync({
-        path: 'system/usercred',
-        tool: 'delete',
+        commandPath: 'system/usercred/delete',
         args: { domain: domain.domain },
       })
       toast.success(`已清除 ${domain.domain} 的个人凭证`)

@@ -6,18 +6,24 @@
  * 「两条路径共用同一函数」这一结构性保证覆盖(真实远端链路见 opt-in connect.remote)。
  */
 
-import { MemoryStateStore, TBError, type ToolResult, type ToolSpec } from '@tool-bridge/core'
+import {
+  MemoryObjectStore,
+  MemoryStateStore,
+  TBError,
+  type ToolResult,
+  type ToolSpec,
+} from '@tool-bridge/core'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { serve } from '@hono/node-server'
 import { createToolBridge, type ToolBridge } from '../src'
 
 const ADMIN_SK = 'tbk_sdk_reg_admin_00000000000'
 
-/** 只读 context:只实现 Get/List —— 旧的四动词强制契约下写不出来。 */
+/** 只读 context:只实现 get/list —— 旧的四动词强制契约下写不出来。 */
 function readOnlyNotes() {
   return {
-    List: () => Promise.resolve({ items: [] }),
-    Get: (path: string) => Promise.reject(TBError.notFound(`no such entry: ${path}`)),
+    list: () => Promise.resolve({ items: [] }),
+    get: (path: string) => Promise.reject(TBError.notFound(`no such entry: ${path}`)),
   }
 }
 
@@ -25,8 +31,8 @@ const spec: ToolSpec = { name: 'ping', description: 'ping' }
 
 function pingProvider() {
   return {
-    List: (): ToolSpec[] => [spec],
-    Call: (): ToolResult => ({ content: 'pong' }),
+    list: (): ToolSpec[] => [spec],
+    call: (): ToolResult => ({ content: 'pong' }),
   }
 }
 
@@ -35,7 +41,11 @@ let close: () => void
 let tb: ToolBridge
 
 beforeAll(async () => {
-  tb = createToolBridge({ state: new MemoryStateStore(), adminSk: ADMIN_SK })
+  tb = createToolBridge({
+    state: new MemoryStateStore(),
+    objects: new MemoryObjectStore(),
+    adminSk: ADMIN_SK,
+  })
   tb.registerContext('readonly-notes', readOnlyNotes(), { description: '只读笔记' })
   tb.registerTool('tools/ping', pingProvider(), {
     description: 'ping 工具',
@@ -53,14 +63,14 @@ beforeAll(async () => {
 afterAll(() => close?.())
 
 async function registryGet(path: string): Promise<Record<string, unknown>> {
-  const res = await fetch(`${baseUrl}/system/registry`, {
+  const res = await fetch(`${baseUrl}/system/registry/get`, {
     method: 'POST',
     headers: {
       'authorization': `Bearer ${ADMIN_SK}`,
       'content-type': 'application/json',
       'accept': 'application/json',
     },
-    body: JSON.stringify({ tool: 'get', arguments: { path } }),
+    body: JSON.stringify({ path }),
   })
   expect(res.status).toBe(200)
   return (await res.json()) as Record<string, unknown>
@@ -81,9 +91,9 @@ describe('registerContext 的能力推导落进节点配置', () => {
     expect(res.status).toBe(200)
     const help = (await res.json()) as { cmds: Array<{ name: string }> }
     const names = help.cmds.map(c => c.name).sort()
-    expect(names).toEqual(['Get', 'List'])
-    expect(names).not.toContain('Write')
-    expect(names).not.toContain('Update')
+    expect(names).toEqual(['get', 'list'])
+    expect(names).not.toContain('write')
+    expect(names).not.toContain('update')
   })
 
   it('~describe 的 capabilities 按 handler 推导(无 Search/Delete → 空)', async () => {

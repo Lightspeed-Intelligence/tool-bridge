@@ -36,7 +36,7 @@ interface BootstrapEnv {
  * 写入持久日志。Node server 仅在显式开发逃生配置下允许随机生成。
  */
 
-/** 引导时注册的内置节点(system directory + 八个 builtin;feedback 走 ~feedback 保留段,非 builtin)。 */
+/** 引导时注册的内置节点(system directory + builtin;feedback 走 ~feedback 保留段,非 builtin)。 */
 const BUILTIN_MODULES = [
   'sk',
   'secret',
@@ -46,6 +46,7 @@ const BUILTIN_MODULES = [
   'catalog',
   'federation',
   'annotation',
+  'store',
   'usercred',
 ] as const
 
@@ -58,12 +59,21 @@ const BUILTIN_DESCRIPTIONS: Record<string, string> = {
   catalog: 'Built-in integration catalog (read-only)',
   federation: 'Remote federation host allowlist',
   annotation: 'Admin notes shown in ~help of any path',
+  store: 'Deployment-level private object Store',
   usercred: 'Your personal upstream credentials (per-user, write-only)',
 }
 
 let bootstrapOnce: Promise<void> | undefined
 
-/** 用固定明文签发 Admin SK(便于部署自动化);hash 入库,不生成随机明文。 */
+/**
+ * 用固定明文签发 Admin SK(便于部署自动化);hash 入库,不生成随机明文。
+ *
+ * 并发引导去重(多 Pod / 多 isolate 同时冷启动):hash key 是天然的去重键——同一
+ * TB_BOOTSTRAP_ADMIN_SK 得到同一 sha256。经 putIfAbsent 抢写,输者直接收手,
+ * 不再写自己的 sk:i:<id> 索引(id 每次随机,重复铸造会给同一 Admin SK 留下多条
+ * 管理面索引)。后端无 putIfAbsent(无 CAS 的自定义 store)时回退 get-miss→put:窗口仍在,
+ * 但 hash key 写入是同值幂等,残余危害只剩重复索引条目。
+ */
 async function mintAdminWithPlaintext(
   store: StateStore,
   plaintext: string,
@@ -71,14 +81,21 @@ async function mintAdminWithPlaintext(
 ): Promise<void> {
   const { key } = await mintKey(adminBootstrapInput(), now)
   const adminKey: SecretKey = { ...key, hash: await sha256Hex(plaintext) }
-  await store.put(KEY_SK_HASH + adminKey.hash, adminKey)
-  await store.put(KEY_SK_ID + adminKey.id, adminKey.hash)
+  const hashKey = KEY_SK_HASH + adminKey.hash
+  let won: boolean
+  if (store.putIfAbsent !== undefined) {
+    won = await store.putIfAbsent(hashKey, adminKey)
+  } else {
+    won = (await store.get(hashKey)) === null
+    if (won) await store.put(hashKey, adminKey)
+  }
+  if (won) await store.put(KEY_SK_ID + adminKey.id, adminKey.hash)
 }
 
 /**
  * 内置节点幂等 ensure(Q15):已引导实例(幂等标志已置位)升级后也要
  * 补挂新加入的内置节点(如 system/plugin)。只写缺失节点(get miss → write),
- * 不覆盖既有节点——避免每个 isolate 冷启动都重写 KV,也不动管理面改过的描述。
+ * 不覆盖既有节点——避免每个 isolate 冷启动都重写状态,也不动管理面改过的描述。
  */
 async function ensureBuiltinNodes(registry: NodeRegistryStore, now: string): Promise<void> {
   const ensure = async (node: NodeInput): Promise<void> => {

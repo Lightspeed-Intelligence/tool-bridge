@@ -60,7 +60,7 @@ const BOTH_KINDS: PluginDescribe = {
       auth: { kind: 'single', label: 'Reader key', required: true },
       id: 'documents',
       profile: 'context/v1',
-      methods: ['Get', 'List'],
+      methods: ['get', 'list'],
       mountConfigFields: [{ key: 'tenant', required: true }],
     },
   ],
@@ -260,5 +260,10 @@ describe('未知 cmd', () => {
     await expect(mod.dispatch('write', {}, ctx)).rejects.toSatisfy(
       err => isTBError(err) && err.code === 'invalid_argument',
     )
+  })
+
+  it('已知 cmd 的未知 arguments 字段也拒绝', async () => {
+    await expect(mod.dispatch('search', { q: 'tavily', extra: true }, ctx))
+      .rejects.toSatisfy(err => isTBError(err) && err.code === 'invalid_argument')
   })
 })

@@ -1,0 +1,123 @@
+---
+description: tb CLI 参数契约:解析/客户端/服务端三层检查、default Store 命令、三入口对等与破坏性确认门。
+kind: guide
+relations:
+  requires:
+    - protocol/htbp-contract.mdx
+code:
+  paths:
+    - knip.jsonc
+    - packages/cli/package.json
+    - packages/cli/tsconfig.json
+    - packages/cli/vitest.config.ts
+    - packages/cli/src/args.ts
+    - packages/cli/src/commander.d.ts
+    - packages/cli/src/commanderInference.typecheck.ts
+    - packages/cli/src/main.ts
+    - packages/cli/src/program.ts
+    - packages/cli/src/confirm.ts
+    - packages/cli/src/http.ts
+    - packages/cli/src/deviceRuntime.ts
+    - packages/cli/src/commands/**
+    - packages/sdk/src/client/**
+    - packages/sdk/src/store/**
+    - packages/sdk/src/device/**
+---
+
+# CLI 参数契约检查
+
+CLI 是公共控制面,不是 API 的宽松包装。修改命令时同时检查三层:解析层、客户端语义层、服务端权限层;任一层缺失都会产生管理旁路或误导性帮助。wire 层面的命令契约(builtin 命令表、错误码、Help 模型)以 [protocol/htbp-contract](../protocol/htbp-contract.mdx) 为准,本文只覆盖 CLI 侧的评审纪律。
+
+## 参数原则
+
+- 同名参数必须同义;不同语义使用不同名称。
+- 全局参数在 root、group、leaf 三个位置都应可解析,不能依赖 Commander 的偶然继承行为。
+- 未知参数、缺值和多余位置参数必须失败,退出码与 stderr 保持可脚本化。
+- 互斥、依赖、默认值和枚举在解析层显式表达;不要把非法组合静默改写。
+- 密钥只从专用 secret 流程进入,不保留隐藏的旧 flag,也不把明文带入普通资源命令。
+- `tb tool mount --kind mcp --auth oauth` 缺省使用 DCR；不支持 DCR 的上游可用
+  `--oauth-client-id <id>` 配置预注册 public client，或再加 `--oauth-client-secret-ref <name>` 配置
+  confidential client。secret-ref 必须依赖 client-id，两者只适用于 MCP OAuth，并与 bearer `--auth-ref` 保持
+  独立；CLI 不提供明文 client-secret 参数。授权仍由后续 `tb tool auth` 发起，`--local` 与网关 callback 共用同一
+  client 配置和 redirect binding。
+- `ctx put` 面向可内联文本/JSON（支持 stdin 与 metadata），`ctx upload` 面向二进制直传；后者缺省条件创建，同名 entry 以 `conflict` 失败，只有显式 `--force` 才请求可覆盖 grant。两条命令的帮助必须互指，避免把直传误解为 `put` 的别名。
+- `tb store` 是部署级对象管理面，与 `ctx` 正交：`upload <file>` 新建 opaque Store 对象，不接收 Context
+  path/entry/overwrite；`stat|get|share|rm` 接严格 `store://default/...`，`revoke-share` 接 share id，
+  `list`/`ls` cursor 分页。帮助必须明确“命名语义 entry 用 `tb ctx upload`”，不能让两类上传互相冒充。
+- `store upload` 从文件 stat 得到 size，流式发送，并按 grant 自动选择 relay/direct；relay PUT 返回
+  descriptor，direct 才调用 capability-only complete。`--idempotency-key` 是 owner-scoped create 重试
+  key，不是覆盖路径。文件 size 大于当次 `maxBytes` 时在本地早拒，服务端仍做权威限额。
+- `store get` 缺省把字节流向 stdout；`--out` 以 create-only 打开，失败只删除本次产生的残片，不覆盖
+  既有文件。`--json` 下载必须同时给 `--out`，避免把二进制与 JSON 混到 stdout。
+- Store capability、签名 URL、headers 与 token 不进入错误/stderr。唯一例外是用户明确执行
+  `store share`：成功 stdout/JSON 必须交付该次请求产生的短期 `$ref`，否则 share 命令没有可用产物；
+  其他 Store 输出继续裁剪 bearer。
+- 删除资源只做命令名承诺的动作,并校验目标 kind:`integration rm` 只卸 tool/context 节点,打到 device 等其它 kind 即拒(走 `deleteNode(target, path, ['tool','context'])`)。集成卸载与密钥删除是两个显式操作。
+- `tb search` 默认请求 compact discovery，`--json` 也不隐式下载 schema；只有 `--schemas` 才映射
+  `detail:'full'`。`--federation local|recursive`、`--matching best|all`、`--min-coverage`、
+  `--path-prefix` 与 repeatable `--effect` 必须原样下发 SDK wire；CLI 只做非法枚举/组合的早拒，不能
+  自己重排或过滤服务端结果。partial source 状态写 stderr warning，JSON page 保持机器可读。
+
+## 类型契约
+
+Commander 的 `.argument()`/`.option()` 链同时是运行时解析、help 与 action callback 类型的真源。命令文件
+不得再维护平行的 opts interface 或重复标注 callback 参数；共享 decorator 必须保留并返回 Commander 的
+`Command<Args, Opts, GlobalOpts>` 增强泛型，调用者也必须继续使用增强后的返回值，不能重新拓宽成普通
+`Command`。
+
+CLI 使用 Commander 官方 extra typings 的 ambient module 只替换编译期声明，运行时仍只依赖并导入
+`commander`；两者的 major/minor 线必须对齐。`commanderInference.typecheck.ts` 是 `tsc --noEmit` 必须覆盖、
+但 CLI 运行入口不得 import 的 compile-only 契约夹具，用代表性 positional、全局/分页/device options 与
+repeatable collector 防止 wrapper 或依赖升级把推断退化成 `any`。Knip 对这类类型入口做窄范围显式建模，
+不得用全仓 ignore 掩盖真实未使用文件或依赖。
+
+## 结构与错误边界
+
+`runMain` 包围根 `program.parseAsync`，是生产 CLI 唯一错误边界。Commander 解析错误和 action reject 都在此统一进入 `reportError`；每个 `.action()` 不得再包一层 guard/catch，否则会重复书写退出码、JSON 模式和敏感错误裁剪。`tb status` 的 target/transport 失败也必须 reject 到该边界，不能自行输出后 return success；帮助/版本的 Commander 提前退出仍在根边界被识别为成功。
+
+CLI 只保留 argv、profile/凭证、stdout/stderr 与 Node 宿主适配。固定控制面 HTTP 交给 `@tool-bridge/sdk/client`，Store wire/transport 交给 `@tool-bridge/sdk/store`，设备 reconnect/heartbeat/credential refresh 交给 `@tool-bridge/sdk/device` 的 portable supervisor。`http.ts`、Store commands 与 `deviceRuntime.ts` 是 CLI 语义适配层，不应复制 SDK 中的 wire parser 或连接状态机。
+
+Linux 的 `tb connect` 与 `tb daemon install` 接受可重复 `--command-profile <file>`。CLI 在连接/安装前读取
+JSON,做 strict profile 校验与 HTBP path/name canonicalization,再把每个 profile 投影为既有
+`DeviceExpose.nodes` tool node。structured profile 可与 shell/FS 并存,也可配合 `--no-shell` 成为唯一暴露;
+shell、FS、profile 三者皆空才报 `nothing to expose`。profile path 与保留 `shell`/`fs` 相等或互为父子,
+以及多个 profile path 相等或互为父子,都必须 fail closed。
+
+executable、固定 argv、输入槽展开、cwd 和环境选择是 CLI Node 宿主适配职责,不下沉到 neutral
+`@tool-bridge/sdk/device`。调用输入由 profile 生成 strict schema,运行时只做 direct argv 执行而不接收隐式
+shell 字符串。daemon install 保存已经校验/规范化的 profile 值,而不是源文件路径;restart/run 不重读源文件,
+profile 变更必须重新 install。该冻结行为既避免源文件漂移,也意味着撤销危险 profile 不能只编辑原 JSON。
+
+CLI 在 workspace 内 typecheck、Vitest 与 tsup 三个解析面都必须覆盖实际使用的 neutral SDK 子入口，并直接
+指向对应 source entry；不能让本地历史 `packages/sdk/dist` 代替源码映射。`verify` 不为此预先 build SDK，
+发布产物的 `.d.ts`/JS closure 仍由独立 build/pack 门验证。
+
+## 确认门不是护栏
+
+破坏性命令(rm/unmount 及 `sk create` 空 scope)的二次确认只对交互式 TTY 且未给 `--yes` 生效;`--yes` 与非 TTY(管道 / CI / Agent `--json`)一律放行。确认是人类安全网,不改变脚本/Agent 既有行为,因此不破坏三入口对等;真正的护栏(kind 白名单、服务端权威校验)不能依赖它。共享 helper 在 `packages/cli/src/confirm.ts`。
+
+## 三入口对等
+
+新增或改变管理能力时,逐项核对:
+
+| 面 | 要验证的内容 |
+|---|---|
+| 直接 API / HTBP | 权限、状态码、响应形状与错误码 |
+| `tb` CLI | 参数可达、帮助文本、stdout/stderr、退出码 |
+| Dashboard | 字段来源、校验、敏感值处理与成功后刷新 |
+
+Store 的当前对等面是 `system/store`、上述 `tb store` 命令与 Dashboard `/manage/store`。Device SDK 的
+`call.uploadObject` 是设备数据面，不要求 CLI 模拟 call capability，但最终仍消费同一 create/relay/direct
+状态机。
+
+如果 Dashboard 或 API 能完成而 CLI 无法表达,就是管理旁路。若某能力有意只属于一个入口,应在契约中说明原因。
+
+## 评审步骤
+
+1. 从 `packages/cli/src/program.ts` 和对应 command 文件确认实际命令树。
+2. 对照 builtin 的 `~help`/返回契约,不从旧示例反推参数。
+3. 覆盖 root/group/leaf 参数位置、非法输入、权限不足和服务端失败。
+4. 更新 `helpContract`、`strictParsing`、`argSemantics` 与业务命令测试。
+5. 涉及 wire 字段时,同轮更新 core、app、CLI、Dashboard 和协议文档。
+
+帮助文本只描述当前路径,不保留 migration 文案;项目尚未上线,旧命令直接删除而不是长期隐藏。

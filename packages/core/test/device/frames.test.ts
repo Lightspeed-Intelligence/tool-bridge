@@ -7,7 +7,8 @@ import {
   PING_FRAME_JSON,
   PONG_FRAME_JSON,
 } from '../../src/device/frames'
-import { isTBError, TBError } from '../../src/errors'
+import { isTBError, TB_ERROR_CODES, TBError } from '../../src/errors'
+import { tbErrorBodySchema } from '../../src/protocol/errorWire'
 
 /** 执行并返回 TBError code(未抛 → null)。 */
 function codeOf(fn: () => unknown): string | null {
@@ -44,7 +45,7 @@ describe('encode/decode 往返', () => {
     },
     { type: 'ready', mountPath: 'device/build-01' },
     { type: 'error', error: { code: 'permission_denied', message: 'nope', retryable: false } },
-    { type: 'call', id: 'r1', path: 'shell', tool: 'exec', arguments: { command: 'echo hi' } },
+    { type: 'call', id: 'r1', path: 'shell/exec', arguments: { command: 'echo hi' } },
     { type: 'result', id: 'r1', ok: true, value: { stdout: 'hi\n', stderr: '', exitCode: 0 } },
     {
       type: 'result',
@@ -86,6 +87,7 @@ describe('encode/decode 往返', () => {
                 name: 'echo',
                 description: '原样返回',
                 inputSchema: { type: 'object', properties: { text: { type: 'string' } } },
+                outputSchema: { type: 'object', properties: { echoed: { type: 'string' } } },
                 effect: 'read',
               },
               { name: 'wipe', effect: 'destructive', confirm: true },
@@ -117,6 +119,77 @@ describe('encode/decode 往返', () => {
         `应拒绝:${text}`,
       ).toBe('invalid_argument')
     }
+  })
+
+  it('call 帧携带 context(caller/deadline)往返保持', () => {
+    const frame: DeviceFrame = {
+      type: 'call',
+      id: 'r3',
+      path: 'tools/echo/echo',
+      arguments: { text: 'hi' },
+      context: {
+        caller: { keyId: 'sk_1', owner: 'agent:researcher', displayName: 'Researcher' },
+        traceId: 'trace-1',
+        createdAt: '2026-08-19T00:00:00.000Z',
+        expiresAt: '2026-08-19T00:01:00.000Z',
+        upload: {
+          token: 'tbc_opaque.secret',
+          expiresAt: '2026-08-19T00:01:00.000Z',
+          maxBytes: 1024,
+          maxObjects: 2,
+        },
+      },
+    }
+    expect(decodeDeviceFrame(encodeDeviceFrame(frame))).toEqual(frame)
+  })
+
+  it('call context upload 严格校验 token/expiry/正整数限制且拒绝未知字段', () => {
+    const prefix
+      = '{"type":"call","id":"r1","path":"p/run","arguments":{},"context":{"caller":{"keyId":"k","owner":"user:a"},"traceId":"tr","createdAt":"t0","expiresAt":"t1","upload":'
+    const suffix = '}}'
+    const valid
+      = '{"token":"cap","expiresAt":"2026-08-25T00:01:00.000Z","maxBytes":10,"maxObjects":1}'
+    expect(decodeDeviceFrame(`${prefix}${valid}${suffix}`)).toMatchObject({
+      context: { upload: { token: 'cap', maxBytes: 10, maxObjects: 1 } },
+    })
+    const invalid = [
+      '{"expiresAt":"2026-08-25T00:01:00.000Z","maxBytes":10,"maxObjects":1}',
+      '{"token":"cap","expiresAt":"bad","maxBytes":10,"maxObjects":1}',
+      '{"token":"cap","expiresAt":"2026-08-25T00:01:00.000Z","maxBytes":0,"maxObjects":1}',
+      '{"token":"cap","expiresAt":"2026-08-25T00:01:00.000Z","maxBytes":10,"maxObjects":1.5}',
+      '{"token":"cap","expiresAt":"2026-08-25T00:01:00.000Z","maxBytes":10,"maxObjects":1,"extra":true}',
+    ]
+    for (const upload of invalid) {
+      expect(codeOf(() => decodeDeviceFrame(`${prefix}${upload}${suffix}`))).toBe('invalid_argument')
+    }
+  })
+
+  it('call 帧的 context 缺 displayName 合法;缺必填字段 → invalid_argument', () => {
+    const ok
+      = '{"type":"call","id":"r1","path":"p/run","arguments":{},"context":{"caller":{"keyId":"k","owner":"user:a"},"traceId":"tr","createdAt":"t0","expiresAt":"t1"}}'
+    expect(decodeDeviceFrame(ok)).toMatchObject({
+      context: { caller: { keyId: 'k', owner: 'user:a' } },
+    })
+    const bad = [
+      // caller 缺 keyId
+      '{"type":"call","id":"r1","path":"p/run","arguments":{},"context":{"caller":{"owner":"user:a"},"traceId":"tr","createdAt":"t0","expiresAt":"t1"}}',
+      // 缺 expiresAt
+      '{"type":"call","id":"r1","path":"p/run","arguments":{},"context":{"caller":{"keyId":"k","owner":"user:a"},"traceId":"tr","createdAt":"t0"}}',
+    ]
+    for (const text of bad) {
+      expect(codeOf(() => decodeDeviceFrame(text)), `应拒绝:${text}`).toBe('invalid_argument')
+    }
+  })
+
+  it('兼容:新网关 → 老设备 decoder,call 帧含 context 不影响既有字段解析', () => {
+    // 老设备只读 id/path/arguments;decoder 仍完整解析,context 作为已知可选字段保留。
+    const text
+      = '{"type":"call","id":"r1","path":"shell/exec","arguments":{"command":"ls"},"context":{"caller":{"keyId":"k","owner":"user:a"},"traceId":"tr","createdAt":"t0","expiresAt":"t1"}}'
+    expect(decodeDeviceFrame(text)).toMatchObject({
+      id: 'r1',
+      path: 'shell/exec',
+      arguments: { command: 'ls' },
+    })
   })
 
   it('ping/pong 序列化为稳定字面量(DO autoResponse 精确匹配)', () => {
@@ -156,8 +229,8 @@ describe('decode 拒绝非法输入 → invalid_argument', () => {
       '{"type":"ready"}', // 缺 mountPath
       '{"type":"error","error":{"code":"nope","message":"m","retryable":false}}', // 非法错误码
       '{"type":"error","error":{"code":"internal","message":"m"}}', // 缺 retryable
-      '{"type":"call","id":"1","tool":"t","arguments":{}}', // 缺 path
-      '{"type":"call","id":"1","path":"p","tool":"t","arguments":"x"}', // arguments 非对象
+      '{"type":"call","id":"1","arguments":{}}', // 缺 path
+      '{"type":"call","id":"1","path":"p/run","arguments":"x"}', // arguments 非对象
       '{"type":"result","id":"1"}', // 缺 ok
       '{"type":"result","id":"1","ok":false}', // ok:false 缺 error
       '{"type":"cancel"}', // 缺 id
@@ -173,6 +246,28 @@ describe('decode 拒绝非法输入 → invalid_argument', () => {
   it('未知顶层字段被剥离(strip)', () => {
     const decoded = decodeDeviceFrame('{"type":"ready","mountPath":"m","extra":1}')
     expect(decoded).toEqual({ type: 'ready', mountPath: 'm' })
+  })
+})
+
+describe('错误帧与固定控制面错误契约', () => {
+  it('对规范错误码与未知错误码保持相同的接受/拒绝结果', () => {
+    for (const code of [...TB_ERROR_CODES, 'future_error']) {
+      const error = { code, message: `error:${code}`, retryable: false }
+      const protocolAccepted = tbErrorBodySchema.safeParse(error).success
+      const errorFrameAccepted = codeOf(() => decodeDeviceFrame(JSON.stringify({
+        type: 'error',
+        error,
+      }))) === null
+      const resultFrameAccepted = codeOf(() => decodeDeviceFrame(JSON.stringify({
+        type: 'result',
+        id: 'r-error',
+        ok: false,
+        error,
+      }))) === null
+
+      expect(errorFrameAccepted, `error frame:${code}`).toBe(protocolAccepted)
+      expect(resultFrameAccepted, `result frame:${code}`).toBe(protocolAccepted)
+    }
   })
 })
 

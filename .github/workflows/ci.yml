@@ -7,6 +7,16 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: CI 全绿后部署指定 production 宿主
+        required: true
+        default: none
+        type: choice
+        options:
+          - none
+          - cloudflare
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -16,9 +26,74 @@ permissions:
   contents: read
 
 jobs:
+  deploy-changes:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      cloudflare: ${{ steps.targets.outputs.cloudflare }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: targets
+        name: Detect production deployment targets
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          DEPLOY_INPUT: ${{ inputs.deploy }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            case "$DEPLOY_INPUT" in
+              cloudflare) printf 'railway=false\ncloudflare=true\n' >> "$GITHUB_OUTPUT" ;;
+              *) printf 'railway=false\ncloudflare=false\n' >> "$GITHUB_OUTPUT" ;;
+            esac
+          elif [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            git ls-tree -r --name-only "$GITHUB_SHA" |
+              node scripts/deploy-change-filter.mjs >> "$GITHUB_OUTPUT"
+          else
+            git diff --name-only "$BEFORE_SHA" "$GITHUB_SHA" |
+              node scripts/deploy-change-filter.mjs >> "$GITHUB_OUTPUT"
+          fi
+
   verify:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+
+    # Postgres 后端(StateStore + SearchIndex)的测试在缺 TB_TEST_DATABASE_URL 时
+    # 自我 skip。没有这个 service,PG 的 SQL 语法、驱动返回类型归一(bigint/EXISTS)与真实
+    # 装配即使全部损坏,PR 仍会全绿 —— 故这里必须起库,让那组测试成为硬闸门。
+    # 用 pgvector 镜像(而非 postgres:16)是为 Phase 3 的 pgvector 语义搜索留出同一环境;
+    # 当前后端本身不依赖任何扩展。
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_PASSWORD: tb
+          POSTGRES_DB: toolbridge
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+      # 多副本设备通道的跨副本转发测试要真 Redis:socket 不可序列化,那组测试是
+      # 唯一能证明"设备连在副本 A、调用打到副本 B 也通"的手段,不能靠 mock。
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      TB_TEST_DATABASE_URL: postgres://postgres:tb@localhost:5432/toolbridge
+      TB_TEST_REDIS_URL: redis://localhost:6379
+
     steps:
       - uses: actions/checkout@v4
 
@@ -30,6 +105,24 @@ jobs:
           cache: pnpm
 
       - run: pnpm install --frozen-lockfile
+
+      # 断言 PG 测试真的在跑:靠 env 生效的自我 skip 一旦静默失效(变量拼错、service 没起来),
+      # 整组 PG 覆盖会无声消失且 CI 依然全绿。这里在 verify 之前先钉死"未被 skip"。
+      - name: Assert Postgres suites are not skipped
+        run: |
+          pnpm --filter @tool-bridge/server exec vitest run \
+            test/pgStateStore.test.ts test/pgSearchIndex.test.ts test/pgServer.e2e.test.ts \
+            test/deviceRouter.integration.test.ts \
+            --reporter=json --outputFile="$RUNNER_TEMP/pg-tests.json"
+          node -e '
+            const r = require(process.env.RUNNER_TEMP + "/pg-tests.json");
+            const skipped = r.numPendingTests + r.numTodoTests;
+            if (r.numTotalTests === 0 || skipped > 0) {
+              console.error(`PG 测试未全部执行: total=${r.numTotalTests} skipped=${skipped}`);
+              process.exit(1);
+            }
+            console.log(`PG 测试全部执行: ${r.numPassedTests}/${r.numTotalTests}`);
+          '
 
       - run: pnpm verify
 
@@ -55,3 +148,94 @@ jobs:
       - name: Warn on unbumped public packages
         if: github.event_name == 'pull_request'
         run: node scripts/check-version-bumps.mjs "origin/${{ github.base_ref }}"
+
+  # 部署产物是纯声明文件,没有测试兜底 —— 模板语法错、危险组合校验失效只会在用户
+  # helm install 时暴露。这里把 lint、双形态渲染与负向用例(必须 fail 的组合真的 fail)
+  # 都钉成硬闸门;compose 同理做语法与必填检查。全程秒级。
+  deploy-artifacts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Helm lint + render both shapes
+        working-directory: deploy/helm/tool-bridge
+        run: |
+          helm lint . -f examples/values-standalone.yaml
+          helm lint . -f examples/values-ha.yaml
+          # standalone → StatefulSet;HA → Deployment。渲染断言防两形态判定回归。
+          helm template tb . -f examples/values-standalone.yaml | grep -q "^kind: StatefulSet"
+          helm template tb . -f examples/values-ha.yaml | grep -q "^kind: Deployment"
+
+      - name: Helm negative cases must fail
+        working-directory: deploy/helm/tool-bridge
+        run: |
+          set -e
+          fails=(
+            "-f examples/values-standalone.yaml --set replicaCount=3"
+            "-f examples/values-ha.yaml --set redis.url="
+            "-f examples/values-ha.yaml --set objectStore.secretAccessKey="
+            "-f examples/values-standalone.yaml --set secrets.bootstrapAdminSk="
+            "-f examples/values-standalone.yaml --set autoscaling.enabled=true"
+          )
+          for args in "${fails[@]}"; do
+            if helm template tb . $args >/dev/null 2>&1; then
+              echo "危险组合未被拒绝: $args" >&2
+              exit 1
+            fi
+          done
+
+      - name: Compose config (both profiles) + required-var check
+        working-directory: deploy/compose
+        env:
+          TB_BOOTSTRAP_ADMIN_SK: tbk_ci_syntax_check
+          TB_SECRET_ENCRYPTION_KEY: ci_syntax_check
+          TB_PG_PASSWORD: ci_syntax_check
+        run: |
+          docker compose --profile default config >/dev/null
+          docker compose --profile ha config >/dev/null
+          # 必填缺失必须在启动前报错(而不是起一个 fail closed 循环重启的容器)。
+          if env -u TB_BOOTSTRAP_ADMIN_SK docker compose --profile default config >/dev/null 2>&1; then
+            echo "缺 TB_BOOTSTRAP_ADMIN_SK 未被拒绝" >&2
+            exit 1
+          fi
+
+  deploy-cloudflare:
+    if: >-
+      needs.deploy-changes.result == 'success' &&
+      needs.deploy-changes.outputs.cloudflare == 'true'
+    needs: [deploy-changes, verify, deploy-artifacts]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+    concurrency:
+      group: deploy-cloudflare-production
+      cancel-in-progress: false
+    env:
+      CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      TB_BASE_URL: ${{ vars.TB_CF_BASE_URL }}
+      TB_DOMAIN: ${{ vars.TB_CF_DOMAIN }}
+      TB_NAME_PREFIX: ${{ vars.TB_CF_NAME_PREFIX }}
+      TB_PROVISION_CONFIG_ONLY: 'true'
+      TB_PROVISION_D1_DATABASE_ID: ${{ vars.TB_CF_D1_DATABASE_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Backfill account-neutral Cloudflare config
+        run: pnpm provision
+
+      - name: Build Dashboard assets
+        run: pnpm --filter @tool-bridge/dashboard build
+
+      - name: Deploy Cloudflare production
+        run: pnpm --filter @tool-bridge/gateway run deploy

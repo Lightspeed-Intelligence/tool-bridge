@@ -12,10 +12,13 @@ import type {
   ContextEntryMeta,
   ContextPatch,
   ContextProvider,
+  ContextUploadGrant,
+  ContextUploadInput,
   SearchOptions,
 } from './types'
 import { type ObjectBody, type ObjectMeta, type ObjectStore, readStreamBytes, readStreamText } from './objectStore'
 import { LIST_LIMIT_DEFAULT, LIST_LIMIT_MAX, type ListOptions, type Page, type TreePath } from '../types'
+import { DEFAULT_STORE_DRIVER_KEY_ROOT } from '../objectStoreService/types'
 import { normalizePath } from '../tree/path'
 import { normalizeEntryPath } from './path'
 import { TBError } from '../errors'
@@ -24,6 +27,61 @@ import { TBError } from '../errors'
 export const REF_THRESHOLD_BYTES_DEFAULT = 1024 * 1024
 /** presign URL 有效期缺省 15 分钟。 */
 export const PRESIGN_TTL_SEC_DEFAULT = 900
+/** SigV4 query presign 的协议上限：7 天。 */
+export const PRESIGN_TTL_SEC_MAX = 604_800
+
+/**
+ * 部署级 default Store 的物理 namespace。
+ *
+ * 对象 Context 与 Store 可能复用同一个 ObjectStore driver，但二者属于不同授权域：
+ * Context provider 绝不能把 Store key 解释成 Context entry。该值须与 StoreService 的
+ * driver key 约定保持一致。
+ */
+const DEFAULT_STORE_RESERVED_KEY_ROOT = DEFAULT_STORE_DRIVER_KEY_ROOT
+
+/** 去掉对象 key prefix 两端的 `/`；空 prefix 仍是合法的桶根 Context。 */
+function normalizeKeyPrefix(keyPrefix: string | undefined): string {
+  return keyPrefix?.replace(/^\/+|\/+$/g, '') ?? ''
+}
+
+/** key 是否位于 default Store 的保留 namespace（含 namespace 根自身）。 */
+function isDefaultStoreReservedKey(key: string): boolean {
+  return key === DEFAULT_STORE_RESERVED_KEY_ROOT
+    || key.startsWith(`${DEFAULT_STORE_RESERVED_KEY_ROOT}/`)
+}
+
+/**
+ * 显式非空 Context prefix 不得包含 Store namespace，也不得落在 Store namespace 内。
+ * 空 prefix 为既有合法挂载形态，按每个物理 key 的访问防火墙兼容处理。
+ */
+function assertContextKeyPrefixAllowed(keyPrefixBare: string): void {
+  if (keyPrefixBare === '') return
+  if (
+    keyPrefixBare === DEFAULT_STORE_RESERVED_KEY_ROOT
+    || keyPrefixBare.startsWith(`${DEFAULT_STORE_RESERVED_KEY_ROOT}/`)
+    || DEFAULT_STORE_RESERVED_KEY_ROOT.startsWith(`${keyPrefixBare}/`)
+  ) {
+    throw new TBError('invalid_argument', '对象 Context keyPrefix 与 Store 保留 namespace 冲突')
+  }
+}
+
+/** 读取侧用 not_found 隐藏对象存在性；写入侧明确拒绝跨授权域修改。 */
+function assertContextKeyAllowed(key: string, path: string, writable: boolean): void {
+  if (!isDefaultStoreReservedKey(key)) return
+  if (!writable) throw TBError.notFound(`context entry 不存在:'${path}'`)
+  throw new TBError('permission_denied', '对象 Context 不得修改 Store 保留 namespace')
+}
+
+/** 校验 SigV4 presign TTL；宿主签名器与 core grant 生成共用。 */
+export function assertPresignTtlSec(ttlSec: number): number {
+  if (!Number.isInteger(ttlSec) || ttlSec < 1 || ttlSec > PRESIGN_TTL_SEC_MAX) {
+    throw new TBError(
+      'invalid_argument',
+      `presign TTL 必须是 1..${PRESIGN_TTL_SEC_MAX} 的整数秒`,
+    )
+  }
+  return ttlSec
+}
 
 /**
  * Search 单次调用经 head 补取 metadata 的次数上限(keyword 须匹配
@@ -51,6 +109,17 @@ export interface ObjectContextProviderOptions {
   relayRefUrl?: (key: string) => string | Promise<string>
 }
 
+export interface ObjectContextUploadGrantOptions {
+  /** 对象 key 前缀(多 namespace 共桶隔离);不参与 uri 与 entry 路径。 */
+  keyPrefix?: string
+  /** namespace 节点树路径,uri 前缀 node://<nsPath>/。 */
+  nsPath: TreePath
+  /** readOnly 挂载拒绝签发。 */
+  readOnly?: boolean
+  /** 上传 grant 有效期(秒);缺省 900，与下载 $ref TTL 独立。 */
+  uploadGrantTtlSec?: number
+}
+
 /**
  * 对象存储 provider 的具体形态:**六个动词全实现**。
  *
@@ -58,6 +127,67 @@ export interface ObjectContextProviderOptions {
  * 收紧成完全体 —— 消费方(网关 r2/s3 分支、单测)据此免去逐个判空。
  */
 export type ObjectContextProvider = Required<ContextProvider>
+
+/**
+ * 为对象 context 的一个 entry 签发直传 PUT。
+ *
+ * 这里与 provider 共用 path/keyPrefix/uri 规则，确保签名目标不会逃出挂载前缀。
+ * `url` 是短期 bearer secret；调用方应只持久化返回的稳定 `uri`。
+ */
+export async function createObjectContextUploadGrant(
+  store: ObjectStore,
+  opts: ObjectContextUploadGrantOptions,
+  input: ContextUploadInput,
+): Promise<ContextUploadGrant> {
+  const keyPrefixBare = normalizeKeyPrefix(opts.keyPrefix)
+  assertContextKeyPrefixAllowed(keyPrefixBare)
+  if (opts.readOnly === true) {
+    throw new TBError('permission_denied', 'readOnly 挂载拒绝 create_upload')
+  }
+  if (typeof input?.path !== 'string') {
+    throw new TBError('invalid_argument', 'create_upload 需要字符串 \'path\'')
+  }
+  if (input.overwrite !== undefined && typeof input.overwrite !== 'boolean') {
+    throw new TBError('invalid_argument', 'create_upload 的 \'overwrite\' 必须是 boolean')
+  }
+  const unknownKeys = Object.keys(input).filter(
+    key => key !== 'path' && key !== 'contentType' && key !== 'overwrite',
+  )
+  if (unknownKeys.length > 0) {
+    throw new TBError('invalid_argument', `create_upload 含未知字段:${unknownKeys.join(',')}`)
+  }
+  if (
+    typeof input?.contentType !== 'string'
+    || input.contentType.trim() === ''
+    || input.contentType.length > 255
+    || !input.contentType.includes('/')
+    || /[\r\n\0]/.test(input.contentType)
+  ) {
+    throw new TBError('invalid_argument', 'create_upload 需要合法的 \'contentType\'')
+  }
+  const nsPath = normalizePath(opts.nsPath)
+  const entryPath = normalizeEntryPath(input.path)
+  const key = `${keyPrefixBare === '' ? '' : `${keyPrefixBare}/`}${entryPath}`
+  assertContextKeyAllowed(key, entryPath, true)
+  if (store.presignPut === undefined) {
+    throw new TBError('unavailable', '对象存储未配置直传签名能力', { retryable: false })
+  }
+  const ttlSec = assertPresignTtlSec(opts.uploadGrantTtlSec ?? PRESIGN_TTL_SEC_DEFAULT)
+  const contentType = input.contentType.trim()
+  // 先取时间再签名：对外宣告的期限宁可略早，绝不晚于底层签名的真实期限。
+  const expiresAt = new Date(Date.now() + ttlSec * 1000).toISOString()
+  const signed = await store.presignPut(key, ttlSec, {
+    contentType,
+    ...(input.overwrite === true ? {} : { ifNoneMatch: '*' }),
+  })
+  return {
+    uri: `node://${nsPath}/${entryPath}`,
+    method: 'PUT',
+    url: signed.url,
+    headers: signed.headers,
+    expiresAt,
+  }
+}
 
 /** limit 缺省 50、超上限 200 静默钳制;非正整数拒绝。 */
 function clampLimit(limit: number | undefined): number {
@@ -104,13 +234,19 @@ export function createObjectContextProvider(
   opts: ObjectContextProviderOptions,
 ): ObjectContextProvider {
   const nsPath = normalizePath(opts.nsPath)
-  const keyPrefixBare = opts.keyPrefix?.replace(/^\/+|\/+$/g, '') ?? ''
+  const keyPrefixBare = normalizeKeyPrefix(opts.keyPrefix)
+  assertContextKeyPrefixAllowed(keyPrefixBare)
   const keyPrefix = keyPrefixBare === '' ? '' : `${keyPrefixBare}/`
   const readOnly = opts.readOnly ?? false
   const refThreshold = opts.refThresholdBytes ?? REF_THRESHOLD_BYTES_DEFAULT
   const presignTtlSec = opts.presignTtlSec ?? PRESIGN_TTL_SEC_DEFAULT
 
-  const keyFor = (path: string): string => keyPrefix + normalizeEntryPath(path)
+  const keyFor = (path: string, writable: boolean): string => {
+    const entryPath = normalizeEntryPath(path)
+    const key = keyPrefix + entryPath
+    assertContextKeyAllowed(key, entryPath, writable)
+    return key
+  }
   const entryPathOf = (key: string): string => key.slice(keyPrefix.length)
   const uriFor = (entryPath: string): string => `node://${nsPath}/${entryPath}`
 
@@ -143,32 +279,49 @@ export function createObjectContextProvider(
   const notFound = (path: string): TBError => TBError.notFound(`context entry 不存在:'${path}'`)
 
   return {
-    async List(path: string, listOpts?: ListOptions): Promise<Page<ContextEntryMeta>> {
+    async list(path: string, listOpts?: ListOptions): Promise<Page<ContextEntryMeta>> {
       rejectFilter(listOpts)
       const limit = clampLimit(listOpts?.limit)
       const rel = path === '' ? '' : `${normalizeEntryPath(path)}/`
       const full = keyPrefix + rel
-      const res = await store.list(full, { delimiter: '/', cursor: listOpts?.cursor, limit })
+      assertContextKeyAllowed(full.slice(0, -1), path, false)
       const items: ContextEntryMeta[] = []
-      for (const item of res.items) {
-        if ('prefix' in item) {
-          items.push({
-            uri: uriFor(entryPathOf(item.prefix)),
-            contentType: DIRECTORY_CONTENT_TYPE,
-            version: '',
-            updatedAt: '',
-            metadata: {},
-          })
-        } else if (item.key !== full) {
-          // 跳过与 prefix 完全相等的目录占位对象
-          items.push(toMeta(item))
+      let storeCursor = listOpts?.cursor
+      for (;;) {
+        const previousCursor = storeCursor
+        const res = await store.list(full, {
+          delimiter: '/',
+          cursor: storeCursor,
+          limit: Math.max(1, limit - items.length),
+        })
+        for (const item of res.items) {
+          const itemKey = 'prefix' in item ? item.prefix.replace(/\/$/, '') : item.key
+          if (isDefaultStoreReservedKey(itemKey)) continue
+          if ('prefix' in item) {
+            items.push({
+              uri: uriFor(entryPathOf(item.prefix)),
+              contentType: DIRECTORY_CONTENT_TYPE,
+              version: '',
+              updatedAt: '',
+              metadata: {},
+            })
+          } else if (item.key !== full) {
+            // 跳过与 prefix 完全相等的目录占位对象
+            items.push(toMeta(item))
+          }
+        }
+        storeCursor = res.cursor
+        if (items.length >= limit || storeCursor === undefined) break
+        // 防御异常 driver 重复同一 cursor，避免保留项过滤后死循环。
+        if (storeCursor === previousCursor) {
+          throw new TBError('internal', '对象存储 list cursor 未前进')
         }
       }
-      return res.cursor !== undefined ? { items, cursor: res.cursor } : { items }
+      return storeCursor !== undefined ? { items, cursor: storeCursor } : { items }
     },
 
-    async Get(path: string): Promise<ContextEntry> {
-      const key = keyFor(path)
+    async get(path: string): Promise<ContextEntry> {
+      const key = keyFor(path, false)
       const head = await store.head(key)
       if (!head) throw notFound(path)
       const meta = toMeta(head)
@@ -188,9 +341,9 @@ export function createObjectContextProvider(
       return { ...meta, content: text }
     },
 
-    async Write(path: string, entry: ContextEntryInput): Promise<ContextEntryMeta> {
-      assertWritable('Write')
-      const key = keyFor(path)
+    async write(path: string, entry: ContextEntryInput): Promise<ContextEntryMeta> {
+      assertWritable('write')
+      const key = keyFor(path, true)
       const { body, contentType } = serializeInput(entry)
       const meta = await store.put(key, body, {
         contentType,
@@ -200,9 +353,9 @@ export function createObjectContextProvider(
       return toMeta(meta)
     },
 
-    async Update(path: string, patch: ContextPatch): Promise<ContextEntryMeta> {
-      assertWritable('Update')
-      const key = keyFor(path)
+    async update(path: string, patch: ContextPatch): Promise<ContextEntryMeta> {
+      assertWritable('update')
+      const key = keyFor(path, true)
       if (patch.content === undefined && patch.metadata === undefined) {
         throw new TBError('invalid_argument', 'patch 至少提供 content 或 metadata 之一')
       }
@@ -227,12 +380,12 @@ export function createObjectContextProvider(
       return toMeta(meta)
     },
 
-    async Delete(path: string): Promise<void> {
-      assertWritable('Delete')
-      await store.delete(keyFor(path))
+    async delete(path: string): Promise<void> {
+      assertWritable('delete')
+      await store.delete(keyFor(path, true))
     },
 
-    async Search(query: string, searchOpts?: SearchOptions): Promise<Page<ContextEntryMeta>> {
+    async search(query: string, searchOpts?: SearchOptions): Promise<Page<ContextEntryMeta>> {
       const mode = searchOpts?.mode ?? 'keyword'
       if (mode === 'semantic') {
         throw new TBError('invalid_argument', 'semantic 检索未声明(\'search:semantic\' capability)')
@@ -260,6 +413,7 @@ export function createObjectContextProvider(
         const page = await store.list(keyPrefix, { cursor: storeCursor, limit: LIST_LIMIT_MAX })
         for (const item of page.items) {
           if ('prefix' in item) continue // 无 delimiter 不应出现,防御
+          if (isDefaultStoreReservedKey(item.key)) continue
           if (after !== undefined && item.key <= after) continue
           const entryPath = entryPathOf(item.key)
           let meta = item

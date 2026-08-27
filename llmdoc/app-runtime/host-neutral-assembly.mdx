@@ -1,0 +1,105 @@
+---
+description: app 包的宿主中立装配:TbAppDeps 注入面、default Store、builtin 模块清单、Workers 与 Node 的运行时差异及代码地图。
+kind: architecture
+code:
+  paths:
+    - packages/app/src/deps.ts
+    - packages/app/src/bootstrap.ts
+    - packages/app/src/tbApp.ts
+    - packages/app/src/store.ts
+    - packages/app/src/routes/invoke.ts
+    - packages/app/src/routes/store.ts
+    - packages/server/test/server.integration.test.ts
+    - packages/sdk/src/client/**
+    - packages/sdk/src/store/**
+    - packages/sdk/src/device/**
+    - packages/app/src/**
+---
+
+# 宿主中立装配
+
+`app` 包持有 Hono 路由、发现/调用、provider 编排与宿主注入面；它不引入 Wrangler、SQLite 或任何 Node/CF 专属启动逻辑。宿主差异全部通过注入实现表达：共享逻辑必须留在 core/app，适配器差异写成注入实现和明确测试，不在业务路由里分叉。
+
+## TbAppDeps 注入面
+
+`packages/app/src/deps.ts` 的 `TbAppDeps` 基础注入点：
+
+- `state: StateStore`
+- `objects?: () => ObjectStore`
+- `secrets: SecretStoreImpl`
+- `device?: DeviceChannel`
+- `search?: SearchIndex`
+
+另有 assets、remote、plugin catalog/bindings、本地 provider 与缓存/安全配置。`DeviceChannel` 是 app 当前消费的真实接口；不要把未实现的 SDK `DeviceTransport` 当成现状。
+
+`objects` 在 `TbAppDeps` 仍是 optional，只为旧自定义宿主保持装配兼容；标准 Node/Workers 宿主始终注入，
+SDK 的 `ToolBridgeConfig.objects` 已是必填。缺 driver 时 `system/store` Help 仍可发现，但实际命令以
+`unavailable` fail closed，不影响其他 builtin。default Store 的元数据状态机还强制要求
+`state.compareAndSwap`；没有 CAS 的自定义 StateStore 不能用 Store。capability HMAC key 优先从
+`storeTokenSecret ?? encryptionKey` 经版本化域分离 SHA-256 派生且不持久化；两者都没有的自定义/
+开发宿主才用 CAS 在 StateStore 生成持久 fallback。
+
+同一个 `ObjectStore` driver 可同时服务对象型 Context 和 deployment-level Store，但 namespace 与产品语义
+隔离：StoreService 只使用服务端生成的 `__tool_bridge_internal__/store/v1/...` key；Context provider 对重叠的非空 keyPrefix
+fail closed，空 prefix 则在 list/search/read/write/update/delete/create_upload 各路径过滤或拒绝保留 key。Store 的宿主中立
+装配集中在 `store.ts`：构造 StoreService、组装 relay/direct grant、签发 owner/share ref、下发 device call
+capability 和执行 cursor cleanup；`routes/store.ts` 只处理 capability-only control/data plane。业务路由不得
+按 Context 配置查 Store 落点，也不能只靠调用方约定隔离共享 driver。未发布预览使用过的 `store/v1`
+不是保留根，既有同名 Context prefix 继续可用。
+
+对象型 R2/S3 context 可在 `ObjectStore.presignPut` 存在时动态声明 `direct-upload`，并以 `create_upload` 为单个 entry 签发定路径、限时 PUT。发现面不是健康探针：S3 能力由实现静态判定，不解析节点 `authRef`；R2 signer 失败只隐藏 Context 的可选能力。default Store 的边界更严：请求必须声明精确 size，driver 必须提供把 `Content-Length` 纳入签名的 `presignPutExact`，否则选择受宿主 `storeRelayMaxBytes` 约束的 relay；Workers 的对象工厂只在单次请求闭包内 memoize Promise，避免同请求重复解析 signer secret，同时不跨请求持有 I/O 对象。
+
+Context upload grant 的 TTL 与下载 `$ref` TTL 独立，缺省取 `min(refTtlSec, 900)`，SigV4 GET/PUT 均受 604800 秒上限约束。Store upload/share/read 另有独立 `store* TtlSec` 配置，缺省均为 900 秒。`@tool-bridge/sdk/device` 的顶层 `uploadObject` 用 `purpose:'http'` 的设备身份调用 Store；handler 内 `call.uploadObject` 使用网关下发的窄 capability。设备凭证必须带非空 `Authorization` header，不能把仅供 WebSocket 使用的 ticket 当作 HTTP 认证。
+
+Store relay/ref/share URL 必须与当次控制请求的 external origin 一致，这是 neutral client 的 SSRF 边界。在 Node TLS 终止代理后，`Request.url` 可能显示内部 `http:`：此时 `TB_CANONICAL_ORIGIN` 只提供可信 protocol，本次请求仍提供对外 alias host/port。不复制 canonical host，也不信任客户端可伪造的 `X-Forwarded-Proto`；这条语义必须由真实 Node HTTP socket 回归覆盖，不能只测纯函数。
+
+## builtin 装配
+
+bootstrap builtin 清单在 `packages/app/src/bootstrap.ts` 的 `BUILTIN_MODULES`：sk、secret、registry、status、plugin、catalog、federation、annotation、store。Store module 由 `createRouteEnv` 追加为惰性实例；`~feedback` 是保留端点，不是 builtin 模块。
+
+## 运行时差异
+
+- 三宿主 StateStore 均为强一致 SQL 后端（Workers=D1、Node=SQLite/PG），SK 吊销即时生效；共享契约测试对拍语义。
+- Store 的全局清理不靠普通请求：Node 监听成功后异步执行首轮并启动 interval，Workers 由 scheduled handler/
+  Cron Trigger 调用同一 `cleanupDefaultStore`；cursor 进度持久化在 StateStore。一次宿主 tick 只有第一页执行
+  staging maintenance；StoreService 不枚举 driver 全树或删除无权威 metadata 的对象，终态 metadata 在
+  安全窗口后以 CAS 收敛。
+- Workers 设备会话结果与连接元数据进入 DO storage；Node 部分幂等结果只在进程内。
+- Workers 静态 UI 经 Assets binding，缓存/压缩/条件请求由平台代劳；Node 从 `TB_UI_DIR` 或 dashboard 包读取，由 `server` 的 `uiAssetsFetcher` 自理（hash 资产 immutable、其余 no-cache，内容协商 br/gzip，弱 ETag + 304），不下沉进 core/app。
+- `@tool-bridge/sdk` 是多入口包：根入口的 `engines.node` 与 Node 依赖属于安装/根运行时约束；`@tool-bridge/sdk/client`、`/store`、`/device` 的兼容性由各自 neutral JS/d.ts 产物和最终 tarball 模块闭包保证，子入口不得从包根重新导出。多运行时包的兼容性按子入口产物闭包判定，不按依赖清单猜。
+
+## app 内部代码地图
+
+### Search 与 remote path 投影
+
+`POST /~search` 的本地路径由 `search/localSearch.ts` 执行，默认 compact/best/10。它可批量 over-fetch
+轻量候选，但在出 wire 前必须重新读取 canonical node/tool，重做 read+call、virtualize 与 effect 复核；
+索引不是授权真源。SearchSynchronizer 仍只物化 mcp/http/tool，不索引 remote。
+
+`search/federatedSearch.ts` 是 query-time coordinator：只选择当前 registry 的 direct remote mounts，分片
+source/time budget，要求 child `search:federated` capability，用 portable coverage 做 source-balanced merge，
+严格投影/复核 child hit。`search/federatedSession.ts` 用 StateStore CAS 保存固定尺寸 handle 对应的 immutable
+generation 与原子 quota；内部 child snapshot validation 递归绑定 A→B→C 后代 revision。只有显式
+instanceId + CAS + SearchIndex revision 齐全时才广告 federated capability。
+
+generic remote fetch 固定 `redirect:'error'`，任何 30x 都 fail closed；按调用方提供的 signal/cap 流式
+读取 body，超时或超限取消 reader。remote `~help/~tree` 的成功体不再原样透传：
+`RemotePathProjector` 严格校验 child canonical path、direct descendants 与 command containment，rebase 到
+本地 mount；tree 后代还逐条重做外层 read/call scope。A→B→C 已覆盖 search/help/tree 路径闭环；普通
+call wire 不变。
+
+| 主题 | 路径/符号 |
+|---|---|
+| 宿主注入类型 | `deps.ts` / `TbAppDeps` |
+| app 组装 | `tbApp.ts`、`bootstrap.ts` |
+| 路径与节点分发 | `paths.ts`、`toolNodes.ts`、`contextNodes.ts`、`deviceNodes.ts` |
+| 路由 | `routes/` |
+| MCP 上游/入站 | `providers/mcp.ts`、`mcpServer.ts`，见 [mcp-interop.mdx](mcp-interop.mdx) |
+| plugin 调用 | `providers/pluginClient.ts` |
+| remote 联邦 | `providers/remote.ts`、`federation.ts` |
+| 搜索执行与续页 | `search/localSearch.ts`、`search/federatedSearch.ts`、`search/federatedSession.ts` |
+| 搜索索引同步 | `search/synchronizer.ts` |
+| default Store | `store.ts`、`storeRefToken.ts`、`routes/store.ts` |
+| Store external origin | `store.ts` / `resolveStoreRequestOrigin`、`routes/invoke.ts`、`routes/store.ts` |
+
+查找时先搜符号而不是历史文档（如 `rg "createTbApp|TbAppDeps|BUILTIN_MODULES" packages/app`）；精确测试数、行数、bundle 字节不属于代码地图，需要时从当前工作树实查。

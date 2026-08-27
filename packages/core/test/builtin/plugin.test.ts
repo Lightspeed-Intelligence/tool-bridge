@@ -35,7 +35,7 @@ const DESCRIBE = {
       auth: { kind: 'none' },
       id: 'documents',
       profile: 'context/v1',
-      methods: ['List', 'Get', 'Update', 'Write', 'Search'],
+      methods: ['list', 'get', 'update', 'write', 'search'],
       capabilities: ['search'],
     },
   ],
@@ -84,6 +84,13 @@ describe('builtin plugin 模块', () => {
       'write',
     ])
     expect(help.cmds.every(c => c.scope === 'admin')).toBe(true)
+  })
+
+  it('list 的顶层与分页对象都拒绝未知字段', async () => {
+    await expect(h.mod.dispatch('list', { token: 'secret' }, ctx))
+      .rejects.toSatisfy(e => isTBError(e) && e.code === 'invalid_argument')
+    await expect(h.mod.dispatch('list', { opts: { limit: 1, filter: 'nope' } }, ctx))
+      .rejects.toSatisfy(e => isTBError(e) && e.code === 'invalid_argument')
   })
 
   it('write 全流程:探活 → 契约校验 → mint pluginToken(platform-token)→ 存 manifest/meta/health', async () => {
@@ -181,14 +188,14 @@ describe('builtin plugin 模块', () => {
             auth: { kind: 'none' },
             id: 'documents',
             profile: 'context/v1',
-            methods: ['List', 'Get'],
+            methods: ['list', 'get'],
             capabilities: ['search'],
           },
         ],
       },
     })
     await expect(bad.mod.dispatch('write', { ...MANIFEST }, ctx)).rejects.toSatisfy(
-      e => isTBError(e) && e.code === 'invalid_argument' && e.message.includes('Search'),
+      e => isTBError(e) && e.code === 'invalid_argument' && e.message.includes('search'),
     )
     expect(await bad.store.get(KEY_PLUGIN + MANIFEST.id)).toBeNull()
   })

@@ -19,12 +19,16 @@
 import { TBError } from '@tool-bridge/plugin-sdk'
 import { assertPublicHttpUrl, guardedFetch } from '../_runtime/guardedFetch'
 import { type ProviderContext, requireApiKey } from '../_runtime/plugin'
+import { readBoundedResponseBytes } from '../_runtime/responseBytes'
+import { createProviderHttpClient } from '../_runtime/providerHttp'
+import { asJsonObject as toRecord } from '../_runtime/jsonValue'
 import { upstreamError } from '../_runtime/upstreamError'
 
 const SERVICE = 'mistral_ai'
 const API_BASE = 'https://api.mistral.ai'
 /** 从 file.url 拉取上传源时的字节上限,照搬上游。 */
 const MAX_REMOTE_UPLOAD_BYTES = 100 * 1024 * 1024
+const http = createProviderHttpClient({ baseUrl: API_BASE, service: SERVICE })
 
 type Json = Record<string, unknown>
 type Method = 'DELETE' | 'GET' | 'PATCH' | 'POST' | 'PUT'
@@ -171,12 +175,6 @@ const SPECS: Record<string, ActionSpec> = {
   },
 }
 
-function toRecord(value: unknown): Json | undefined {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
-    ? (value as Json)
-    : undefined
-}
-
 function text(value: unknown): string | undefined {
   return typeof value === 'string' && value !== '' ? value : undefined
 }
@@ -313,32 +311,11 @@ async function readBounded(
   maxBytes: number,
   field: string,
 ): Promise<Uint8Array<ArrayBuffer>> {
-  const reader = response.body?.getReader()
-  if (reader === undefined) return new Uint8Array(0)
-
-  const chunks: Uint8Array[] = []
-  let total = 0
-  try {
-    for (;;) {
-      const { done, value } = await reader.read()
-      if (done) break
-      total += value.byteLength
-      if (total > maxBytes) {
-        throw new TBError('invalid_argument', `${field} 超过 ${maxBytes} 字节上限`)
-      }
-      chunks.push(value)
-    }
-  } finally {
-    await reader.cancel().catch(() => undefined)
-  }
-
-  const bytes = new Uint8Array(total)
-  let offset = 0
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset)
-    offset += chunk.byteLength
-  }
-  return bytes
+  return readBoundedResponseBytes(response, {
+    checkContentLength: false,
+    maxBytes,
+    tooLarge: () => new TBError('invalid_argument', `${field} 超过 ${maxBytes} 字节上限`),
+  })
 }
 
 async function resolveUpload(remaining: Json): Promise<UploadSource> {
@@ -392,15 +369,27 @@ async function executeJson(spec: ActionSpec, input: Json, ctx: ProviderContext):
   const sendsBody = spec.method === 'POST' || spec.method === 'PUT' || spec.method === 'PATCH'
     || (spec.method === 'DELETE' && spec.bodyOnDelete === true)
 
-  const response = await guardedFetch(url, {
+  const result = await http.request({
+    path: url,
     method: spec.method,
     headers: authHeaders(ctx, true),
-    ...(sendsBody ? { body: JSON.stringify(compactJson(remaining)) } : {}),
+    ...(sendsBody ? { json: compactJson(remaining) } : {}),
+    responseType: 'auto',
+    invalidJsonMessage: 'mistral_ai returned malformed JSON',
+    mapError: ({ data, rawText, status }) => {
+      const payload = toRecord(data)
+      const fallback = `mistral_ai request failed with ${status}`
+      const message = text(payload?.detail)
+        ?? text(payload?.message)
+        ?? text(payload?.error)
+        ?? text(rawText)
+        ?? fallback
+      return upstreamError(status === 422 ? 400 : (status || 502), message)
+    },
   })
-  await assertOk(response)
   // 204 没有 body,但删除类 action 的出参 schema 要一个 `{deleted:true}`。
-  if (response.status === 204) return { deleted: true }
-  return await readResponse(response)
+  if (result.status === 204) return { deleted: true }
+  return result.bodyKind === 'empty' ? '' : result.data
 }
 
 async function executeMultipart(spec: ActionSpec, input: Json, ctx: ProviderContext): Promise<unknown> {

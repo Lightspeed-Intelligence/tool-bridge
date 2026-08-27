@@ -38,6 +38,11 @@ const KEYS = [
   'node:a%b',
   'node:a[1]',
   'node:中文/路径',
+  // 补充平面(代理对):prefixUpperBound 按 code unit 加一会拆开代理对,
+  // 让 upper bound 的 UTF-8 字节序小于 prefix,子树查询恒空。
+  'node:🏿',
+  'node:🏿/child',
+  'node:🏿/child/deep',
   'sk:h:aaa',
   'sk:h:bbb',
   'sk:i:001',
@@ -84,6 +89,9 @@ describe('SqliteStateStore 契约(vs MemoryStateStore)', () => {
         percent: (await store.list('node:a%')).items.map(i => i.key),
         bracket: (await store.list('node:a[')).items.map(i => i.key),
         cjk: (await store.list('node:中文/')).items.map(i => i.key),
+        // 代理对 prefix:必须取到自身与整棵子树。
+        astral: (await store.list('node:🏿')).items.map(i => i.key),
+        astralSubtree: (await store.list('node:🏿/')).items.map(i => i.key),
         all: (await store.list('')).items.map(i => i.key),
         missPrefix: (await store.list('zzz:')).items,
       }
@@ -120,6 +128,62 @@ describe('SqliteStateStore 契约(vs MemoryStateStore)', () => {
       await store.put('v', value)
       return await store.get('v')
     })
+  })
+
+  it('putIfAbsent:首写 true;已存在 false 且不覆盖旧值', async () => {
+    await contract(async (store) => {
+      const first = await store.putIfAbsent?.('once', 'winner')
+      const second = await store.putIfAbsent?.('once', 'loser')
+      return { first, second, value: await store.get('once') }
+    })
+  })
+
+  it('compareAndSwap:创建、revision 替换/删除与失配语义对拍', async () => {
+    await contract(async (store) => {
+      expect(store.compareAndSwap).toBeTypeOf('function')
+      const cas = store.compareAndSwap!.bind(store)
+      const missingDelete = await cas('cas', null, null)
+      const created = await cas('cas', null, { revision: 0, state: 'pending' })
+      const duplicate = await cas('cas', null, { revision: 0, state: 'other' })
+      const stale = await cas('cas', 1, { revision: 2 })
+      const replaced = await cas('cas', 0, { revision: 1, state: 'ready' })
+      const staleDelete = await cas('cas', 0, null)
+      const deleted = await cas('cas', 1, null)
+      await store.put('cas:bad', { revision: true })
+      const booleanRevision = await cas('cas:bad', 1, { revision: 2 })
+      await store.put('cas:fractional', { revision: 1.5 })
+      const fractionalRevision = await cas('cas:fractional', 1, { revision: 2 })
+      return {
+        missingDelete,
+        created,
+        duplicate,
+        stale,
+        replaced,
+        staleDelete,
+        deleted,
+        booleanRevision,
+        fractionalRevision,
+        value: await store.get('cas'),
+      }
+    })
+  })
+})
+
+describe('SQLite compareAndSwap 并发', () => {
+  it('两个连接竞争同一 revision，只有一个原子推进', async () => {
+    const dbPath = tmpDbPath()
+    const first = new SqliteStateStore(dbPath)
+    const second = new SqliteStateStore(dbPath)
+    cleanups.push(() => first.close(), () => second.close())
+    await first.put('race', { revision: 0, state: 'pending' })
+
+    const results = await Promise.all([
+      first.compareAndSwap('race', 0, { revision: 1, winner: 'first' }),
+      second.compareAndSwap('race', 0, { revision: 1, winner: 'second' }),
+    ])
+
+    expect(results.sort()).toEqual([false, true])
+    expect(await first.get('race')).toMatchObject({ revision: 1 })
   })
 })
 

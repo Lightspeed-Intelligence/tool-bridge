@@ -1,5 +1,4 @@
 import { Loader2, Pencil, StickyNote } from 'lucide-react'
-import { useQueryClient } from '@tanstack/react-query'
 import { useState } from 'react'
 import { toast } from 'sonner'
 import {
@@ -11,9 +10,9 @@ import {
   DialogTitle,
   DialogTrigger,
 } from '@/components/ui/dialog'
+import { useInvalidate, useInvoke } from '@/lib/queries'
 import { Textarea } from '@/components/ui/textarea'
 import { Button } from '@/components/ui/button'
-import { useInvoke } from '@/lib/queries'
 
 function AddNoteTrigger() {
   return (
@@ -34,7 +33,7 @@ function NoteDialog({
   trigger: React.ReactNode
 }) {
   const invoke = useInvoke()
-  const qc = useQueryClient()
+  const invalidate = useInvalidate()
   const [open, setOpen] = useState(false)
   const [text, setText] = useState(current)
   const [err, setErr] = useState<string | null>(null)
@@ -43,7 +42,7 @@ function NoteDialog({
     toast.success(msg)
     setOpen(false)
     setErr(null)
-    qc.invalidateQueries({ queryKey: ['tb'] })
+    invalidate('help', 'helpMarkdown', 'tree')
   }
 
   const save = () => {
@@ -52,14 +51,14 @@ function NoteDialog({
       return
     }
     invoke.mutate(
-      { path: 'system/annotation', tool: 'set', args: { path, text: text.trim() } },
+      { commandPath: 'system/annotation/set', args: { path, text: text.trim() } },
       { onSuccess: () => done('补充说明已保存'), onError: e => setErr(e.message) },
     )
   }
 
   const remove = () => {
     invoke.mutate(
-      { path: 'system/annotation', tool: 'remove', args: { path } },
+      { commandPath: 'system/annotation/remove', args: { path } },
       { onSuccess: () => done('补充说明已移除'), onError: e => setErr(e.message) },
     )
   }

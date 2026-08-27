@@ -1,16 +1,14 @@
-import type {
-  FeedbackView,
-  HelpJson,
-  Page,
-  TBErrorBody,
-  ToolSearchItem,
-  TreeJson,
-} from './types'
-import { encodeTreePath } from './path'
-
-function nodeUrl(path: string): string {
-  return path === '' ? '' : `/${encodeTreePath(path)}`
-}
+import {
+  type ClientInvokeResult,
+  createToolBridgeClient,
+  parseContextUploadGrant,
+  PresignedPutError,
+  putPresignedObject,
+  type ToolBridgeClient,
+  ToolBridgeClientError,
+  type ToolSearchRequest,
+} from '@tool-bridge/sdk/client'
+import type { TBErrorBody } from './types'
 
 /** TBError 线上形状的客户端异常({code,message,retryable} + HTTP 状态)。 */
 export class ApiError extends Error {
@@ -33,141 +31,152 @@ export interface Connection {
   sk: string
 }
 
-interface RequestOpts {
-  /** Accept 头;缺省 application/json。 */
-  accept?: string
-  body?: unknown
-  method?: 'GET' | 'POST' | 'DELETE'
-  signal?: AbortSignal
+function client(conn: Connection): ToolBridgeClient {
+  return createToolBridgeClient({ baseUrl: conn.baseUrl, sk: conn.sk, fetcher: fetch })
 }
 
-async function request(conn: Connection, path: string, opts: RequestOpts = {}): Promise<Response> {
-  const url = `${conn.baseUrl.replace(/\/+$/, '')}${path.startsWith('/') ? path : `/${path}`}`
-  let res: Response
+/** SDK 错误只在这里映射一次；TanStack Query 的调用方取消保持原 AbortError。 */
+async function withClient<T>(
+  conn: Connection,
+  fn: (value: ToolBridgeClient) => Promise<T>,
+): Promise<T> {
   try {
-    res = await fetch(url, {
-      method: opts.method ?? 'GET',
-      signal: opts.signal ?? null,
-      headers: {
-        authorization: `Bearer ${conn.sk}`,
-        accept: opts.accept ?? 'application/json',
-        ...(opts.body !== undefined ? { 'content-type': 'application/json' } : {}),
-      },
-      ...(opts.body !== undefined ? { body: JSON.stringify(opts.body) } : {}),
-    })
+    return await fn(client(conn))
   } catch (error) {
-    // React Query 会用 AbortSignal 取消过时的路由/搜索请求;取消不是网络故障,
-    // 保留原始 AbortError 才不会触发 retry 或“网关不可达”误报。
     if (error instanceof DOMException && error.name === 'AbortError') throw error
-    throw new ApiError('network', 0, '网络请求失败:网关不可达或跨域未放行', true)
-  }
-  if (!res.ok) {
-    const fallback: TBErrorBody = {
-      code: res.status === 401 || res.status === 403 ? 'permission_denied' : 'internal',
-      message: `HTTP ${res.status}`,
-      retryable: false,
+    if (error instanceof ToolBridgeClientError) {
+      if (error.kind === 'network') {
+        throw new ApiError('network', 0, '网络请求失败:网关不可达或跨域未放行', true)
+      }
+      if (error.kind === 'timeout') {
+        throw new ApiError('unavailable', 0, '请求超时，请稍后重试', true)
+      }
+      if (error.kind === 'protocol') {
+        throw new ApiError('internal', 502, '网关返回了无效的响应', true)
+      }
+      throw new ApiError(
+        error.code === 'network' ? 'network' : error.code,
+        error.status,
+        error.message,
+        error.retryable,
+      )
     }
-    const body = (await res.json().catch(() => fallback)) as TBErrorBody
-    throw new ApiError(body.code ?? fallback.code, res.status, body.message, body.retryable)
+    throw new ApiError('internal', 0, '请求处理失败', false)
   }
-  return res
 }
 
 /** GET <path>/~help(JSON 表现)。path '' = 根。 */
 export async function getHelp(conn: Connection, path: string, signal?: AbortSignal) {
-  const p = `${nodeUrl(path)}/~help`
-  return (await (await request(conn, p, { signal })).json()) as HelpJson
+  return await withClient(conn, async value => await value.getHelp(path, { signal }))
 }
 
 /** GET <path>/~help(可读 Markdown 表现,text/markdown = 协议默认)。 */
 export async function getHelpMarkdown(conn: Connection, path: string, signal?: AbortSignal) {
-  const p = `${nodeUrl(path)}/~help`
-  return await (await request(conn, p, { accept: 'text/markdown', signal })).text()
+  return await withClient(
+    conn,
+    async value => await value.getHelpText(path, { representation: 'markdown', signal }),
+  )
 }
 
 /** GET <path>/~tree?depth=N。 */
 export async function getTree(conn: Connection, path: string, depth: number, signal?: AbortSignal) {
-  const p = `${nodeUrl(path)}/~tree`
-  return (await (await request(conn, `${p}?depth=${depth}`, { signal })).json()) as TreeJson
+  return await withClient(conn, async value => await value.getTree(path, { depth, signal }))
 }
 
 /** POST /~search：全局工具检索；权限裁剪与虚拟化由网关完成。 */
 export async function searchTools(
   conn: Connection,
   query: string,
-  opts: { cursor?: string, limit: number, mode: 'keyword' | 'semantic' },
+  opts: NonNullable<ToolSearchRequest['opts']>,
   signal?: AbortSignal,
-): Promise<Page<ToolSearchItem>> {
-  return (await (
-    await request(conn, '/~search', { method: 'POST', body: { query, opts }, signal })
-  ).json()) as Page<ToolSearchItem>
+) {
+  return await withClient(conn, async value => await value.search({ query, opts }, { signal }))
 }
 
-export interface InvokeResult {
-  contentType: string
-  /** application/json 时的解析结果。 */
-  json?: unknown
-  /** 端到端耗时(fetch 发起到 body 读完)。 */
-  ms: number
-  /** 响应原文(json 时为 pretty 前的原始文本)。 */
-  text: string
-}
+export type InvokeResult = ClientInvokeResult
 
 /**
- * POST 数据面调用。`direct`(mcp/http/tool 工具,~help 宣告直连路径)→
- * `POST /<path>/<tool>`,body 即 arguments 本体;否则信封 `POST /<path>` + {tool,arguments}。
+ * POST 数据面调用。唯一形态:`POST /<commandPath>`,body 即 arguments 本体
+ * (commandPath 为含命令/工具叶子段的完整路径,如 `docs/ctx7/resolve` 或 `system/status/get`)。
  * accept 'json' 拿结构化返回,'markdown' 拿默认 markdown 表现。
  */
 export async function invoke(
   conn: Connection,
-  path: string,
-  tool: string,
+  commandPath: string,
   args: unknown,
   accept: 'json' | 'markdown' = 'json',
-  direct = false,
 ): Promise<InvokeResult> {
-  const started = performance.now()
-  const res = await request(
+  return await withClient(
     conn,
-    direct ? `${nodeUrl(path)}/${encodeURIComponent(tool)}` : nodeUrl(path),
-    {
-      method: 'POST',
-      body: direct ? (args ?? {}) : { tool, arguments: args ?? {} },
-      accept: accept === 'json' ? 'application/json' : 'text/markdown',
-    },
+    async value => await value.invoke(commandPath, args ?? {}, { accept }),
   )
-  const contentType = res.headers.get('content-type') ?? ''
-  const text = await res.text()
-  const ms = Math.round(performance.now() - started)
-  if (contentType.includes('application/json')) {
-    try {
-      return { contentType, text, json: JSON.parse(text), ms }
-    } catch {
-      return { contentType, text, ms }
+}
+
+/** 申请 context 上传凭证，再把 File 直接发往对象存储；二进制不经过 Tool Bridge。 */
+export async function uploadContextObject(
+  conn: Connection,
+  nodePath: string,
+  entryPath: string,
+  file: File,
+  overwrite = false,
+  signal?: AbortSignal,
+): Promise<{ etag?: string, uri: string }> {
+  const contentType = file.type || 'application/octet-stream'
+  const rawGrant = await withClient(
+    conn,
+    async value => await value.invokeJson(`${nodePath}/create_upload`, {
+      path: entryPath,
+      contentType,
+      ...(overwrite ? { overwrite: true } : {}),
+    }, { signal }),
+  )
+  try {
+    const grant = parseContextUploadGrant(rawGrant)
+    const uploaded = await putPresignedObject(grant, file, {
+      fetcher: fetch,
+      signal,
+    })
+    return { uri: grant.uri, ...uploaded }
+  } catch (error) {
+    if (!(error instanceof PresignedPutError)) throw error
+    if (error.kind === 'aborted') throw new DOMException('The operation was aborted', 'AbortError')
+    if (error.kind === 'invalid') {
+      throw new ApiError('internal', 502, '网关返回了无效的上传凭证', true)
     }
+    if (error.kind === 'expired') {
+      throw new ApiError('unavailable', 503, '上传凭证在开始上传前已经过期，请重试', true)
+    }
+    if (error.kind === 'conflict') {
+      throw new ApiError('conflict', 412, '目标条目已存在', false)
+    }
+    if (error.kind === 'http') {
+      throw new ApiError(
+        'unavailable',
+        error.status,
+        `对象存储直传返回 HTTP ${error.status}`,
+        error.retryable,
+      )
+    }
+    throw new ApiError('network', 0, '对象存储直传失败：请检查网络与 R2/S3 CORS 配置', true)
   }
-  return { contentType, text, ms }
 }
 
 /** 登录校验:GET /~help 能过认证即有效(与 tb login 同一判据)。 */
 export async function validateConnection(conn: Connection): Promise<void> {
-  await getHelp(conn, '')
+  await withClient(conn, async value => await value.validateConnection())
 }
 
 /** POST /<path>/~authorize:mcp 托管 OAuth 发起(auth:'oauth' 挂载;对等 `tb tool auth`)。 */
-export async function startOAuthAuthorize(
-  conn: Connection,
-  path: string,
-): Promise<{ authorizationUrl?: string, status: 'authorized' | 'redirect' }> {
-  const res = await request(conn, `${nodeUrl(path)}/~authorize`, { method: 'POST' })
-  return (await res.json()) as { authorizationUrl?: string, status: 'authorized' | 'redirect' }
+export async function startOAuthAuthorize(conn: Connection, path: string) {
+  return await withClient(conn, async value => await value.startOAuthAuthorization(path))
 }
 
 /** GET /healthz(免认证;tb status 同款)。 */
 export async function getHealthz(baseUrl: string) {
-  const res = await fetch(`${baseUrl.replace(/\/+$/, '')}/healthz`)
-  if (!res.ok) throw new ApiError('unavailable', res.status, `healthz HTTP ${res.status}`, true)
-  return (await res.json()) as { healthy: boolean, version: string }
+  return await withClient(
+    { baseUrl, sk: '' },
+    async value => await value.getHealth(),
+  )
 }
 
 /** 当前同源网关是否配置了飞书登录;旧版/未配置网关由调用页降级到手工 SK。 */
@@ -245,8 +254,10 @@ export async function feedbackList(
   hidden: boolean,
   signal?: AbortSignal,
 ) {
-  const p = `${nodeUrl(path)}/~feedback${hidden ? '?hidden=1' : ''}`
-  return (await (await request(conn, p, { signal })).json()) as { items: FeedbackView[] }
+  return await withClient(
+    conn,
+    async value => await value.feedback.list(path, { hidden, signal }),
+  )
 }
 
 /** GET /<path>/~feedback/<id>(含 detail)。 */
@@ -256,9 +267,7 @@ export async function feedbackGet(
   id: string,
   signal?: AbortSignal,
 ) {
-  return (await (
-    await request(conn, `${nodeUrl(path)}/~feedback/${encodeURIComponent(id)}`, { signal })
-  ).json()) as FeedbackView
+  return await withClient(conn, async value => await value.feedback.get(path, id, { signal }))
 }
 
 /** POST /<path>/~feedback → 提交(title/detail 强制短)。 */
@@ -267,9 +276,7 @@ export async function feedbackSubmit(
   path: string,
   input: { detail: string, title: string },
 ) {
-  return (await (
-    await request(conn, `${nodeUrl(path)}/~feedback`, { method: 'POST', body: input })
-  ).json()) as { id: string, path: string, title: string }
+  return await withClient(conn, async value => await value.feedback.submit(path, input))
 }
 
 /** POST /<path>/~feedback/<id> → 投票(每身份一票,可改票)。 */
@@ -279,15 +286,10 @@ export async function feedbackVote(
   id: string,
   vote: 'up' | 'down' | 'clear',
 ) {
-  return (await (
-    await request(conn, `${nodeUrl(path)}/~feedback/${encodeURIComponent(id)}`, {
-      method: 'POST',
-      body: { vote },
-    })
-  ).json()) as FeedbackView
+  return await withClient(conn, async value => await value.feedback.vote(path, id, vote))
 }
 
 /** DELETE /<path>/~feedback/<id>(admin)。 */
 export async function feedbackRemove(conn: Connection, path: string, id: string) {
-  await request(conn, `${nodeUrl(path)}/~feedback/${encodeURIComponent(id)}`, { method: 'DELETE' })
+  await withClient(conn, async value => await value.feedback.remove(path, id))
 }

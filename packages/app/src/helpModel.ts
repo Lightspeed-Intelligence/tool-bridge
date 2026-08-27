@@ -10,6 +10,8 @@ import {
   type CallContext,
   contextHelpModel,
   contextMethodsOf,
+  contextUploadCmd,
+  derivePresence,
   deviceDirectoryHelpModel,
   deviceFsHelpModel,
   deviceShellHelpModel,
@@ -24,7 +26,12 @@ import {
   virtualizeTools,
 } from '@tool-bridge/core'
 import type { TbAppDeps } from './deps'
-import { assertContextAlive, localContext, pruneExpiredContext } from './contextNodes'
+import {
+  assertContextAlive,
+  contextDirectUploadAvailable,
+  localContext,
+  pruneExpiredContext,
+} from './contextNodes'
 import { providerFor, requirePluginExport, upstreamTools } from './toolNodes'
 import { deviceMarkerOf, deviceToolMarker } from './deviceNodes'
 import { filterListVisible } from './paths'
@@ -40,8 +47,18 @@ export async function helpModelFor(
   ctx: CallContext,
   builtins: Map<string, BuiltinModule>,
   deps: TbAppDeps,
-  opts: { now: string, refresh: boolean },
+  opts: {
+    /** MCP 等调用方已知没有 write scope 时可跳过可选直传能力探测。 */
+    includeDirectUpload?: boolean
+    now: string
+    refresh: boolean
+    schemas?: boolean
+  },
 ): Promise<HelpModel> {
+  // schemas=1:节点级 `~help` 直接内联每个工具的全量 inputSchema(关闭两级披露的
+  // 索引形态),让 agent 在一次往返里拿到可调用契约,省掉逐工具下钻。只影响 mcp/http/
+  // tool 与 device tool 节点(其余 kind 本就在节点级带全量 schema)。
+  const index = opts.schemas !== true
   if (node.kind === 'builtin' && node.config?.kind === 'builtin') {
     const mod = builtins.get(node.config.module)
     if (mod) return mod.help(node.path)
@@ -53,8 +70,13 @@ export async function helpModelFor(
       ctx.scopes,
     )
     if (node.online !== undefined) {
+      const presence = derivePresence({
+        online: node.online,
+        ...(node.lastSeenAt !== undefined ? { lastSeenAt: node.lastSeenAt } : {}),
+        now: opts.now,
+      })
       return deviceDirectoryHelpModel(
-        { path: node.path, description: node.description, online: node.online },
+        { path: node.path, description: node.description, presence },
         children.map(n => ({ path: n.path, kind: n.kind, description: n.description })),
       )
     }
@@ -73,21 +95,20 @@ export async function helpModelFor(
       node.path,
       { kind: node.kind, description: node.description },
       toolMarker.cmds ?? [],
-      { index: true },
+      { index },
     )
   }
   if (node.kind === 'mcp' || node.kind === 'http' || node.kind === 'tool') {
     const provider = await providerFor(node, ctx, deps)
     const raw = await upstreamTools(node, provider, deps, opts.refresh, opts.now)
     const { exposed } = virtualizeTools(node.virtualize, raw)
-    // 索引形态(两级披露):不含 inputSchema;全量 spec 走工具级 ~help。
+    // 默认索引形态(两级披露):不含 inputSchema,全量 spec 走工具级 ~help;
+    // schemas=1 时 index=false,节点级即内联全量 schema。
     return toolsToHelpModel(
       node.path,
       { kind: node.kind, description: node.description },
       exposed,
-      {
-        index: true,
-      },
+      { index },
     )
   }
   if (node.kind === 'device' && node.config?.kind === 'device') {
@@ -131,19 +152,73 @@ export async function helpModelFor(
         = exported.methods !== undefined
           ? new Set(exported.methods)
           : new Set([
-              'List',
-              'Get',
-              'Write',
-              'Update',
+              'list',
+              'get',
+              'write',
+              'update',
               ...optionalMethodsForCapabilities(exported.capabilities ?? []),
             ])
       return { ...model, cmds: model.cmds.filter(c => declared.has(c.name)) }
     }
-    return contextHelpModel(node, { readOnly: node.config.readOnly ?? false })
+    const model = contextHelpModel(node, { readOnly: node.config.readOnly ?? false })
+    if (
+      node.config.readOnly !== true
+      && opts.includeDirectUpload !== false
+      && await contextDirectUploadAvailable(node.config, deps)
+    ) {
+      return { ...model, cmds: [...model.cmds, contextUploadCmd(node.path)] }
+    }
+    return model
   }
   if (node.kind === 'skillhub' && node.config?.kind === 'skillhub') {
     await assertContextAlive(node, node.config, registry)
     return skillhubHelpModel(node, { readOnly: node.config.readOnly ?? false })
   }
   throw TBError.unimplemented(`~help for kind '${node.kind}' not implemented yet`)
+}
+
+/**
+ * 命令级 `~help`(`GET /<nodePath>/<command>/~help`)对 builtin/context/skillhub 与
+ * 标准 device shell 成立:
+ * resolve 到父节点,构建其全量 HelpModel(schemas 形态,cmd 带 inputSchema),
+ * 取出叶子段命中的单条 cmd 单独返回。mcp/http/tool 的工具级 help 由 toolHelpModelFor 承载,
+ * 不进此函数(调用点已先试过)。命中不到(节点不可调用 / 命令不存在)→ null(交调用点 404)。
+ *
+ * 授权:节点可见性(read)已在 handleHelp 判过;命令是节点下虚拟叶子,授权只到节点,
+ * 故此处不额外判命令级 scope。
+ */
+export async function commandHelpModelFor(
+  registry: NodeRegistryStore,
+  ctx: CallContext,
+  builtins: Map<string, BuiltinModule>,
+  deps: TbAppDeps,
+  path: TreeNode['path'],
+  opts: { refresh: boolean, schemas?: boolean },
+): Promise<HelpModel | null> {
+  const resolved = await registry.resolve(path).catch(() => null)
+  if (resolved === null || resolved.rest === '' || resolved.rest.includes('/')) return null
+  const { node, rest: command } = resolved
+  // builtin/context/skillhub 与 device shell 在此处理；mcp/http/tool（含 device 自定义
+  // tool）已由 toolHelpModelFor 命中，directory/remote 没有本地命令级 help。
+  if (
+    !(
+      node.kind === 'builtin'
+      || node.kind === 'context'
+      || node.kind === 'skillhub'
+      || (node.kind === 'device' && node.config?.kind === 'device')
+    )
+  ) {
+    return null
+  }
+  const full = await helpModelFor(node, registry, ctx, builtins, deps, {
+    refresh: opts.refresh,
+    schemas: true,
+    now: new Date().toISOString(),
+  })
+  const cmd = full.cmds.find(c => c.name === command)
+  if (cmd === undefined) return null
+  return {
+    node: { path: `${node.path}/${command}`, kind: node.kind, description: cmd.h ?? full.node.description },
+    cmds: [cmd],
+  }
 }

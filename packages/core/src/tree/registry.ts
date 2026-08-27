@@ -20,7 +20,7 @@ import {
   type TreeNode,
   type TreePath,
 } from '../types'
-import { isPrefixOf, normalizePath, parentPaths, segments, validatePath } from './path'
+import { canonicalizePath, isPrefixOf, normalizePath, parentPaths, segments, validatePath } from './path'
 import { KEY_NODE, type StateStore } from '../store'
 import { TBError } from '../errors'
 
@@ -67,10 +67,9 @@ export class NodeRegistryStore {
    * 只扫子树(前缀限定),不再对全树做内存过滤——避免 children/hasChildren/subtree 的
    * O(N²)(每层各扫全树)。`opts.limit` 传给底层 `store.list` 以小步取(hasChildren 短路用)。
    *
-   * **Workers 子请求上限约束**:KvStateStore.list 对每个键各发一次 `get`,即翻页取到的每个
-   * 键消耗一次 Workers 子请求(免费套餐 50 / 付费 1000,含出站 fetch 与 KV 读)。故子树规模
-   * (含中间 directory)应远小于该上限——当前树规模小(节点数十级)可接受;规模变大后
-   * 需改 KV metadata 承载值(list 不再逐 get)或换 SQLite 宿主。
+   * **Workers 查询预算约束**:D1StateStore.list 是单条 SQL 直接带值返回(ADR-001 迁 D1 后
+   * 不再逐键 get),每页只花一次 D1 查询;但 Workers 单请求仍有查询/子请求预算,深翻页的
+   * 页数应远小于预算——当前树规模小(节点数十级)可接受。
    */
   private async scanPrefix(
     keyPrefix: string,
@@ -117,17 +116,17 @@ export class NodeRegistryStore {
     return page.items.length > 0
   }
 
-  /** 取单个;不存在 → not_found。 */
+  /** 取单个;不存在 → not_found。路径大小写不敏感(规范化为小写后查)。 */
   async get(path: TreePath): Promise<TreeNode> {
-    const norm = normalizePath(path)
+    const norm = canonicalizePath(path)
     const node = await this.read(norm)
     if (!node) throw new TBError('not_found', `节点不存在:'${norm}'`)
     return node
   }
 
-  /** 批量取节点；路径先规范化去重，不存在的节点不进入返回 Map。 */
+  /** 批量取节点；路径先规范化(小写)去重，不存在的节点不进入返回 Map。 */
   async getMany(paths: readonly TreePath[]): Promise<Map<TreePath, TreeNode>> {
-    const canonical = [...new Set(paths.map(path => normalizePath(path)))]
+    const canonical = [...new Set(paths.map(path => canonicalizePath(path)))]
     const values = await this.store.getMany(canonical.map(path => this.keyOf(path)))
     const out = new Map<TreePath, TreeNode>()
     for (const path of canonical) {
@@ -142,7 +141,7 @@ export class NodeRegistryStore {
    * 无 prefix = 全树。cursor 为上一页末节点的 path。
    */
   async list(prefix?: TreePath, opts?: ListOptions): Promise<Page<TreeNode>> {
-    const normPrefix = prefix === undefined ? '' : normalizePath(prefix)
+    const normPrefix = prefix === undefined ? '' : canonicalizePath(prefix)
     const limit = clampLimit(opts?.limit)
     const all = (await this.scanAll()).filter(n => isPrefixOf(normPrefix, n.path)).sort(byPath)
     const cursor = opts?.cursor
@@ -157,7 +156,7 @@ export class NodeRegistryStore {
 
   /** 直接子节点(段深恰好 +1);~help 列子节点用。只扫子树前缀,不扫全树。 */
   async children(path: TreePath): Promise<TreeNode[]> {
-    const norm = normalizePath(path)
+    const norm = canonicalizePath(path)
     const depth = segments(norm).length
     const sub = await this.scanPrefix(this.subtreePrefix(norm))
     return sub.filter(n => segments(n.path).length === depth + 1).sort(byPath)
@@ -169,7 +168,7 @@ export class NodeRegistryStore {
    * 不存在的根返回空数组(调用方自行判 not_found)。
    */
   async subtree(path: TreePath, opts?: { maxNodes?: number }): Promise<TreeNode[]> {
-    const norm = normalizePath(path)
+    const norm = canonicalizePath(path)
     if (
       opts?.maxNodes !== undefined
       && (!Number.isInteger(opts.maxNodes) || opts.maxNodes < 1)
@@ -218,11 +217,11 @@ export class NodeRegistryStore {
     node: NodeInput,
     registeredBy: string,
     now: Timestamp,
-    opts: { online?: boolean } = {},
+    opts: { lastSeenAt?: Timestamp, online?: boolean } = {},
   ): Promise<TreeNode> {
-    const path = normalizePath(node.path)
-    const invalid = validatePath(path)
+    const invalid = validatePath(node.path)
     if (invalid) throw invalid
+    const path = canonicalizePath(node.path)
     assertKindConfig(node)
 
     for (const parent of parentPaths(path)) {
@@ -247,6 +246,7 @@ export class NodeRegistryStore {
       ...(node.config !== undefined ? { config: node.config } : {}),
       ...(node.virtualize !== undefined ? { virtualize: node.virtualize } : {}),
       ...(opts.online !== undefined ? { online: opts.online } : {}),
+      ...(opts.lastSeenAt !== undefined ? { lastSeenAt: opts.lastSeenAt } : {}),
       registeredBy,
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,
@@ -257,10 +257,10 @@ export class NodeRegistryStore {
 
   /** 部分更新(patch);不存在 → not_found;path 不可改。 */
   async update(path: TreePath, patch: Partial<NodeInput>, now: Timestamp): Promise<TreeNode> {
-    const norm = normalizePath(path)
+    const norm = canonicalizePath(path)
     const existing = await this.read(norm)
     if (!existing) throw new TBError('not_found', `节点不存在:'${norm}'`)
-    if (patch.path !== undefined && normalizePath(patch.path) !== norm) {
+    if (patch.path !== undefined && canonicalizePath(patch.path) !== norm) {
       throw new TBError('invalid_argument', 'path 不可通过 Update 变更')
     }
     const merged: TreeNode = {
@@ -277,14 +277,34 @@ export class NodeRegistryStore {
     return merged
   }
 
-  /** 设备生命周期专用:只更新节点 online 状态,不存在 → not_found。 */
+  /**
+   * 设备生命周期专用:更新节点 online 状态,不存在 → not_found。
+   * online 翻 true 时视为一次存活观察,同步把 `lastSeenAt` 刷到 now;翻 false 时保留原
+   * `lastSeenAt`(用于展示"最后在线于")。
+   */
   async setOnline(path: TreePath, online: boolean, now: Timestamp): Promise<TreeNode> {
-    const norm = normalizePath(path)
+    const norm = canonicalizePath(path)
     const existing = await this.read(norm)
     if (!existing) throw new TBError('not_found', `节点不存在:'${norm}'`)
-    const updated: TreeNode = { ...existing, online, updatedAt: now }
+    const updated: TreeNode = {
+      ...existing,
+      online,
+      ...(online ? { lastSeenAt: now } : {}),
+      updatedAt: now,
+    }
     await this.store.put(this.keyOf(norm), updated)
     return updated
+  }
+
+  /**
+   * 设备心跳专用:只把 `lastSeenAt` 刷到 now,不改 online 也不动 updatedAt(心跳不是元数据变更,
+   * 不该扰动 updatedAt 的语义)。节点不存在时静默返回——心跳晚于节点删除是正常竞态,不报错。
+   */
+  async touchSeen(path: TreePath, now: Timestamp): Promise<void> {
+    const norm = canonicalizePath(path)
+    const existing = await this.read(norm)
+    if (!existing) return
+    await this.store.put(this.keyOf(norm), { ...existing, lastSeenAt: now })
   }
 
   /**
@@ -295,7 +315,7 @@ export class NodeRegistryStore {
    * (不允许删除非空子树;显式 directory 同理)。
    */
   async delete(path: TreePath): Promise<void> {
-    const norm = normalizePath(path)
+    const norm = canonicalizePath(path)
     const existing = await this.read(norm)
     if (!existing) throw new TBError('not_found', `节点不存在:'${norm}'`)
     if (await this.hasChildren(norm)) {
@@ -315,7 +335,7 @@ export class NodeRegistryStore {
    * 普通管理面仍使用 delete(),不允许误删非空子树。
    */
   async deleteSubtree(path: TreePath): Promise<void> {
-    const norm = normalizePath(path)
+    const norm = canonicalizePath(path)
     const existing = await this.read(norm)
     if (!existing) throw new TBError('not_found', `节点不存在:'${norm}'`)
     const descendants = await this.scanPrefix(this.subtreePrefix(norm))
@@ -335,7 +355,7 @@ export class NodeRegistryStore {
    * 完全匹配 → rest=''。无任何匹配 → not_found。
    */
   async resolve(path: TreePath): Promise<{ node: TreeNode, rest: string }> {
-    const norm = normalizePath(path)
+    const norm = canonicalizePath(path)
     const candidates = [norm, ...parentPaths(norm).reverse()]
     for (const cand of candidates) {
       const node = await this.read(cand)
