@@ -31,6 +31,8 @@ import pkg from '../package.json' with { type: 'json' }
 export interface Env {
   /** Dashboard 静态资源(Workers Static Assets;本地测试/未部署 UI 时可缺省)。 */
   ASSETS?: Fetcher
+  /** Feishu MCP tool allowlist (comma-separated); empty means no tools are advertised. */
+  FEISHU_ALLOWED_TOOLS?: string
   /** 放行 http:// 上游(仅本地开发)。 */
   TB_ALLOW_INSECURE_HTTP?: string
   TB_BOOTSTRAP_ADMIN_SK?: string

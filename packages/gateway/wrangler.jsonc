@@ -46,6 +46,8 @@
     // presign 凭证本体走 SecretStore 'r2-presign' 或 wrangler secret,不入 vars。
     "TB_R2_BUCKET": "tb-r2",
     "TB_R2_S3_ENDPOINT": "https://041d4868e5611b45f9959f4f58c1e4c7.r2.cloudflarestorage.com",
+    // 飞书官方 MCP 工具白名单(逗号分隔);为空时上游不会返回任何工具。
+    "FEISHU_ALLOWED_TOOLS": "create-doc,fetch-doc,list-docs,update-doc,get-comments,add-comments,get-user,fetch-file",
     // 飞书登录:复用 feishu plugin 的 SecretStore 凭证(feishu-app),设置即启用 /login。
     "TB_FEISHU_LOGIN_SECRET_REF": "feishu-app",
     // meego 自动绑定(登录后 open_id → union_id → user_key 写入节点 userKeys)。
