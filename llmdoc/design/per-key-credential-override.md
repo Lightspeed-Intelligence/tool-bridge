@@ -73,6 +73,11 @@ if (config.authRef !== undefined) {
 
 回落语义天然满足需求:个人凭证缺失(或节点没标 domain)→ 用节点默认 token,行为不变。
 
+**仅个人凭证模式(2026-09 起)**:节点只标 `credentialDomain` 而**不配 `authRef`**,表示上游要求
+每人自己的 token、不存在共享兜底(如 lekuko)。调用方未配该域 → `permission_denied`(不可重试),
+消息里直接给补配路径(Dashboard「我的凭证」/ `system/usercred/set`),且不向上游出站。
+不新增开关字段:「有 domain 无 authRef」本身就是声明。`tb tool mount --credential-domain <d>` 可直接挂。
+
 ### 2. 数据面:个人凭证读写端点
 
 新增一个 builtin 模块(如 `usercred`,挂 `system/my-credentials`),cmd:

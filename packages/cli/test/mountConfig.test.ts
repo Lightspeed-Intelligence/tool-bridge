@@ -145,6 +145,45 @@ describe('tb tool mount --config', () => {
   })
 })
 
+describe('tb tool mount --credential-domain', () => {
+  it('[mcp] 无 --auth-ref 也可挂载:config 只带 credentialDomain(每人自配 token)', async () => {
+    const fn = captureFetch({ path: 'mcp/lekuko', kind: 'mcp' })
+    await runCli([
+      'tool', 'mount', 'mcp/lekuko', '--kind', 'mcp', '--url', 'https://u/mcp',
+      '--credential-domain', 'lekuko', '--auth-header', 'Authorization', ...base,
+    ])
+    expect(sentConfig(fn)).toEqual({
+      kind: 'mcp',
+      url: 'https://u/mcp',
+      credentialDomain: 'lekuko',
+      authHeader: 'Authorization',
+    })
+  })
+
+  it('与 --auth-ref 并存 → 两者都进 config(未配个人凭证时回落)', async () => {
+    const fn = captureFetch({ path: 'mcp/y', kind: 'mcp' })
+    await runCli([
+      'tool', 'mount', 'mcp/y', '--kind', 'mcp', '--url', 'https://u/mcp',
+      '--auth-ref', 'yunxiao', '--credential-domain', 'yunxiao', ...base,
+    ])
+    expect(sentConfig(fn)).toMatchObject({ authRef: 'yunxiao', credentialDomain: 'yunxiao' })
+  })
+
+  it('非 mcp / 含 ":" / 与 --auth oauth 同用 → 本地拒', async () => {
+    for (const argv of [
+      ['tool', 'mount', 'x', '--kind', 'tool', '--provider', 'p', '--credential-domain', 'd'],
+      ['tool', 'mount', 'x', '--kind', 'mcp', '--url', 'https://u/mcp', '--credential-domain', 'a:b'],
+      ['tool', 'mount', 'x', '--kind', 'mcp', '--url', 'https://u/mcp', '--auth', 'oauth', '--credential-domain', 'd'],
+    ]) {
+      const fn = captureFetch({})
+      await runCli([...argv, ...base])
+      expect(process.exitCode, argv.join(' ')).not.toBe(0)
+      expect(fn, argv.join(' ')).not.toHaveBeenCalled()
+      process.exitCode = 0
+    }
+  })
+})
+
 describe('tb ctx mount --config', () => {
   it('plugin provider 收 providerConfig', async () => {
     const fn = captureFetch({ path: 'ctx/notion', kind: 'context' })

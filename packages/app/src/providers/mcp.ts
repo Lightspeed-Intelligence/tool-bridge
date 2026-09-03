@@ -24,9 +24,11 @@
  * - `enforceStrictCapabilities: true`:能力门一旦落空就抛错,不返回空列表。空工具清单是
  *   我们踩过的事故类型,宁可响亮失败也不静默交付一个空目录。
  *
- * - 上游请求头 = `headers`(静态明文,如上游要求的工具白名单头)+ `authRef` 凭证头
+ * - 上游请求头 = `headers`(静态明文,如上游要求的工具白名单头)+ 凭证头
  *   (`authHeaderFor` 语义:默认 `Authorization: Bearer`,可经 `authHeader`/`authScheme`
- *   改头名/前缀,空 scheme 原样注入;凭证头覆盖同名静态头)。
+ *   改头名/前缀,空 scheme 原样注入;凭证头覆盖同名静态头)。凭证取值:个人凭证
+ *   (`credentialDomain` + 调用方 owner)优先,回落 `authRef`;只标 `credentialDomain`
+ *   而无 `authRef` 表示上游要求每人自己的 token,未配即 permission_denied。
  *   `auth:'oauth'` 时改挂网关托管 OAuthClientProvider(oauth.ts;mode:'deny'):SDK 自动带
  *   token、401 时自动 refresh;需要交互(重新)授权 → reauthorizeRequired 指引 `tb tool auth`。
  * - **单一 choke point**(`guard`):一切传输/协议错误经 `normalizeUpstreamError` 归一为 TBError;
@@ -69,7 +71,11 @@ export interface McpConfig {
   authRef?: string
   /** 凭证前缀;空串 = 原样注入(默认 Bearer)。 */
   authScheme?: string
-  /** 个人凭证域:调用方在此域配了个人 token 则覆盖 authRef 默认(见 usercred)。 */
+  /**
+   * 个人凭证域:调用方在此域配了个人 token 则注入本人 token(见 usercred)。
+   * 与 authRef 并存 → 未配则回落节点默认;**无 authRef** → 上游要求每人自己的 token,
+   * 未配直接 permission_denied(不存在共享兜底)。
+   */
   credentialDomain?: string
   /** 静态明文请求头(非机密);authRef 凭证头覆盖同名项。 */
   headers?: Record<string, string>
@@ -401,18 +407,30 @@ export function createMcpProvider(
         }),
       }
     }
-    // 静态头形态:headers(明文)+ authRef 凭证头(authHeaderFor 语义,覆盖同名)。
+    // 静态头形态:headers(明文)+ 凭证头(authHeaderFor 语义,覆盖同名)。
     const h: Record<string, string> = { ...(config.headers ?? {}) }
-    if (config.authRef !== undefined) {
+    if (config.credentialDomain !== undefined || config.authRef !== undefined) {
       // 凭证解析顺序:个人凭证(usercred:<owner>:<domain>)优先,否则回落节点默认 authRef。
       const personal
         = opts.callerOwner !== undefined && config.credentialDomain !== undefined
           ? await resolveUserCredential(secrets, opts.callerOwner, config.credentialDomain)
           : undefined
-      const cred = personal ?? (await secrets.resolve(config.authRef))
-      // fail closed:声明了 authRef 却(个人+默认都)解析不到 → unavailable,不静默以无凭证/仅静态头出站
-      // (上游可能据此当匿名放行或返回误导性结果)。与 pluginClient 同语义:配置错误快速失败。
+      const cred
+        = personal
+          ?? (config.authRef !== undefined ? await secrets.resolve(config.authRef) : undefined)
       if (cred === undefined) {
+        // 仅 credentialDomain(无 authRef)= 上游要求每人自己的 token,没有共享兜底:
+        // 调用方未配个人凭证 → permission_denied,并告知补配路径。
+        if (config.authRef === undefined) {
+          throw new TBError(
+            'permission_denied',
+            `此节点要求个人凭证:请先配置凭证域 '${config.credentialDomain}'`
+            + `(Dashboard「我的凭证」,或 POST system/usercred/set {"domain":"${config.credentialDomain}","value":"<token>"})`,
+            { retryable: false },
+          )
+        }
+        // fail closed:声明了 authRef 却(个人+默认都)解析不到 → unavailable,不静默以无凭证/仅静态头出站
+        // (上游可能据此当匿名放行或返回误导性结果)。与 pluginClient 同语义:配置错误快速失败。
         throw new TBError('unavailable', `mcp authRef '${config.authRef}' 无法解析`, {
           retryable: false,
         })
