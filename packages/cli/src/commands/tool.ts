@@ -67,10 +67,15 @@ export function toolMountCommand() {
       '[mcp oauth] SecretStore ref for the pre-registered confidential client secret',
     )
     .option('--auth-ref <name>', 'SecretStore ref for upstream credential')
-    .option('--auth-header <name>', '[mcp/http] auth header name; requires --auth-ref')
+    .option(
+      '--credential-domain <domain>',
+      '[mcp] per-user credential domain (system/usercred); with --auth-ref users fall back to it, '
+      + 'without --auth-ref every caller must configure their own token',
+    )
+    .option('--auth-header <name>', '[mcp/http] auth header name; requires --auth-ref or --credential-domain')
     .option(
       '--auth-scheme <scheme>',
-      '[mcp/http] auth scheme; requires --auth-ref; empty string sends the secret as-is',
+      '[mcp/http] auth scheme; requires --auth-ref or --credential-domain; empty string sends the secret as-is',
     )
     .option(
       '--header <name=value>',
@@ -95,6 +100,7 @@ Examples:
   tb tool mount docs/context7 --kind mcp --url https://mcp.context7.com/mcp
   tb tool mount jira --kind mcp --url https://mcp.example.com/mcp --auth-ref jira-token
   tb tool mount gh --kind mcp --url https://api.example.com/mcp --auth oauth   # then: tb tool auth gh
+  tb tool mount lekuko --kind mcp --url https://mcp.example.com/mcp --credential-domain lekuko   # per-user token only
   tb tool mount ha --kind mcp --url https://ha.example.com/api/mcp --auth oauth --oauth-client-id tool-bridge
   tb tool mount weather --kind http --endpoint https://api.weather.com --tools-file tools.json
   tb tool mount notion --kind tool --provider notion-tools --auth-ref notion-token
@@ -116,8 +122,17 @@ Examples:
       const oauthClientSecretRef = opts.oauthClientSecretRef !== undefined
         ? String(opts.oauthClientSecretRef).trim()
         : undefined
-      if ((authHeader !== undefined || authScheme !== undefined) && !authRef) {
-        throw new CliError('--auth-header/--auth-scheme require --auth-ref')
+      const credentialDomain = opts.credentialDomain !== undefined
+        ? String(opts.credentialDomain).trim()
+        : undefined
+      if (credentialDomain !== undefined && (credentialDomain === '' || credentialDomain.includes(':'))) {
+        throw new CliError('--credential-domain must be non-empty and must not contain ":"')
+      }
+      if ((authHeader !== undefined || authScheme !== undefined) && !authRef && credentialDomain === undefined) {
+        throw new CliError('--auth-header/--auth-scheme require --auth-ref or --credential-domain')
+      }
+      if (credentialDomain !== undefined && kind !== 'mcp') {
+        throw new CliError('--credential-domain is only supported for --kind mcp')
       }
 
       let config: NodeConfig
@@ -144,6 +159,9 @@ Examples:
         if (auth === 'oauth' && authRef) {
           throw new CliError('--auth oauth and --auth-ref are mutually exclusive')
         }
+        if (auth === 'oauth' && credentialDomain !== undefined) {
+          throw new CliError('--auth oauth and --credential-domain are mutually exclusive')
+        }
         if ((oauthClientId !== undefined || oauthClientSecretRef !== undefined) && auth !== 'oauth') {
           throw new CliError('--oauth-client-id/--oauth-client-secret-ref require --auth oauth')
         }
@@ -160,6 +178,7 @@ Examples:
           kind: 'mcp',
           url,
           ...(authRef ? { authRef } : {}),
+          ...(credentialDomain !== undefined ? { credentialDomain } : {}),
           ...(auth === 'oauth' ? { auth: 'oauth' as const } : {}),
           ...(oauthClientId !== undefined
             ? {

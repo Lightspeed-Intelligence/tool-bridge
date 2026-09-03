@@ -1,5 +1,6 @@
 import {
   base64urlEncode,
+  isTBError,
   MemoryStateStore,
   parseHelpDsl,
   SecretStoreImpl,
@@ -866,6 +867,51 @@ describe('个人凭证覆盖(usercred:<owner>:<domain> 优先于 authRef 默认)
     const auths = upstream.headersSeen().map(h => h.get('Authorization'))
     expect(auths).toContain('Bearer ALICE-PAT')
     expect(auths).toContain('Bearer ADMIN-DEFAULT')
+  })
+
+  it('仅 credentialDomain(无 authRef):命中注入本人 token;未配 → permission_denied 不出站', async () => {
+    const { upstream } = setup()
+    const store = new MemoryStateStore()
+    const key = base64urlEncode(crypto.getRandomValues(new Uint8Array(32)))
+    const secrets = new SecretStoreImpl(store, key)
+    await secrets.set('usercred:user:ou_alice:lekuko', 'ALICE-LEKUKO', NOW)
+
+    const cfg = { url: 'https://mcp-mock.test/mcp', credentialDomain: 'lekuko' }
+    const pa = createMcpProvider(cfg, secrets, {
+      allowInsecure: false,
+      callerOwner: 'user:ou_alice',
+      session: { store, nodePath: 'ext/l' },
+    })
+    await pa.call('echo', {})
+    expect(upstream.headersSeen().map(h => h.get('Authorization'))).toContain('Bearer ALICE-LEKUKO')
+
+    const seenBefore = upstream.headersSeen().length
+    const pb = createMcpProvider(cfg, secrets, {
+      allowInsecure: false,
+      callerOwner: 'user:ou_bob',
+      session: { store, nodePath: 'ext/l' },
+    })
+    const err = await pb.call('echo', {}).catch((e: unknown) => e)
+    expect(isTBError(err)).toBe(true)
+    if (isTBError(err)) {
+      expect(err.code).toBe('permission_denied')
+      expect(err.retryable).toBe(false)
+      expect(err.message).toContain('lekuko')
+      expect(err.message).toContain('system/usercred/set')
+    }
+    // 没有共享兜底:未配的人一个请求都不发到上游。
+    expect(upstream.headersSeen().length).toBe(seenBefore)
+  })
+
+  it('仅 credentialDomain 且调用方无 owner(非登录 SK)→ permission_denied', async () => {
+    const { store, secrets } = setup()
+    const cfg = { url: 'https://mcp-mock.test/mcp', credentialDomain: 'lekuko' }
+    const p = createMcpProvider(cfg, secrets, {
+      allowInsecure: false,
+      session: { store, nodePath: 'ext/l2' },
+    })
+    const err = await p.list().catch((e: unknown) => e)
+    expect(isTBError(err) && err.code === 'permission_denied').toBe(true)
   })
 })
 
