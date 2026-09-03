@@ -25,6 +25,10 @@
   // Every authenticated request reads authoritative D1 state. Keep the Worker close
   // to its dominant backends so repeated D1/upstream round trips do not cross regions.
   "placement": { "mode": "smart" },
+  "vars": {
+    // Feishu official MCP allowlist; an empty value makes tools/list return no tools.
+    "FEISHU_ALLOWED_TOOLS": "create-doc,fetch-doc,list-docs,update-doc,get-comments,add-comments,get-user,fetch-file"
+  },
   // Workers have no resident process: periodically converge expired Store uploads,
   // shares, call capabilities, staging bytes, and orphaned objects.
   "triggers": { "crons": ["*/15 * * * *"] },
